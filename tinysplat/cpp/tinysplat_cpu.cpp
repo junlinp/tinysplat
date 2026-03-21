@@ -40,56 +40,61 @@ std::vector<GaussianPrecomputed<scalar_t>> precompute_gaussians(
     constexpr scalar_t kEps = static_cast<scalar_t>(1e-8);
     constexpr scalar_t kPi = static_cast<scalar_t>(3.14159265358979323846);
 
-    for (int64_t g = 0; g < num_gaussians; ++g) {
-        const scalar_t a = covs_a[g][0][0];
-        const scalar_t b = covs_a[g][0][1];
-        const scalar_t c = covs_a[g][1][0];
-        const scalar_t d = covs_a[g][1][1];
+    at::parallel_for(0, num_gaussians, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t g = begin; g < end; ++g) {
+            const scalar_t a = covs_a[g][0][0];
+            const scalar_t b = covs_a[g][0][1];
+            const scalar_t c = covs_a[g][1][0];
+            const scalar_t d = covs_a[g][1][1];
 
-        scalar_t det = a * d - b * c;
-        if (det < kEps) {
-            det = kEps;
+            scalar_t det = a * d - b * c;
+            if (det < kEps) {
+                det = kEps;
+            }
+
+            const scalar_t inv_det = static_cast<scalar_t>(1.0) / det;
+            const scalar_t trace = a + d;
+            const scalar_t disc =
+                std::sqrt(std::max(static_cast<scalar_t>(0), (a - d) * (a - d) + 4 * b * c));
+            const scalar_t lambda_max = std::max(
+                (trace + disc) * static_cast<scalar_t>(0.5),
+                kEps
+            );
+            const scalar_t radius = static_cast<scalar_t>(
+                std::ceil(kSigmaRadius * std::sqrt(lambda_max))
+            );
+            const int64_t min_x = std::max(
+                static_cast<int64_t>(0),
+                static_cast<int64_t>(std::floor(means_a[g][0] - radius))
+            );
+            const int64_t max_x = std::min(
+                width - 1,
+                static_cast<int64_t>(std::ceil(means_a[g][0] + radius))
+            );
+            const int64_t min_y = std::max(
+                static_cast<int64_t>(0),
+                static_cast<int64_t>(std::floor(means_a[g][1] - radius))
+            );
+            const int64_t max_y = std::min(
+                height - 1,
+                static_cast<int64_t>(std::ceil(means_a[g][1] + radius))
+            );
+
+            params[static_cast<size_t>(g)] = GaussianPrecomputed<scalar_t>{
+                d * inv_det,
+                -b * inv_det,
+                -c * inv_det,
+                a * inv_det,
+                static_cast<scalar_t>(1.0) /
+                    (static_cast<scalar_t>(2.0) * kPi * std::sqrt(det + kEps)),
+                det / (det + kEps),
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            };
         }
-
-        const scalar_t inv_det = static_cast<scalar_t>(1.0) / det;
-        const scalar_t trace = a + d;
-        const scalar_t disc =
-            std::sqrt(std::max(static_cast<scalar_t>(0), (a - d) * (a - d) + 4 * b * c));
-        const scalar_t lambda_max = std::max((trace + disc) * static_cast<scalar_t>(0.5), kEps);
-        const scalar_t radius = static_cast<scalar_t>(
-            std::ceil(kSigmaRadius * std::sqrt(lambda_max))
-        );
-        const int64_t min_x = std::max(
-            static_cast<int64_t>(0),
-            static_cast<int64_t>(std::floor(means_a[g][0] - radius))
-        );
-        const int64_t max_x = std::min(
-            width - 1,
-            static_cast<int64_t>(std::ceil(means_a[g][0] + radius))
-        );
-        const int64_t min_y = std::max(
-            static_cast<int64_t>(0),
-            static_cast<int64_t>(std::floor(means_a[g][1] - radius))
-        );
-        const int64_t max_y = std::min(
-            height - 1,
-            static_cast<int64_t>(std::ceil(means_a[g][1] + radius))
-        );
-
-        params[static_cast<size_t>(g)] = GaussianPrecomputed<scalar_t>{
-            d * inv_det,
-            -b * inv_det,
-            -c * inv_det,
-            a * inv_det,
-            static_cast<scalar_t>(1.0) /
-                (static_cast<scalar_t>(2.0) * kPi * std::sqrt(det + kEps)),
-            det / (det + kEps),
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-        };
-    }
+    });
 
     return params;
 }
@@ -161,50 +166,60 @@ std::vector<RasterGaussian2D<scalar_t>> precompute_raster_gaussians_2d(
     scalar_t sigma_radius
 ) {
     std::vector<RasterGaussian2D<scalar_t>> gaussians(static_cast<size_t>(num_gaussians));
-    for (int64_t g = 0; g < num_gaussians; ++g) {
-        scalar_t s00 = covs_a[g][0][0] + min_covariance;
-        scalar_t s01 = covs_a[g][0][1];
-        scalar_t s10 = covs_a[g][1][0];
-        scalar_t s11 = covs_a[g][1][1] + min_covariance;
-        scalar_t det = s00 * s11 - s01 * s10;
-        if (det <= min_covariance) {
-            det = min_covariance;
+    at::parallel_for(0, num_gaussians, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t g = begin; g < end; ++g) {
+            scalar_t s00 = covs_a[g][0][0] + min_covariance;
+            scalar_t s01 = covs_a[g][0][1];
+            scalar_t s10 = covs_a[g][1][0];
+            scalar_t s11 = covs_a[g][1][1] + min_covariance;
+            scalar_t det = s00 * s11 - s01 * s10;
+            if (det <= min_covariance) {
+                det = min_covariance;
+            }
+            scalar_t inv_det = static_cast<scalar_t>(1.0) / det;
+            scalar_t inv_xx = s11 * inv_det;
+            scalar_t inv_xy = -s01 * inv_det;
+            scalar_t inv_yx = -s10 * inv_det;
+            scalar_t inv_yy = s00 * inv_det;
+
+            scalar_t trace = s00 + s11;
+            scalar_t disc = std::sqrt(
+                std::max(
+                    static_cast<scalar_t>(0),
+                    (s00 - s11) * (s00 - s11) + 4 * s01 * s10
+                )
+            );
+            scalar_t lambda_max = std::max(
+                (trace + disc) * static_cast<scalar_t>(0.5),
+                min_covariance
+            );
+            scalar_t radius = sigma_radius * std::sqrt(lambda_max);
+
+            int64_t min_x = static_cast<int64_t>(std::floor(means_a[g][0] - radius));
+            int64_t max_x = static_cast<int64_t>(std::ceil(means_a[g][0] + radius));
+            int64_t min_y = static_cast<int64_t>(std::floor(means_a[g][1] - radius));
+            int64_t max_y = static_cast<int64_t>(std::ceil(means_a[g][1] + radius));
+            if (max_x < 0 || min_x >= width || max_y < 0 || min_y >= height) {
+                min_x = 1;
+                max_x = 0;
+                min_y = 1;
+                max_y = 0;
+            }
+
+            gaussians[static_cast<size_t>(g)] = RasterGaussian2D<scalar_t>{
+                means_a[g][0],
+                means_a[g][1],
+                inv_xx,
+                inv_xy,
+                inv_yx,
+                inv_yy,
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            };
         }
-        scalar_t inv_det = static_cast<scalar_t>(1.0) / det;
-        scalar_t inv_xx = s11 * inv_det;
-        scalar_t inv_xy = -s01 * inv_det;
-        scalar_t inv_yx = -s10 * inv_det;
-        scalar_t inv_yy = s00 * inv_det;
-
-        scalar_t trace = s00 + s11;
-        scalar_t disc = std::sqrt(std::max(static_cast<scalar_t>(0), (s00 - s11) * (s00 - s11) + 4 * s01 * s10));
-        scalar_t lambda_max = std::max((trace + disc) * static_cast<scalar_t>(0.5), min_covariance);
-        scalar_t radius = sigma_radius * std::sqrt(lambda_max);
-
-        int64_t min_x = static_cast<int64_t>(std::floor(means_a[g][0] - radius));
-        int64_t max_x = static_cast<int64_t>(std::ceil(means_a[g][0] + radius));
-        int64_t min_y = static_cast<int64_t>(std::floor(means_a[g][1] - radius));
-        int64_t max_y = static_cast<int64_t>(std::ceil(means_a[g][1] + radius));
-        if (max_x < 0 || min_x >= width || max_y < 0 || min_y >= height) {
-            min_x = 1;
-            max_x = 0;
-            min_y = 1;
-            max_y = 0;
-        }
-
-        gaussians[static_cast<size_t>(g)] = RasterGaussian2D<scalar_t>{
-            means_a[g][0],
-            means_a[g][1],
-            inv_xx,
-            inv_xy,
-            inv_yx,
-            inv_yy,
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-        };
-    }
+    });
     return gaussians;
 }
 
