@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 import viser
@@ -657,17 +656,17 @@ def prepare_dataset_frames(
 class GaussianData:
     """Central manager for 3D Gaussian Splatting parameters.
 
-    Holds nn.Parameter directly so the optimizer can update in-place
+    Holds tensors with requires_grad=True so the optimizer can update in-place
     and all consumers (rasterizer, visualizer) see the same data.
     """
 
     def __init__(self, params: Dict[str, torch.Tensor], device: str):
         self._device = torch.device(device)
-        self.means = nn.Parameter(params["means"].to(self._device))
-        self.log_scales = nn.Parameter(params["log_scales"].to(self._device))
-        self.rotations = nn.Parameter(params["rotations"].to(self._device))
-        self.colors = nn.Parameter(params["colors"].to(self._device))
-        self.opacities = nn.Parameter(params["opacities"].to(self._device))
+        self.means = params["means"].to(self._device).requires_grad_(True)
+        self.log_scales = params["log_scales"].to(self._device).requires_grad_(True)
+        self.rotations = params["rotations"].to(self._device).requires_grad_(True)
+        self.colors = params["colors"].to(self._device).requires_grad_(True)
+        self.opacities = params["opacities"].to(self._device).requires_grad_(True)
 
     @property
     def device(self) -> torch.device:
@@ -712,11 +711,11 @@ class GaussianData:
         return torch.sigmoid(self.opacities)
 
     def replace(self, params: Dict[str, torch.Tensor]):
-        self.means = nn.Parameter(params["means"].to(self._device))
-        self.log_scales = nn.Parameter(params["log_scales"].to(self._device))
-        self.rotations = nn.Parameter(params["rotations"].to(self._device))
-        self.colors = nn.Parameter(params["colors"].to(self._device))
-        self.opacities = nn.Parameter(params["opacities"].to(self._device))
+        self.means = params["means"].to(self._device).requires_grad_(True)
+        self.log_scales = params["log_scales"].to(self._device).requires_grad_(True)
+        self.rotations = params["rotations"].to(self._device).requires_grad_(True)
+        self.colors = params["colors"].to(self._device).requires_grad_(True)
+        self.opacities = params["opacities"].to(self._device).requires_grad_(True)
 
     def export_params(self) -> Dict[str, torch.Tensor]:
         return {
@@ -755,42 +754,6 @@ class GaussianData:
         }
 
 
-class MultiViewGaussianSplatTrainer(nn.Module):
-    """Thin wrapper that registers GaussianData's nn.Parameters for the optimizer."""
-
-    def __init__(self, data: GaussianData):
-        super().__init__()
-        self.data = data
-        self.means = data.means
-        self.log_scales = data.log_scales
-        self.rotations = data.rotations
-        self.colors = data.colors
-        self.opacities = data.opacities
-
-    def num_gaussians(self) -> int:
-        return self.data.num_gaussians
-
-    def covariance_matrices(self) -> torch.Tensor:
-        return self.data.covariance_matrices()
-
-    def replace_gaussians(self, params: Dict[str, torch.Tensor]):
-        self.data.replace(params)
-        self.means = self.data.means
-        self.log_scales = self.data.log_scales
-        self.rotations = self.data.rotations
-        self.colors = self.data.colors
-        self.opacities = self.data.opacities
-
-    def render(
-        self,
-        intrinsics: torch.Tensor,
-        camera_to_world: torch.Tensor,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        return self.data.render(intrinsics, camera_to_world, height, width)
-
-
 def save_checkpoint(
     data: GaussianData,
     output_path: Path,
@@ -798,12 +761,12 @@ def save_checkpoint(
     torch.save(data.export_params(), output_path)
 
 
-def rebuild_optimizer(model: MultiViewGaussianSplatTrainer, lr: float):
-    return torch.optim.Adam(model.parameters(), lr=lr)
+def rebuild_optimizer(data: GaussianData, lr: float):
+    return torch.optim.Adam(data.parameters(), lr=lr)
 
 
 def densify_and_prune(
-    model: MultiViewGaussianSplatTrainer,
+    data: GaussianData,
     grad_norms: torch.Tensor,
     grad_thresh: float,
     prune_opacity_thresh: float,
@@ -821,12 +784,12 @@ def densify_and_prune(
 ) -> bool:
     """Densify and prune following gsplat's DefaultStrategy."""
     with torch.no_grad():
-        n = model.num_gaussians()
-        means = model.means.detach().clone()[:n]
-        log_scales = model.log_scales.detach().clone()[:n]
-        rotations = model.rotations.detach().clone()[:n]
-        colors = model.colors.detach().clone()[:n]
-        opacities = model.opacities.detach().clone()[:n]
+        n = data.num_gaussians
+        means = data.means.detach().clone()[:n]
+        log_scales = data.log_scales.detach().clone()[:n]
+        rotations = data.rotations.detach().clone()[:n]
+        colors = data.colors.detach().clone()[:n]
+        opacities = data.opacities.detach().clone()[:n]
         grad_norms = grad_norms.detach().clone()[:n]
 
         sizes = [
@@ -839,7 +802,7 @@ def densify_and_prune(
         ]
         if len(set(sizes)) != 1:
             print(
-                f"SIZE MISMATCH in densify: means={sizes[0]} log_scales={sizes[1]} rotations={sizes[2]} colors={sizes[3]} opacities={sizes[4]} grad_norms={sizes[5]} model.n={n}"
+                f"SIZE MISMATCH in densify: means={sizes[0]} log_scales={sizes[1]} rotations={sizes[2]} colors={sizes[3]} opacities={sizes[4]} grad_norms={sizes[5]} n={n}"
             )
 
         assert means.shape[0] == n, f"means {means.shape[0]} != {n}"
@@ -864,7 +827,7 @@ def densify_and_prune(
             and camera_to_world is not None
             and height > 0
         ):
-            cov_matrices = model.covariance_matrices()[:n]
+            cov_matrices = data.covariance_matrices()[:n]
             proj_means, proj_covs, _, proj_mask = project_gaussians_3d_to_2d(
                 means,
                 cov_matrices,
@@ -1009,7 +972,7 @@ def densify_and_prune(
 
         changed = means.shape[0] != n_before
         if changed:
-            model.replace_gaussians(
+            data.replace(
                 {
                     "means": means,
                     "log_scales": log_scales,
@@ -1021,14 +984,14 @@ def densify_and_prune(
         return changed
 
 
-def reset_opacities(model: MultiViewGaussianSplatTrainer, value: float = 0.01):
+def reset_opacities(data: GaussianData, value: float = 0.01):
     """Reset opacities to prevent Gaussians from becoming permanently opaque/transparent."""
     with torch.no_grad():
         new_opacities = torch.clamp(
-            model.opacities.data,
+            data.opacities.data,
             max=torch.logit(torch.tensor(value)).item(),
         )
-        model.opacities.data.copy_(new_opacities)
+        data.opacities.data.copy_(new_opacities)
 
 
 def main():
@@ -1084,24 +1047,24 @@ def main():
         init_grid_long_side=args.init_grid_long_side,
     )
     gauss_data = GaussianData(gaussians, device)
-    model = MultiViewGaussianSplatTrainer(gauss_data)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(gauss_data.parameters(), lr=args.lr)
 
     visualizer.set_cameras(frames)
     with torch.no_grad():
-        initial_render = model.render(
+        initial_render = gauss_data.render(
             intrinsics=first_intrinsics,
             camera_to_world=frames[0].camera_to_world,
             height=first_height,
             width=first_width,
         ).detach()
+        snap = gauss_data.snapshot_for_visualizer()
         visualizer.update_gaussians(
-            model.means,
-            torch.clamp(model.colors, 0.0, 1.0),
-            torch.sigmoid(model.opacities),
-            model.covariance_matrices(),
+            snap["means"],
+            snap["colors"],
+            snap["opacities"],
+            snap["covariances"],
         )
-    visualizer.update_gaussian_stats(model.num_gaussians())
+    visualizer.update_gaussian_stats(gauss_data.num_gaussians)
     visualizer.update_status(f"**Status:** training live at http://localhost:{args.viser_port}")
     visualizer.update_frame_preview(0, frames[0], first_target, initial_render)
 
@@ -1113,7 +1076,7 @@ def main():
     print(f"Scene dir: {scene_dir}")
     print(f"Frames: {len(frames)}")
     print(f"Resolution: {first_width}x{first_height}")
-    print(f"Initial gaussians: {model.means.shape[0]}")
+    print(f"Initial gaussians: {gauss_data.num_gaussians}")
     print(f"Initial grid long side cap: {args.init_grid_long_side}")
     print(f"Max resolution: {args.max_resolution or 'original'}")
     print(f"Output directory: {output_dir}")
@@ -1159,7 +1122,7 @@ def main():
             )
 
         optimizer.zero_grad()
-        rendered = model.render(
+        rendered = gauss_data.render(
             intrinsics=intrinsics,
             camera_to_world=frame.camera_to_world,
             height=height,
@@ -1190,13 +1153,13 @@ def main():
 
         # Scale regularization (PhysGaussian): penalize huge spikey gaussians
         if args.use_scale_regularization and step % 10 == 0:
-            scale_exp = torch.exp(model.log_scales)
+            scale_exp = torch.exp(gauss_data.log_scales)
             max_min_ratio = scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1).clamp(min=1e-8)
             scale_reg = torch.clamp(max_min_ratio - args.max_gauss_ratio, min=0.0).mean()
             loss = loss + 0.1 * scale_reg
 
         loss.backward()
-        grad_norms = model.means.grad.detach().norm(dim=1)
+        grad_norms = gauss_data.means.grad.detach().norm(dim=1)
         optimizer.step()
 
         last_loss = loss.detach()
@@ -1217,7 +1180,7 @@ def main():
                     snap["opacities"],
                     snap["covariances"],
                 )
-            visualizer.update_gaussian_stats(model.num_gaussians())
+            visualizer.update_gaussian_stats(gauss_data.num_gaussians)
 
         if (
             args.densify_every
@@ -1226,7 +1189,7 @@ def main():
             and (args.densify_until < 0 or (step + 1) <= args.densify_until)
         ):
             changed = densify_and_prune(
-                model=model,
+                data=gauss_data,
                 grad_norms=grad_norms,
                 grad_thresh=args.densify_grad_thresh,
                 prune_opacity_thresh=args.prune_opacity_thresh,
@@ -1240,8 +1203,8 @@ def main():
                 width=width,
             )
             if changed:
-                print(f"Densified at step {step + 1}: {model.num_gaussians()} gaussians")
-                optimizer = rebuild_optimizer(model, args.lr)
+                print(f"Densified at step {step + 1}: {gauss_data.num_gaussians} gaussians")
+                optimizer = rebuild_optimizer(gauss_data, args.lr)
                 with torch.no_grad():
                     snap = gauss_data.snapshot_for_visualizer()
                     visualizer.update_gaussians(
@@ -1250,13 +1213,13 @@ def main():
                         snap["opacities"],
                         snap["covariances"],
                     )
-                visualizer.update_gaussian_stats(model.num_gaussians())
+                visualizer.update_gaussian_stats(gauss_data.num_gaussians)
                 visualizer.update_status(
                     f"**Status:** training live at http://localhost:{args.viser_port} (densified/pruned)"
                 )
 
         if args.reset_opacity_every > 0 and (step + 1) % args.reset_opacity_every == 0 and step > 0:
-            reset_opacities(model)
+            reset_opacities(gauss_data)
             if args.densify_every:
                 print(f"Reset opacities at step {step + 1}")
         if visualizer.should_render_selected_frame(step + 1, effective_viser_update_every):
@@ -1276,7 +1239,7 @@ def main():
                     )
                 )
             with torch.no_grad():
-                selected_render = model.render(
+                selected_render = gauss_data.render(
                     intrinsics=selected_intrinsics,
                     camera_to_world=selected_frame.camera_to_world,
                     height=selected_height,
@@ -1291,7 +1254,7 @@ def main():
 
         if args.eval_every and (step + 1) % args.eval_every == 0:
             with torch.no_grad():
-                eval_render = model.render(
+                eval_render = gauss_data.render(
                     intrinsics=first_intrinsics,
                     camera_to_world=frames[0].camera_to_world,
                     height=first_height,
@@ -1300,7 +1263,7 @@ def main():
             save_image(eval_render, output_dir / f"render_frame0_step_{step + 1:05d}.png")
 
     with torch.no_grad():
-        final_render = model.render(
+        final_render = gauss_data.render(
             intrinsics=first_intrinsics,
             camera_to_world=frames[0].camera_to_world,
             height=first_height,
@@ -1321,7 +1284,7 @@ def main():
             snap["opacities"],
             snap["covariances"],
         )
-    visualizer.update_gaussian_stats(model.num_gaussians())
+    visualizer.update_gaussian_stats(gauss_data.num_gaussians)
     visualizer.update_status("**Status:** training complete")
     visualizer.update_frame_preview(0, frames[0], first_target, final_render)
 
