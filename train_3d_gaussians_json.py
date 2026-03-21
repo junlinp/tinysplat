@@ -654,21 +654,32 @@ def prepare_dataset_frames(
     return prepared
 
 
-class MultiViewGaussianSplatTrainer(nn.Module):
-    def __init__(self, gaussians: Dict[str, torch.Tensor], device: str):
-        super().__init__()
-        self.device_obj = torch.device(device)
-        self.register_parameter("means", nn.Parameter(gaussians["means"].to(self.device_obj)))
-        self.register_parameter(
-            "log_scales", nn.Parameter(gaussians["log_scales"].to(self.device_obj))
-        )
-        self.register_parameter(
-            "rotations", nn.Parameter(gaussians["rotations"].to(self.device_obj))
-        )
-        self.register_parameter("colors", nn.Parameter(gaussians["colors"].to(self.device_obj)))
-        self.register_parameter(
-            "opacities", nn.Parameter(gaussians["opacities"].to(self.device_obj))
-        )
+class GaussianData:
+    """Central manager for 3D Gaussian Splatting parameters.
+
+    Provides a single source of truth that the trainer, rasterizer,
+    and visualizer can all access.
+    """
+
+    def __init__(self, params: Dict[str, torch.Tensor], device: str):
+        self._device = torch.device(device)
+        self.means: torch.Tensor = params["means"].to(self._device)
+        self.log_scales: torch.Tensor = params["log_scales"].to(self._device)
+        self.rotations: torch.Tensor = params["rotations"].to(self._device)
+        self.colors: torch.Tensor = params["colors"].to(self._device)
+        self.opacities: torch.Tensor = params["opacities"].to(self._device)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def num_gaussians(self) -> int:
+        return self.means.shape[0]
+
+    @property
+    def num_channels(self) -> int:
+        return self.colors.shape[1]
 
     def covariance_matrices(self) -> torch.Tensor:
         scales = torch.exp(self.log_scales)
@@ -688,26 +699,29 @@ class MultiViewGaussianSplatTrainer(nn.Module):
         )
         scale_matrix = torch.diag_embed(scales * scales)
         covariance = rotation @ scale_matrix @ rotation.transpose(1, 2)
-        epsilon = torch.eye(3, device=self.device_obj).unsqueeze(0) * 1e-6
+        epsilon = torch.eye(3, device=self._device).unsqueeze(0) * 1e-6
         return covariance + epsilon
 
-    def num_gaussians(self) -> int:
-        return int(self.means.shape[0])
+    def visible_colors(self) -> torch.Tensor:
+        return torch.clamp(self.colors, 0.0, 1.0)
 
-    def replace_gaussians(self, gaussians: Dict[str, torch.Tensor]):
-        self.means = nn.Parameter(gaussians["means"].to(self.device_obj))
-        self.log_scales = nn.Parameter(gaussians["log_scales"].to(self.device_obj))
-        self.rotations = nn.Parameter(gaussians["rotations"].to(self.device_obj))
-        self.colors = nn.Parameter(gaussians["colors"].to(self.device_obj))
-        self.opacities = nn.Parameter(gaussians["opacities"].to(self.device_obj))
+    def visible_opacities(self) -> torch.Tensor:
+        return torch.sigmoid(self.opacities)
 
-    def export_gaussians(self) -> Dict[str, torch.Tensor]:
+    def replace(self, params: Dict[str, torch.Tensor]):
+        self.means = params["means"].to(self._device)
+        self.log_scales = params["log_scales"].to(self._device)
+        self.rotations = params["rotations"].to(self._device)
+        self.colors = params["colors"].to(self._device)
+        self.opacities = params["opacities"].to(self._device)
+
+    def export_params(self) -> Dict[str, torch.Tensor]:
         return {
-            "means": self.means.detach(),
-            "log_scales": self.log_scales.detach(),
-            "rotations": self.rotations.detach(),
-            "colors": self.colors.detach(),
-            "opacities": self.opacities.detach(),
+            "means": self.means.detach().cpu(),
+            "log_scales": self.log_scales.detach().cpu(),
+            "rotations": self.rotations.detach().cpu(),
+            "colors": self.colors.detach().cpu(),
+            "opacities": self.opacities.detach().cpu(),
         }
 
     def render(
@@ -720,30 +734,74 @@ class MultiViewGaussianSplatTrainer(nn.Module):
         return gaussian_splat_3d(
             means=self.means,
             covariances=self.covariance_matrices(),
-            colors=torch.clamp(self.colors, 0.0, 1.0),
-            opacities=torch.sigmoid(self.opacities),
+            colors=self.visible_colors(),
+            opacities=self.visible_opacities(),
             intrinsics=intrinsics,
             camera_to_world=camera_to_world,
             height=height,
             width=width,
-            device=self.device_obj.type,
+            device=self._device.type,
+        )
+
+    def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
+        """Return tensors ready for viser (detached, CPU, correct ranges)."""
+        return {
+            "means": self.means.detach().cpu(),
+            "colors": self.visible_colors().detach().cpu(),
+            "opacities": self.visible_opacities().detach().cpu(),
+            "covariances": self.covariance_matrices().detach().cpu(),
+        }
+
+
+class MultiViewGaussianSplatTrainer(nn.Module):
+    def __init__(self, data: GaussianData):
+        super().__init__()
+        self.data = data
+        self.register_parameter("means", nn.Parameter(data.means))
+        self.register_parameter("log_scales", nn.Parameter(data.log_scales))
+        self.register_parameter("rotations", nn.Parameter(data.rotations))
+        self.register_parameter("colors", nn.Parameter(data.colors))
+        self.register_parameter("opacities", nn.Parameter(data.opacities))
+
+    def num_gaussians(self) -> int:
+        return self.data.num_gaussians
+
+    def covariance_matrices(self) -> torch.Tensor:
+        return self.data.covariance_matrices()
+
+    def replace_gaussians(self, params: Dict[str, torch.Tensor]):
+        self.data.replace(params)
+        self.means = nn.Parameter(self.data.means)
+        self.log_scales = nn.Parameter(self.data.log_scales)
+        self.rotations = nn.Parameter(self.data.rotations)
+        self.colors = nn.Parameter(self.data.colors)
+        self.opacities = nn.Parameter(self.data.opacities)
+
+    def render(
+        self,
+        intrinsics: torch.Tensor,
+        camera_to_world: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        return gaussian_splat_3d(
+            means=self.means,
+            covariances=self.covariance_matrices(),
+            colors=self.data.visible_colors(),
+            opacities=self.data.visible_opacities(),
+            intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+            height=height,
+            width=width,
+            device=self.data.device.type,
         )
 
 
 def save_checkpoint(
-    model: MultiViewGaussianSplatTrainer,
+    data: GaussianData,
     output_path: Path,
 ):
-    torch.save(
-        {
-            "means": model.means.detach().cpu(),
-            "log_scales": model.log_scales.detach().cpu(),
-            "rotations": model.rotations.detach().cpu(),
-            "colors": model.colors.detach().cpu(),
-            "opacities": model.opacities.detach().cpu(),
-        },
-        output_path,
-    )
+    torch.save(data.export_params(), output_path)
 
 
 def rebuild_optimizer(model: MultiViewGaussianSplatTrainer, lr: float):
@@ -1031,7 +1089,8 @@ def main():
         camera_to_world=frames[0].camera_to_world,
         init_grid_long_side=args.init_grid_long_side,
     )
-    model = MultiViewGaussianSplatTrainer(gaussians=gaussians, device=device)
+    gauss_data = GaussianData(gaussians, device)
+    model = MultiViewGaussianSplatTrainer(gauss_data)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     visualizer.set_cameras(frames)
@@ -1157,11 +1216,12 @@ def main():
         visualizer.update_step(step + 1, last_loss.item(), psnr.item(), frame.image_id)
         if effective_viser_update_every and (step + 1) % effective_viser_update_every == 0:
             with torch.no_grad():
+                snap = gauss_data.snapshot_for_visualizer()
                 visualizer.update_gaussians(
-                    model.means,
-                    torch.clamp(model.colors, 0.0, 1.0),
-                    torch.sigmoid(model.opacities),
-                    model.covariance_matrices(),
+                    snap["means"],
+                    snap["colors"],
+                    snap["opacities"],
+                    snap["covariances"],
                 )
             visualizer.update_gaussian_stats(model.num_gaussians())
 
@@ -1189,11 +1249,12 @@ def main():
                 print(f"Densified at step {step + 1}: {model.num_gaussians()} gaussians")
                 optimizer = rebuild_optimizer(model, args.lr)
                 with torch.no_grad():
+                    snap = gauss_data.snapshot_for_visualizer()
                     visualizer.update_gaussians(
-                        model.means,
-                        torch.clamp(model.colors, 0.0, 1.0),
-                        torch.sigmoid(model.opacities),
-                        model.covariance_matrices(),
+                        snap["means"],
+                        snap["colors"],
+                        snap["opacities"],
+                        snap["covariances"],
                     )
                 visualizer.update_gaussian_stats(model.num_gaussians())
                 visualizer.update_status(
@@ -1256,14 +1317,15 @@ def main():
 
     save_image(final_render, output_dir / "render_frame0_final.png")
     save_image(torch.cat([first_target, final_render], dim=1), output_dir / "comparison_frame0.png")
-    save_checkpoint(model, output_dir / "gaussians.pt")
+    save_checkpoint(gauss_data, output_dir / "gaussians.pt")
 
     with torch.no_grad():
+        snap = gauss_data.snapshot_for_visualizer()
         visualizer.update_gaussians(
-            model.means,
-            torch.clamp(model.colors, 0.0, 1.0),
-            torch.sigmoid(model.opacities),
-            model.covariance_matrices(),
+            snap["means"],
+            snap["colors"],
+            snap["opacities"],
+            snap["covariances"],
         )
     visualizer.update_gaussian_stats(model.num_gaussians())
     visualizer.update_status("**Status:** training complete")
