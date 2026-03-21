@@ -5,7 +5,7 @@ import torch
 from tinysplat import gaussian_splat_3d, project_gaussians_3d_to_2d
 from tinysplat.backends_3d import get_backend_3d
 from tinysplat.backends_3d.projected import render_projected_3d
-from tinysplat_mps import HAS_COMPILED_MPS_EXTENSION, gaussian_splat_3d_forward_mps
+from tinysplat.mps import HAS_COMPILED_MPS_EXTENSION, gaussian_splat_3d_forward_mps
 
 
 def test_project_gaussian_3d_identity_camera():

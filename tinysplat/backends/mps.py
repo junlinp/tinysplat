@@ -1,7 +1,7 @@
 """MPS backend registration."""
 
 try:
-    from tinysplat_mps import (
+    from tinysplat.mps import (
         HAS_COMPILED_MPS_EXTENSION,
         gaussian_splat_2d_backward_mps,
         gaussian_splat_2d_forward_mps,

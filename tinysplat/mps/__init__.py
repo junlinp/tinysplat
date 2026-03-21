@@ -4,7 +4,6 @@ These kernels execute entirely on MPS tensors and provide a stable import
 surface for the MPS backends.
 """
 
-import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -256,8 +255,8 @@ def load_mps_extension():
     except ImportError:
         return None
 
-    source_path = Path(__file__).resolve().parent / "tinysplat" / "mps" / "tinysplat_mps.mm"
-    build_dir = Path(__file__).resolve().parent / "tinysplat" / "mps" / "build"
+    source_path = Path(__file__).resolve().parent / "tinysplat_mps.mm"
+    build_dir = Path(__file__).resolve().parent / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
     try:

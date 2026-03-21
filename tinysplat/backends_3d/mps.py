@@ -1,7 +1,7 @@
 """MPS backend for 3D Gaussian splatting."""
 
 try:
-    from tinysplat_mps import HAS_COMPILED_MPS_EXTENSION, gaussian_splat_3d_forward_mps
+    from tinysplat.mps import HAS_COMPILED_MPS_EXTENSION, gaussian_splat_3d_forward_mps
 
     from .common import Backend3DOps
 
