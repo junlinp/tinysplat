@@ -657,17 +657,17 @@ def prepare_dataset_frames(
 class GaussianData:
     """Central manager for 3D Gaussian Splatting parameters.
 
-    Provides a single source of truth that the trainer, rasterizer,
-    and visualizer can all access.
+    Holds nn.Parameter directly so the optimizer can update in-place
+    and all consumers (rasterizer, visualizer) see the same data.
     """
 
     def __init__(self, params: Dict[str, torch.Tensor], device: str):
         self._device = torch.device(device)
-        self.means: torch.Tensor = params["means"].to(self._device)
-        self.log_scales: torch.Tensor = params["log_scales"].to(self._device)
-        self.rotations: torch.Tensor = params["rotations"].to(self._device)
-        self.colors: torch.Tensor = params["colors"].to(self._device)
-        self.opacities: torch.Tensor = params["opacities"].to(self._device)
+        self.means = nn.Parameter(params["means"].to(self._device))
+        self.log_scales = nn.Parameter(params["log_scales"].to(self._device))
+        self.rotations = nn.Parameter(params["rotations"].to(self._device))
+        self.colors = nn.Parameter(params["colors"].to(self._device))
+        self.opacities = nn.Parameter(params["opacities"].to(self._device))
 
     @property
     def device(self) -> torch.device:
@@ -680,6 +680,9 @@ class GaussianData:
     @property
     def num_channels(self) -> int:
         return self.colors.shape[1]
+
+    def parameters(self):
+        return [self.means, self.log_scales, self.rotations, self.colors, self.opacities]
 
     def covariance_matrices(self) -> torch.Tensor:
         scales = torch.exp(self.log_scales)
@@ -709,11 +712,11 @@ class GaussianData:
         return torch.sigmoid(self.opacities)
 
     def replace(self, params: Dict[str, torch.Tensor]):
-        self.means = params["means"].to(self._device)
-        self.log_scales = params["log_scales"].to(self._device)
-        self.rotations = params["rotations"].to(self._device)
-        self.colors = params["colors"].to(self._device)
-        self.opacities = params["opacities"].to(self._device)
+        self.means = nn.Parameter(params["means"].to(self._device))
+        self.log_scales = nn.Parameter(params["log_scales"].to(self._device))
+        self.rotations = nn.Parameter(params["rotations"].to(self._device))
+        self.colors = nn.Parameter(params["colors"].to(self._device))
+        self.opacities = nn.Parameter(params["opacities"].to(self._device))
 
     def export_params(self) -> Dict[str, torch.Tensor]:
         return {
@@ -744,7 +747,6 @@ class GaussianData:
         )
 
     def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
-        """Return tensors ready for viser (detached, CPU, correct ranges)."""
         return {
             "means": self.means.detach().cpu(),
             "colors": self.visible_colors().detach().cpu(),
@@ -754,14 +756,16 @@ class GaussianData:
 
 
 class MultiViewGaussianSplatTrainer(nn.Module):
+    """Thin wrapper that registers GaussianData's nn.Parameters for the optimizer."""
+
     def __init__(self, data: GaussianData):
         super().__init__()
         self.data = data
-        self.register_parameter("means", nn.Parameter(data.means))
-        self.register_parameter("log_scales", nn.Parameter(data.log_scales))
-        self.register_parameter("rotations", nn.Parameter(data.rotations))
-        self.register_parameter("colors", nn.Parameter(data.colors))
-        self.register_parameter("opacities", nn.Parameter(data.opacities))
+        self.means = data.means
+        self.log_scales = data.log_scales
+        self.rotations = data.rotations
+        self.colors = data.colors
+        self.opacities = data.opacities
 
     def num_gaussians(self) -> int:
         return self.data.num_gaussians
@@ -771,11 +775,11 @@ class MultiViewGaussianSplatTrainer(nn.Module):
 
     def replace_gaussians(self, params: Dict[str, torch.Tensor]):
         self.data.replace(params)
-        self.means = nn.Parameter(self.data.means)
-        self.log_scales = nn.Parameter(self.data.log_scales)
-        self.rotations = nn.Parameter(self.data.rotations)
-        self.colors = nn.Parameter(self.data.colors)
-        self.opacities = nn.Parameter(self.data.opacities)
+        self.means = self.data.means
+        self.log_scales = self.data.log_scales
+        self.rotations = self.data.rotations
+        self.colors = self.data.colors
+        self.opacities = self.data.opacities
 
     def render(
         self,
@@ -784,17 +788,7 @@ class MultiViewGaussianSplatTrainer(nn.Module):
         height: int,
         width: int,
     ) -> torch.Tensor:
-        return gaussian_splat_3d(
-            means=self.means,
-            covariances=self.covariance_matrices(),
-            colors=self.data.visible_colors(),
-            opacities=self.data.visible_opacities(),
-            intrinsics=intrinsics,
-            camera_to_world=camera_to_world,
-            height=height,
-            width=width,
-            device=self.data.device.type,
-        )
+        return self.data.render(intrinsics, camera_to_world, height, width)
 
 
 def save_checkpoint(
