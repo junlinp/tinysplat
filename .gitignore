@@ -41,14 +41,12 @@ htmlcov/
 
 # Example outputs
 *.png
+!tests/data/lena.png
 example_*.png
 
 # Test outputs
 test_images/
 tests/test_outputs/
-
-# Test data (Lena image will be downloaded)
-tests/data/lena.png
 
 # OS
 .DS_Store
