@@ -29,6 +29,7 @@ dependencies = [
     "torch>=2.0.0",
     "numpy>=1.20.0",
     "opencv-python>=4.13.0.90",
+    "tqdm>=4.66.0",
 ]
 
 [project.optional-dependencies]
@@ -41,11 +42,11 @@ dev = [
     "pillow>=9.0.0",
 ]
 
-[tool.setuptools]
-packages = ["tinysplat"]
+[tool.setuptools.packages.find]
+include = ["tinysplat*"]
 
 [tool.setuptools.package-data]
-tinysplat = ["*.py"]
+tinysplat = ["*.py", "cpp/*.cpp"]
 
 [tool.black]
 line-length = 100
@@ -60,5 +61,3 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-
-

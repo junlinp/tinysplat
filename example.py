@@ -1,188 +1,267 @@
 """
-Example usage of TinySplat 2D Gaussian splatting.
+Train 2D Gaussian splats to reconstruct the Lena image.
+
+The script:
+1. Loads ``tests/data/lena.png``
+2. Builds one Gaussian per pixel of the working image
+3. Optimizes those Gaussians with the ``GaussianSplat2D`` PyTorch module
+4. Writes outputs into a temporary directory under the repository root
+
+The reference implementation in ``tinysplat/gaussian_splat_2d.py`` scales as
+O(num_gaussians * height * width), so the script downsamples Lena by default to
+keep the example runnable.
 """
 
+import argparse
+import math
+import tempfile
+from pathlib import Path
+
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
-try:
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    print("Warning: matplotlib not found. Install with: pip install matplotlib")
-    print("Or install dev dependencies: pip install -e '.[dev]'")
-
-from tinysplat import GaussianSplat2D, gaussian_splat_2d
+from tinysplat import GaussianSplat2D
 
 
-def example_functional():
-    """Example using the functional API."""
-    if not HAS_MATPLOTLIB:
-        print("Skipping functional example (matplotlib not available)")
-        return
-    
-    print("Running functional API example...")
-    
-    # Create some Gaussian splats
-    num_gaussians = 5
-    height, width = 256, 256
-    
-    # Means: random positions
-    means = torch.rand(num_gaussians, 2) * torch.tensor([width, height])
-    
-    # Covariances: create some elliptical Gaussians
-    covariances = []
-    for i in range(num_gaussians):
-        # Create a 2x2 covariance matrix
-        angle = i * torch.pi / num_gaussians
-        cos_a, sin_a = torch.cos(angle), torch.sin(angle)
-        R = torch.tensor([[cos_a, -sin_a], [sin_a, cos_a]])
-        S = torch.diag(torch.tensor([20.0 + i * 5, 10.0 + i * 3]))
-        cov = R @ S @ S.T @ R.T
-        covariances.append(cov)
-    covariances = torch.stack(covariances)
-    
-    # Colors: random RGB colors
-    colors = torch.rand(num_gaussians, 3)
-    
-    # Opacities: vary between 0.3 and 1.0
-    opacities = torch.linspace(0.3, 1.0, num_gaussians)
-    
-    # Render
-    image = gaussian_splat_2d(
-        means=means,
-        covariances=covariances,
-        colors=colors,
-        opacities=opacities,
+REPO_ROOT = Path(__file__).resolve().parent
+LENA_PATH = REPO_ROOT / "tests" / "data" / "lena.png"
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help="Resize Lena to a square working resolution before training. Defaults to full resolution.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=200,
+        help="Number of optimization steps.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=5e-2,
+        help="Adam learning rate.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cpu", "cuda", "mps"],
+        default="auto",
+        help="Device to use for training and rendering.",
+    )
+    parser.add_argument(
+        "--save-initial-render",
+        action="store_true",
+        help="Render and save the initial image before training. Disabled by default because it is expensive.",
+    )
+    return parser.parse_args()
+
+
+def choose_device():
+    """Pick the best available torch device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def resolve_device(device_arg: str) -> str:
+    """Resolve the requested device, validating availability when needed."""
+    if device_arg == "auto":
+        return choose_device()
+    if device_arg == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available.")
+    if device_arg == "mps":
+        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
+            raise ValueError("MPS was requested but is not available.")
+    return device_arg
+
+
+def load_lena_image(image_size: int, device: str) -> torch.Tensor:
+    """Load and resize the Lena image from the repo's test data directory."""
+    if not LENA_PATH.exists():
+        raise FileNotFoundError(
+            f"Expected Lena image at {LENA_PATH}. Run tests/download_lena.py first."
+        )
+
+    image_bgr = cv2.imread(str(LENA_PATH), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise ValueError(f"Failed to read image from {LENA_PATH}")
+
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    if image_size is not None:
+        image_rgb = cv2.resize(
+            image_rgb,
+            (image_size, image_size),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    image = torch.from_numpy(image_rgb.astype(np.float32) / 255.0).to(device)
+    return image
+
+
+def save_image(image: torch.Tensor, output_path: Path):
+    """Save a tensor image to disk."""
+    image_np = image.detach().cpu().clamp(0.0, 1.0).numpy()
+    image_np = (image_np * 255.0).astype(np.uint8)
+    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(output_path), image_bgr)
+
+
+def compute_grid_size(length: int) -> int:
+    """Compute the Gaussian grid resolution for one image axis."""
+    return max(1, length // 4)
+
+
+def build_pixel_gaussians(target: torch.Tensor) -> dict:
+    """
+    Create one learnable Gaussian per 4x4 image region.
+
+    The Gaussians start on a regular coarse grid with colors initialized from
+    pooled image patches.
+    """
+    height, width, _ = target.shape
+    grid_height = compute_grid_size(height)
+    grid_width = compute_grid_size(width)
+    dtype = target.dtype
+    device = target.device
+
+    y_coords = (
+        (torch.arange(grid_height, device=device, dtype=dtype) + 0.5)
+        * (height / grid_height)
+        - 0.5
+    ).clamp(0, height - 1)
+    x_coords = (
+        (torch.arange(grid_width, device=device, dtype=dtype) + 0.5)
+        * (width / grid_width)
+        - 0.5
+    ).clamp(0, width - 1)
+
+    means = torch.stack(
+        [
+            x_coords.repeat(grid_height),
+            y_coords.repeat_interleave(grid_width),
+        ],
+        dim=1,
+    )
+
+    pooled = F.adaptive_avg_pool2d(
+        target.permute(2, 0, 1).unsqueeze(0),
+        output_size=(grid_height, grid_width),
+    )
+    colors = pooled.squeeze(0).permute(1, 2, 0).reshape(-1, target.shape[-1]).contiguous()
+
+    # Start each Gaussian with a footprint roughly aligned to a 4x4 region.
+    initial_scale = 2.0
+    log_scales = torch.full(
+        (grid_height * grid_width, 2),
+        math.log(initial_scale),
+        device=device,
+        dtype=dtype,
+    )
+    rotations = torch.zeros(grid_height * grid_width, device=device, dtype=dtype)
+
+    # GaussianSplat2D applies sigmoid() to opacities in forward().
+    initial_alpha = 0.9
+    initial_opacity_logit = torch.logit(
+        torch.tensor(initial_alpha, device=device, dtype=dtype)
+    ).item()
+    opacity_logits = torch.full(
+        (grid_height * grid_width,),
+        initial_opacity_logit,
+        device=device,
+        dtype=dtype,
+    )
+
+    return {
+        "means": means,
+        "log_scales": log_scales,
+        "rotations": rotations,
+        "colors": colors,
+        "opacities": opacity_logits,
+    }
+
+
+def main():
+    """Run the Lena reconstruction example."""
+    args = parse_args()
+    device = resolve_device(args.device)
+
+    target = load_lena_image(args.image_size, device)
+    height, width, _ = target.shape
+    num_gaussians = compute_grid_size(height) * compute_grid_size(width)
+
+    output_dir = Path(
+        tempfile.mkdtemp(prefix="tinysplat_example_", dir=REPO_ROOT)
+    )
+
+    print(f"Using device: {device}")
+    print(f"Loaded Lena from: {LENA_PATH}")
+    print(f"Working resolution: {width}x{height}")
+    print(f"Generating {num_gaussians} Gaussian splats ((H/4) * (W/4))")
+    print(f"Output directory: {output_dir}")
+
+    gaussians = build_pixel_gaussians(target)
+    model = GaussianSplat2D(
+        gaussians=gaussians,
         height=height,
         width=width,
+        device=device,
     )
-    
-    # Display
-    plt.figure(figsize=(8, 8))
-    plt.imshow(image.detach().cpu().numpy())
-    plt.title("Functional API Example")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig("example_functional.png", dpi=150, bbox_inches="tight")
-    print("Saved example_functional.png")
-    plt.close()
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-def example_module():
-    """Example using the module API."""
-    if not HAS_MATPLOTLIB:
-        print("Skipping module example (matplotlib not available)")
-        return
-    
-    print("Running module API example...")
-    
-    # Create module
-    model = GaussianSplat2D(
-        num_gaussians=10,
-        num_channels=3,
-        height=256,
-        width=256,
-    )
-    
-    # Render
-    image = model()
-    
-    # Display
-    plt.figure(figsize=(8, 8))
-    plt.imshow(image.detach().cpu().numpy())
-    plt.title("Module API Example (Initial State)")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig("example_module_initial.png", dpi=150, bbox_inches="tight")
-    print("Saved example_module_initial.png")
-    plt.close()
-    
-    # Optimize to create a target pattern (simple example)
-    print("Optimizing to create a pattern...")
-    target = torch.zeros(256, 256, 3)
-    target[100:150, 100:150] = torch.tensor([1.0, 0.0, 0.0])  # Red square
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    
-    for i in range(100):
+    save_image(target, output_dir / "target.png")
+
+    initial_render = None
+    if args.save_initial_render:
+        print("Rendering initial image...")
+        initial_render = model().detach()
+        save_image(initial_render, output_dir / "render_initial.png")
+
+    print(f"Training for {args.iterations} iterations...")
+    progress = tqdm(range(args.iterations), desc="Training", unit="iter")
+
+    for step in progress:
         optimizer.zero_grad()
-        output = model()
-        loss = F.mse_loss(output, target.to(output.device))
+        rendered = model()
+        loss = F.mse_loss(rendered, target)
         loss.backward()
         optimizer.step()
-        
-        if (i + 1) % 20 == 0:
-            print(f"Iteration {i+1}, Loss: {loss.item():.6f}")
-    
-    # Render final result
-    final_image = model()
-    plt.figure(figsize=(8, 8))
-    plt.imshow(final_image.detach().cpu().numpy())
-    plt.title("Module API Example (After Optimization)")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig("example_module_optimized.png", dpi=150, bbox_inches="tight")
-    print("Saved example_module_optimized.png")
-    plt.close()
 
+        psnr = -10.0 * torch.log10(loss.detach() + 1e-10)
+        progress.set_postfix(loss=f"{loss.item():.6f}", psnr=f"{psnr.item():.2f} dB")
 
-def example_backend_comparison():
-    """Compare different backends."""
-    if not HAS_MATPLOTLIB:
-        print("Skipping backend comparison example (matplotlib not available)")
-        return
-    
-    print("Running backend comparison example...")
-    
-    num_gaussians = 5
-    height, width = 128, 128
-    
-    means = torch.rand(num_gaussians, 2) * torch.tensor([width, height])
-    covariances = torch.eye(2).unsqueeze(0).repeat(num_gaussians, 1, 1) * 100.0
-    colors = torch.rand(num_gaussians, 3)
-    opacities = torch.ones(num_gaussians) * 0.8
-    
-    backends = ["cpu"]
-    if torch.cuda.is_available():
-        backends.append("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        backends.append("mps")
-    
-    fig, axes = plt.subplots(1, len(backends), figsize=(5 * len(backends), 5))
-    if len(backends) == 1:
-        axes = [axes]
-    
-    for idx, backend in enumerate(backends):
-        print(f"  Rendering on {backend}...")
-        image = gaussian_splat_2d(
-            means=means,
-            covariances=covariances,
-            colors=colors,
-            opacities=opacities,
-            height=height,
-            width=width,
-            device=backend,
-        )
-        
-        axes[idx].imshow(image.detach().cpu().numpy())
-        axes[idx].set_title(f"Backend: {backend.upper()}")
-        axes[idx].axis("off")
-    
-    plt.tight_layout()
-    plt.savefig("example_backends.png", dpi=150, bbox_inches="tight")
-    print("Saved example_backends.png")
-    plt.close()
+    final_render = model().detach()
+    final_loss = F.mse_loss(final_render, target)
+    final_psnr = -10.0 * torch.log10(final_loss + 1e-10)
+
+    save_image(final_render, output_dir / "render_final.png")
+
+    if initial_render is None:
+        comparison = torch.cat([target, final_render], dim=1)
+    else:
+        comparison = torch.cat([target, initial_render, final_render], dim=1)
+    save_image(comparison, output_dir / "comparison.png")
+
+    print("Training complete.")
+    print(f"Final loss: {final_loss.item():.6f}")
+    print(f"Final PSNR: {final_psnr.item():.2f} dB")
+    if initial_render is None:
+        print(f"Saved target, final render, and comparison to: {output_dir}")
+    else:
+        print(f"Saved target, initial render, final render, and comparison to: {output_dir}")
 
 
 if __name__ == "__main__":
-    print("TinySplat 2D Gaussian Splatting Examples")
-    print("=" * 50)
-    
-    example_functional()
-    example_module()
-    example_backend_comparison()
-    
-    print("\nAll examples completed!")
-
+    main()
