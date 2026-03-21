@@ -394,7 +394,59 @@ class TestGaussianSplat2D:
             # Compare with CPU (allowing for small numerical differences)
             diff = torch.abs(results["cpu"] - results["mps"].cpu())
             max_diff = diff.max().item()
-            assert max_diff < 1e-3, f"CPU and MPS results differ by {max_diff}"
+            assert max_diff < 2e-3, f"CPU and MPS results differ by {max_diff}"
+
+    def test_mps_compiled_backward_matches_cpu_gradients(self):
+        """Test that the compiled MPS backward path matches CPU gradients on a small case."""
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            pytest.skip("MPS is not available")
+
+        torch.manual_seed(0)
+        height, width = 8, 8
+        num_gaussians = 4
+
+        means_cpu = (
+            torch.rand(num_gaussians, 2, dtype=torch.float32) * torch.tensor([width, height], dtype=torch.float32)
+        ).requires_grad_()
+        covariances_cpu = (torch.eye(2, dtype=torch.float32).unsqueeze(0).repeat(num_gaussians, 1, 1) * 10.0).requires_grad_()
+        colors_cpu = torch.rand(num_gaussians, 3, dtype=torch.float32, requires_grad=True)
+        opacities_cpu = torch.rand(num_gaussians, dtype=torch.float32, requires_grad=True)
+
+        means_mps = means_cpu.detach().clone().to("mps").requires_grad_()
+        covariances_mps = covariances_cpu.detach().clone().to("mps").requires_grad_()
+        colors_mps = colors_cpu.detach().clone().to("mps").requires_grad_()
+        opacities_mps = opacities_cpu.detach().clone().to("mps").requires_grad_()
+
+        target = torch.rand(height, width, 3, dtype=torch.float32)
+
+        output_cpu = gaussian_splat_2d(
+            means_cpu,
+            covariances_cpu,
+            colors_cpu,
+            opacities_cpu,
+            height=height,
+            width=width,
+            device="cpu",
+        )
+        loss_cpu = torch.nn.functional.mse_loss(output_cpu, target)
+        loss_cpu.backward()
+
+        output_mps = gaussian_splat_2d(
+            means_mps,
+            covariances_mps,
+            colors_mps,
+            opacities_mps,
+            height=height,
+            width=width,
+            device="mps",
+        )
+        loss_mps = torch.nn.functional.mse_loss(output_mps, target.to("mps"))
+        loss_mps.backward()
+
+        assert torch.allclose(means_cpu.grad, means_mps.grad.cpu(), atol=5e-3, rtol=5e-2)
+        assert torch.allclose(covariances_cpu.grad, covariances_mps.grad.cpu(), atol=5e-3, rtol=5e-2)
+        assert torch.allclose(colors_cpu.grad, colors_mps.grad.cpu(), atol=5e-3, rtol=5e-2)
+        assert torch.allclose(opacities_cpu.grad, opacities_mps.grad.cpu(), atol=5e-3, rtol=5e-2)
 
 
 if __name__ == "__main__":

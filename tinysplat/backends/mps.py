@@ -1,7 +1,11 @@
 """MPS backend registration."""
 
 try:
-    from tinysplat_mps import gaussian_splat_2d_backward_mps, gaussian_splat_2d_forward_mps
+    from tinysplat_mps import (
+        HAS_COMPILED_MPS_EXTENSION,
+        gaussian_splat_2d_backward_mps,
+        gaussian_splat_2d_forward_mps,
+    )
 
     from .common import BackendOps
 
@@ -9,7 +13,7 @@ try:
         name="mps",
         forward=gaussian_splat_2d_forward_mps,
         backward=gaussian_splat_2d_backward_mps,
-        is_compiled=True,
+        is_compiled=HAS_COMPILED_MPS_EXTENSION,
     )
 except ImportError:
     from .common import BackendOps
