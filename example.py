@@ -1,15 +1,12 @@
 """
-Train 2D Gaussian splats to reconstruct the Lena image.
+Train 3D Gaussian splats to reconstruct the Lena image.
 
 The script:
 1. Loads ``tests/data/lena.png``
-2. Builds one Gaussian per pixel of the working image
-3. Optimizes those Gaussians with the ``GaussianSplat2D`` PyTorch module
-4. Writes outputs into a temporary directory under the repository root
-
-The reference implementation in ``tinysplat/gaussian_splat_2d.py`` scales as
-O(num_gaussians * height * width), so the script downsamples Lena by default to
-keep the example runnable.
+2. Builds coarse 3D Gaussians in world space
+3. Projects them with camera intrinsics and a camera-to-world pose
+4. Optimizes the Gaussians with the ``GaussianSplat3D`` PyTorch module
+5. Writes outputs into a temporary directory under the repository root
 """
 
 import argparse
@@ -23,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from tinysplat import GaussianSplat2D
+from tinysplat import GaussianSplat3D
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -123,14 +120,56 @@ def compute_grid_size(length: int) -> int:
     return max(1, length // 4)
 
 
-def build_pixel_gaussians(target: torch.Tensor) -> dict:
-    """
-    Create one learnable Gaussian per 4x4 image region.
+def build_default_camera(height: int, width: int, device: torch.device, dtype: torch.dtype):
+    """Construct a simple pinhole camera with camera-to-world pose."""
+    focal_length = float(max(height, width))
+    intrinsics = torch.tensor(
+        [
+            [focal_length, 0.0, width / 2.0],
+            [0.0, focal_length, height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    camera_to_world = torch.eye(4, device=device, dtype=dtype)
+    return intrinsics, camera_to_world
 
-    The Gaussians start on a regular coarse grid with colors initialized from
-    pooled image patches.
+
+def backproject_pixels_to_world(
+    pixel_centers: torch.Tensor,
+    depth: float,
+    intrinsics: torch.Tensor,
+    camera_to_world: torch.Tensor,
+) -> torch.Tensor:
+    """Backproject pixel centers to a fronto-parallel plane in world coordinates."""
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+
+    x_cam = (pixel_centers[:, 0] - cx) * depth / fx
+    y_cam = (pixel_centers[:, 1] - cy) * depth / fy
+    z_cam = torch.full_like(x_cam, depth)
+    points_camera = torch.stack([x_cam, y_cam, z_cam], dim=1)
+
+    rotation = camera_to_world[:3, :3]
+    translation = camera_to_world[:3, 3]
+    return points_camera @ rotation.transpose(0, 1) + translation
+
+
+def build_pixel_gaussians_3d(
+    target: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world: torch.Tensor,
+) -> dict:
     """
-    height, width, _ = target.shape
+    Create one learnable 3D Gaussian per 4x4 image region.
+
+    The Gaussians start on a fronto-parallel plane in front of the camera and
+    use pooled image colors for initialization.
+    """
+    height, width, channels = target.shape
     grid_height = compute_grid_size(height)
     grid_width = compute_grid_size(width)
     dtype = target.dtype
@@ -147,7 +186,7 @@ def build_pixel_gaussians(target: torch.Tensor) -> dict:
         - 0.5
     ).clamp(0, width - 1)
 
-    means = torch.stack(
+    pixel_centers = torch.stack(
         [
             x_coords.repeat(grid_height),
             y_coords.repeat_interleave(grid_width),
@@ -159,19 +198,31 @@ def build_pixel_gaussians(target: torch.Tensor) -> dict:
         target.permute(2, 0, 1).unsqueeze(0),
         output_size=(grid_height, grid_width),
     )
-    colors = pooled.squeeze(0).permute(1, 2, 0).reshape(-1, target.shape[-1]).contiguous()
+    colors = pooled.squeeze(0).permute(1, 2, 0).reshape(-1, channels).contiguous()
 
-    # Start each Gaussian with a footprint roughly aligned to a 4x4 region.
-    initial_scale = 2.0
-    log_scales = torch.full(
-        (grid_height * grid_width, 2),
-        math.log(initial_scale),
-        device=device,
-        dtype=dtype,
+    initial_depth = 3.0
+    means = backproject_pixels_to_world(
+        pixel_centers=pixel_centers,
+        depth=initial_depth,
+        intrinsics=intrinsics,
+        camera_to_world=camera_to_world,
     )
-    rotations = torch.zeros(grid_height * grid_width, device=device, dtype=dtype)
 
-    # GaussianSplat2D applies sigmoid() to opacities in forward().
+    pixel_size_x = initial_depth / intrinsics[0, 0]
+    pixel_size_y = initial_depth / intrinsics[1, 1]
+    patch_scale_x = pixel_size_x * max(width / grid_width, 1.0) * 0.5
+    patch_scale_y = pixel_size_y * max(height / grid_height, 1.0) * 0.5
+    patch_scale_z = 0.05
+
+    log_scales = torch.stack(
+        [
+            torch.full((grid_height * grid_width,), math.log(float(patch_scale_x)), device=device, dtype=dtype),
+            torch.full((grid_height * grid_width,), math.log(float(patch_scale_y)), device=device, dtype=dtype),
+            torch.full((grid_height * grid_width,), math.log(float(patch_scale_z)), device=device, dtype=dtype),
+        ],
+        dim=1,
+    )
+
     initial_alpha = 0.9
     initial_opacity_logit = torch.logit(
         torch.tensor(initial_alpha, device=device, dtype=dtype)
@@ -186,7 +237,6 @@ def build_pixel_gaussians(target: torch.Tensor) -> dict:
     return {
         "means": means,
         "log_scales": log_scales,
-        "rotations": rotations,
         "colors": colors,
         "opacities": opacity_logits,
     }
@@ -200,19 +250,29 @@ def main():
     target = load_lena_image(args.image_size, device)
     height, width, _ = target.shape
     num_gaussians = compute_grid_size(height) * compute_grid_size(width)
-
-    output_dir = Path(
-        tempfile.mkdtemp(prefix="tinysplat_example_", dir=REPO_ROOT)
+    intrinsics, camera_to_world = build_default_camera(
+        height=height,
+        width=width,
+        device=target.device,
+        dtype=target.dtype,
     )
+
+    output_dir = Path(tempfile.mkdtemp(prefix="tinysplat_example_", dir=REPO_ROOT))
 
     print(f"Using device: {device}")
     print(f"Loaded Lena from: {LENA_PATH}")
     print(f"Working resolution: {width}x{height}")
-    print(f"Generating {num_gaussians} Gaussian splats ((H/4) * (W/4))")
+    print(f"Generating {num_gaussians} 3D Gaussian splats ((H/4) * (W/4))")
     print(f"Output directory: {output_dir}")
 
-    gaussians = build_pixel_gaussians(target)
-    model = GaussianSplat2D(
+    gaussians = build_pixel_gaussians_3d(
+        target=target,
+        intrinsics=intrinsics,
+        camera_to_world=camera_to_world,
+    )
+    model = GaussianSplat3D(
+        intrinsics=intrinsics,
+        camera_to_world=camera_to_world,
         gaussians=gaussians,
         height=height,
         width=width,
@@ -232,7 +292,7 @@ def main():
     print(f"Training for {args.iterations} iterations...")
     progress = tqdm(range(args.iterations), desc="Training", unit="iter")
 
-    for step in progress:
+    for _ in progress:
         optimizer.zero_grad()
         rendered = model()
         loss = F.mse_loss(rendered, target)
