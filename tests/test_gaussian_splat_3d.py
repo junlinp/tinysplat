@@ -86,3 +86,33 @@ def test_gaussian_splat_3d_output_shape():
     assert image.shape == (16, 16, 3)
     assert torch.all(image >= 0)
     assert torch.all(image <= 1)
+
+
+def test_gaussian_splat_3d_outside_center_still_contributes():
+    intrinsics = torch.tensor(
+        [
+            [80.0, 0.0, 8.0],
+            [0.0, 80.0, 8.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    camera_to_world = torch.eye(4)
+
+    means = torch.tensor([[-0.3, 0.0, 2.0]])
+    covariances = torch.eye(3).unsqueeze(0) * 0.2
+    colors = torch.tensor([[1.0, 0.0, 0.0]])
+    opacities = torch.tensor([0.9])
+
+    image = gaussian_splat_3d(
+        means=means,
+        covariances=covariances,
+        colors=colors,
+        opacities=opacities,
+        intrinsics=intrinsics,
+        camera_to_world=camera_to_world,
+        height=16,
+        width=16,
+        device="cpu",
+    )
+
+    assert image.sum() > 0
