@@ -783,6 +783,71 @@ def save_checkpoint(
     torch.save(data.export_params(), output_path)
 
 
+def save_ply(
+    data: GaussianData,
+    output_path: Path,
+):
+    """Export 3D Gaussians as PLY file (compatible with standard 3DGS viewers)."""
+    import numpy as np
+    from plyfile import PlyData, PlyElement
+
+    n = data.num_gaussians
+    means = data.means.detach().cpu().numpy()
+    log_scales = data.log_scales.detach().cpu().numpy()
+    rotations = data.rotations.detach().cpu().numpy()
+    colors = data.visible_colors().detach().cpu().numpy()
+    opacities = data.visible_opacities().detach().cpu().numpy()
+
+    # Normalize rotations to unit quaternion
+    norms = np.linalg.norm(rotations, axis=1, keepdims=True).clip(min=1e-8)
+    rotations = rotations / norms
+
+    # Opacity: inverse sigmoid for PLY (PLYSigmoid format)
+    opacity_inv_sigmoid = np.log(opacities / (1.0 - opacities + 1e-8))
+
+    # SH DC coefficients (constant term = color * SH_C0)
+    SH_C0 = 0.28209479177387814
+    sh_dc = colors / SH_C0
+
+    # Build vertex dtype
+    dtype_list = [
+        ("x", "f4"),
+        ("y", "f4"),
+        ("z", "f4"),
+        ("nx", "f4"),
+        ("ny", "f4"),
+        ("nz", "f4"),
+    ]
+    # SH DC (one per channel)
+    num_sh_coeffs = 1  # DC only
+    for i in range(3):  # RGB
+        for j in range(num_sh_coeffs):
+            dtype_list.append((f"f_dc_{i}", "f4"))
+    dtype_list.append(("opacity", "f4"))
+    for i in range(3):
+        dtype_list.append((f"scale_{i}", "f4"))
+    for i in range(4):
+        dtype_list.append((f"rot_{i}", "f4"))
+
+    vertices = np.zeros(n, dtype=dtype_list)
+    vertices["x"] = means[:, 0]
+    vertices["y"] = means[:, 1]
+    vertices["z"] = means[:, 2]
+    vertices["nx"] = 0.0
+    vertices["ny"] = 0.0
+    vertices["nz"] = 0.0
+    for i in range(3):
+        vertices[f"f_dc_{i}"] = sh_dc[:, i]
+    vertices["opacity"] = opacity_inv_sigmoid
+    for i in range(3):
+        vertices[f"scale_{i}"] = log_scales[:, i]
+    for i in range(4):
+        vertices[f"rot_{i}"] = rotations[:, i]
+
+    el = PlyElement.describe(vertices, "vertex")
+    PlyData([el], byte_order="<").write(str(output_path))
+
+
 def rebuild_optimizer(data: GaussianData, lr: float):
     return torch.optim.Adam(data.parameters(), lr=lr)
 
@@ -1283,6 +1348,8 @@ def main():
     save_image(final_render, output_dir / "render_frame0_final.png")
     save_image(torch.cat([first_target, final_render], dim=1), output_dir / "comparison_frame0.png")
     save_checkpoint(gauss_data, output_dir / "gaussians.pt")
+    save_ply(gauss_data, output_dir / "point_cloud.ply")
+    print(f"Exported PLY: {output_dir / 'point_cloud.ply'} ({gauss_data.num_gaussians} gaussians)")
 
     with torch.no_grad():
         snap = gauss_data.snapshot_for_visualizer()

@@ -32,6 +32,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "viser>=0.2.0",
     "pytorch-msssim>=1.0.0",
+    "plyfile>=1.0.3",
 ]
 
 [project.optional-dependencies]
