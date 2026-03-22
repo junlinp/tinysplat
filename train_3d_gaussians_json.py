@@ -51,7 +51,7 @@ class PreparedFrame:
 
 class ViserVisualizer:
     def __init__(self, port: int):
-        self.server = viser.ViserServer(port=port)
+        self.server = viser.ViserServer(port=port, host="0.0.0.0")
         self.server.scene.set_up_direction("+z")
         self.gaussian_handle = None
         self.camera_handles = {}
