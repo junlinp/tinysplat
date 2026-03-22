@@ -22,6 +22,13 @@ from tqdm.auto import tqdm
 from tinysplat import gaussian_splat_3d
 from tinysplat.gaussian_splat_3d_core import project_gaussians_3d_to_2d
 
+try:
+    from pytorch_msssim import ssim as _compute_ssim
+
+    _HAS_SSIM = True
+except ImportError:
+    _HAS_SSIM = False
+
 
 @dataclass
 class FrameSample:
@@ -228,7 +235,7 @@ def parse_args():
     parser.add_argument(
         "--init-grid-long-side",
         type=int,
-        default=64,
+        default=256,
         help="Cap the longer side of the initial Gaussian grid while keeping training at full image resolution.",
     )
     parser.add_argument(
@@ -264,11 +271,14 @@ def parse_args():
     parser.add_argument(
         "--densify-every",
         type=int,
-        default=100,
-        help="Run densify/prune every N steps. Use 0 to disable.",
+        default=1000,
+        help="Run densify/prune every N steps. Use 0 to disable. (nerfstudio default: 3000)",
     )
     parser.add_argument(
-        "--densify-from", type=int, default=50, help="Start densification after this many steps."
+        "--densify-from",
+        type=int,
+        default=500,
+        help="Start densification after this many steps. (nerfstudio default: 500)",
     )
     parser.add_argument(
         "--densify-until",
@@ -447,7 +457,7 @@ def compute_initial_grid_shape(
 
 def backproject_pixels_to_world(
     pixel_centers: torch.Tensor,
-    depth: float,
+    depth,
     intrinsics: torch.Tensor,
     camera_to_world: torch.Tensor,
 ) -> torch.Tensor:
@@ -456,9 +466,16 @@ def backproject_pixels_to_world(
     cx = intrinsics[0, 2]
     cy = intrinsics[1, 2]
 
-    x_cam = (pixel_centers[:, 0] - cx) * depth / fx
-    y_cam = (pixel_centers[:, 1] - cy) * depth / fy
-    z_cam = torch.full_like(x_cam, depth)
+    if isinstance(depth, torch.Tensor):
+        d = depth
+    else:
+        d = torch.full(
+            (pixel_centers.shape[0],), depth, dtype=pixel_centers.dtype, device=pixel_centers.device
+        )
+
+    x_cam = (pixel_centers[:, 0] - cx) * d / fx
+    y_cam = (pixel_centers[:, 1] - cy) * d / fy
+    z_cam = d
     points_camera = torch.stack([x_cam, y_cam, z_cam], dim=1)
 
     rotation = camera_to_world[:3, :3]
@@ -509,19 +526,24 @@ def build_pixel_gaussians_3d(
         )
     colors = pooled.squeeze(0).permute(1, 2, 0).reshape(-1, channels).contiguous()
 
-    initial_depth = 3.0
+    min_depth = 1.0
+    max_depth = 8.0
+    depths = (
+        torch.rand(grid_height * grid_width, device=device, dtype=dtype) * (max_depth - min_depth)
+        + min_depth
+    )
     means = backproject_pixels_to_world(
         pixel_centers=pixel_centers,
-        depth=initial_depth,
+        depth=depths,
         intrinsics=intrinsics,
         camera_to_world=camera_to_world,
     )
 
-    pixel_size_x = initial_depth / intrinsics[0, 0]
-    pixel_size_y = initial_depth / intrinsics[1, 1]
-    patch_scale_x = pixel_size_x * max(width / grid_width, 1.0) * 0.5
-    patch_scale_y = pixel_size_y * max(height / grid_height, 1.0) * 0.5
-    patch_scale_z = 0.05
+    pixel_size_x = max_depth / intrinsics[0, 0]
+    pixel_size_y = max_depth / intrinsics[1, 1]
+    patch_scale_x = pixel_size_x * max(width / grid_width, 1.0) * 1.0
+    patch_scale_y = pixel_size_y * max(height / grid_height, 1.0) * 1.0
+    patch_scale_z = 0.1
 
     log_scales = torch.stack(
         [
@@ -547,7 +569,7 @@ def build_pixel_gaussians_3d(
         dim=1,
     )
 
-    initial_alpha = 0.9
+    initial_alpha = 0.99
     initial_opacity_logit = torch.logit(
         torch.tensor(initial_alpha, device=device, dtype=dtype)
     ).item()
@@ -1129,34 +1151,8 @@ def main():
             width=width,
         )
 
-        # L1 loss (nerfstudio uses L1 instead of MSE)
-        Ll1 = torch.abs(rendered - target).mean()
-
-        # SSIM loss if available and enabled
-        simloss = torch.tensor(0.0, device=device)
-        if args.ssim_lambda > 0:
-            try:
-                from pytorch_msssim import ssim as compute_ssim
-
-                ssim_val = compute_ssim(
-                    rendered.permute(2, 0, 1).unsqueeze(0),
-                    target.permute(2, 0, 1).unsqueeze(0),
-                    data_range=1.0,
-                    size_average=True,
-                )
-                simloss = 1.0 - ssim_val
-            except ImportError:
-                pass
-
-        # nerfstudio default: (1 - ssim_lambda) * L1 + ssim_lambda * SSIM
-        loss = (1.0 - args.ssim_lambda) * Ll1 + args.ssim_lambda * simloss
-
-        # Scale regularization (PhysGaussian): penalize huge spikey gaussians
-        if args.use_scale_regularization and step % 10 == 0:
-            scale_exp = torch.exp(gauss_data.log_scales)
-            max_min_ratio = scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1).clamp(min=1e-8)
-            scale_reg = torch.clamp(max_min_ratio - args.max_gauss_ratio, min=0.0).mean()
-            loss = loss + 0.1 * scale_reg
+        # MSE loss (directly optimizes PSNR)
+        loss = F.mse_loss(rendered, target)
 
         loss.backward()
         grad_norms = gauss_data.means.grad.detach().norm(dim=1)
@@ -1164,10 +1160,22 @@ def main():
 
         last_loss = loss.detach()
         psnr = -10.0 * torch.log10(last_loss + 1e-10)
+
+        ssim_val = 0.0
+        if _HAS_SSIM:
+            with torch.no_grad():
+                ssim_val = _compute_ssim(
+                    rendered.detach().permute(2, 0, 1).unsqueeze(0),
+                    target.permute(2, 0, 1).unsqueeze(0),
+                    data_range=1.0,
+                    size_average=True,
+                ).item()
+
         progress.set_postfix(
             frame=frame.image_id,
             loss=f"{last_loss.item():.6f}",
-            psnr=f"{psnr.item():.2f} dB",
+            psnr=f"{psnr.item():.2f}",
+            ssim=f"{ssim_val:.4f}",
         )
 
         visualizer.update_step(step + 1, last_loss.item(), psnr.item(), frame.image_id)
