@@ -116,11 +116,49 @@ int gaussian_splat_backward(float* grad_output, float* means,
                             int width, int C,
                             float* grad_means, float* grad_cov,
                             float* grad_colors, float* grad_opacities) {
-    // Phase 2 implementation — for now use PyTorch fallback.
-    // Gradient computation not yet wired in Halide.
-    fprintf(stderr, "Backward not yet implemented in Halide backend — "
-                    "falling back to PyTorch.\n");
-    return -1;
+    try {
+        // Wrap raw pointers as Halide buffers
+        Halide::Buffer<float> grad_out_buf(grad_output, {height, width, C});
+        Halide::Buffer<float> means_buf(means, {N, 2});
+        Halide::Buffer<float> cov_buf(covariances, {N, 2, 2});
+        Halide::Buffer<float> colors_buf(colors, {N, C});
+        Halide::Buffer<float> opacities_buf(opacities, {N});
+
+        Halide::Buffer<float> grad_means_buf(grad_means, {N, 2});
+        Halide::Buffer<float> grad_cov_buf(grad_cov, {N, 2, 2});
+        Halide::Buffer<float> grad_colors_buf(grad_colors, {N, C});
+        Halide::Buffer<float> grad_opacities_buf(grad_opacities, {N});
+
+        grad_out_buf.set_host_dirty(true);
+
+        // Build backward pipeline
+        auto grad_funcs = tinysplat_halide::build_backward_pipeline(
+            grad_out_buf, means_buf, cov_buf, colors_buf, opacities_buf,
+            height, width, C);
+
+        // Realize each gradient Func into the output buffers
+        grad_funcs.grad_means.realize(grad_means_buf);
+        grad_funcs.grad_cov.realize(grad_cov_buf);
+        grad_funcs.grad_colors.realize(grad_colors_buf);
+        grad_funcs.grad_opacities.realize(grad_opacities_buf);
+
+        // Copy results to host
+        grad_means_buf.copy_to_host();
+        grad_cov_buf.copy_to_host();
+        grad_colors_buf.copy_to_host();
+        grad_opacities_buf.copy_to_host();
+
+        return 0;
+    } catch (const Halide::Error& e) {
+        fprintf(stderr, "Halide backward error: %s\n", e.what());
+        return -1;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "std backward error: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "Unknown backward error\n");
+        return -1;
+    }
 }
 
 }  // extern "C"
