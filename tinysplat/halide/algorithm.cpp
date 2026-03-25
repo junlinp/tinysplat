@@ -225,9 +225,120 @@ build_backward_pipeline_impl(const Buffer<float>& grad_output_in,
     Func grad_means_out("grad_means_out");
     grad_means_out(n, c) = select(c == 0, grad_means_x(n), grad_means_y(n));
 
-    // ---- grad_cov — stub ----
+    // ---- grad_cov[2x2] — analytical ----
+    // ∂weight/∂Σ[i,j] = -0.5 * op * norm * exp(-0.5*mahal) * ∂mahal/∂Σ[i,j]
+    //                 + weight * ∂(1/det)/∂Σ[i,j] / (2π*sqrt(det))
+    // For symmetric Σ with params (a,b,d) = (Σ_00, Σ_01, Σ_11):
+    //   ∂det/∂a = d, ∂det/∂b = -2b, ∂det/∂d = a
+    //   ∂norm/∂a = -d / (4π*det^1.5), ∂norm/∂b = b / (2π*det^1.5), ∂norm/∂d = -a / (4π*det^1.5)
+    //
+    // mahal = [dx,dy] · Σ⁻¹ · [dx,dy]ᵀ
+    // For diagonal Σ: mahal = dx²/a + dy²/d
+    // For full Σ: mahal = (a*dx² + 2b*dx*dy + d*dy²) / det
+    //
+    // Chain rule: ∂weight/∂Σ = -0.5 * op * norm * exp(-0.5*mahal) * ∂mahal/∂Σ
+    //                        + weight * ∂norm/∂Σ / norm
+    //
+    // We implement the full 2x2 case using the matrix derivative identity:
+    //   ∂mahal/∂Σ = -Σ⁻¹ · d · dᵀ · Σ⁻¹   (d = pixel - mean)
+    //
+    // Combined with chain rule through the exponential and normalization,
+    // we get the gradient by summing over all pixel contributions.
+
+    // Precompute mahal and weight for each (pixel, gaussian)
+    Func mahal_term("mahal_term");
+    mahal_term(x, y, n) = cast<float>(-0.5f) * mahal_b(x, y, n);
+
+    Func norm_term("norm_term");
+    norm_term(n) = norm_factor_b(n);
+
+    Func weight_term("weight_term");
+    weight_term(x, y, n) = weight_b(x, y, n);
+
+    // grad_norm/∂Σ[i,j] for 2x2 symmetric
+    // ∂norm/∂a = -cov[1,1] / (4π * det^1.5)
+    // ∂norm/∂d = -cov[0,0] / (4π * det^1.5)  
+    // ∂norm/∂b =  cov[0,1] / (2π * det^1.5)
+    Func det_pow15("det_pow15");
+    det_pow15(n) = pow(max(det_fn(n), kEps), cast<float>(1.5f));
+
+    Func grad_norm_a("grad_norm_a"), grad_norm_b("grad_norm_b"), grad_norm_d("grad_norm_d");
+    grad_norm_a(n) = -cov_b(n, 1, 1) / (cast<float>(4.0f) * kPi * det_pow15(n));
+    grad_norm_b(n) =  cov_b(n, 0, 1) / (cast<float>(2.0f) * kPi * det_pow15(n));
+    grad_norm_d(n) = -cov_b(n, 0, 0) / (cast<float>(4.0f) * kPi * det_pow15(n));
+
+    // ∂mahal/∂Σ for each (pixel, gaussian) using matrix identity
+    // mahal = dᵀ Σ⁻¹ d = (dᵀ * inv * d)
+    // ∂mahal/∂Σ = -inv * d * dᵀ * inv
+    //   = -(1/det²) * [[d², dx*dy],[dx*dy, dy²]] * [[d,-b],[-b,a]]
+    //   = -(1/det²) * [[d*dx²-b*dx*dy, d*dx*dy - ab*dy], ...]
+    //
+    // For each of the 3 unique elements (a,b,d) of symmetric Σ:
+    Func mahal_grad_a("mahal_grad_a"), mahal_grad_b("mahal_grad_b"), mahal_grad_d("mahal_grad_d");
+    mahal_grad_a(x, y, n) = -inv_cov_b(n, 0, 0) * dx_b(x, y, n) * inv_cov_b(n, 0, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 0, 0) * dx_b(x, y, n) * inv_cov_b(n, 0, 1) * dy_b(x, y, n)
+                           - inv_cov_b(n, 0, 1) * dy_b(x, y, n) * inv_cov_b(n, 0, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 0, 1) * dy_b(x, y, n) * inv_cov_b(n, 0, 1) * dy_b(x, y, n);
+    mahal_grad_b(x, y, n) = -inv_cov_b(n, 0, 0) * dx_b(x, y, n) * inv_cov_b(n, 1, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 0, 0) * dx_b(x, y, n) * inv_cov_b(n, 1, 1) * dy_b(x, y, n)
+                           - inv_cov_b(n, 0, 1) * dy_b(x, y, n) * inv_cov_b(n, 1, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 0, 1) * dy_b(x, y, n) * inv_cov_b(n, 1, 1) * dy_b(x, y, n);
+    mahal_grad_d(x, y, n) = -inv_cov_b(n, 1, 0) * dx_b(x, y, n) * inv_cov_b(n, 1, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 1, 0) * dx_b(x, y, n) * inv_cov_b(n, 1, 1) * dy_b(x, y, n)
+                           - inv_cov_b(n, 1, 1) * dy_b(x, y, n) * inv_cov_b(n, 1, 0) * dx_b(x, y, n)
+                           - inv_cov_b(n, 1, 1) * dy_b(x, y, n) * inv_cov_b(n, 1, 1) * dy_b(x, y, n);
+
+    // Combined gradient: ∂weight/∂Σ = op * ( -0.5*exp(-0.5*mahal)*norm*∂mahal/∂Σ + weight*grad_norm/det_term )
+    // Chain rule through Σ: we sum over all pixels and channels
+    // ∂L/∂Σ = Σ_{pixels,channels} grad_out * ∂output/∂weight * ∂weight/∂Σ
+    // output_norm = total_color / total_weight
+    // ∂output/∂weight is complex; we use chain_term from earlier
+    //
+    // Simplified: use weight_b * chain_term already computed for gradient
+
+    // For grad_cov, we use the full chain:
+    // ∂L/∂Σ = Σ grad_out * (∂composite/∂weight) * ∂weight/∂Σ
+    // where composite includes both color weighting and normalization
+
+    // grad_cov[0,0] = Σ_x,y,c grad_out * chain_term * (-0.5 * op * norm * mahal_grad_a)
+    //                 + Σ_x,y,c grad_out * weight * grad_norm_a / norm * (2π*sqrt(det))
+    // But this is complex. Use weight_b * chain_term already accumulated.
+    //
+    // Final: grad_cov[i,j] = Σ (weight_b * chain_term * mahal_grad + weight_b * grad_norm_term)
+
+    Func contrib_cov_a("contrib_cov_a"), contrib_cov_b("contrib_cov_b"), contrib_cov_d("contrib_cov_d");
+    contrib_cov_a(x, y, c, n) =
+        weight_b(x, y, n)
+        * (cast<float>(-0.5f) * mahal_grad_a(x, y, n)
+           + grad_norm_a(n) / max(norm_factor_b(n), kEps))
+        * chain_term(x, y, c, n);
+
+    contrib_cov_b(x, y, c, n) =
+        weight_b(x, y, n)
+        * (cast<float>(-0.5f) * mahal_grad_b(x, y, n)
+           + grad_norm_b(n) / max(norm_factor_b(n), kEps))
+        * chain_term(x, y, c, n);
+
+    contrib_cov_d(x, y, c, n) =
+        weight_b(x, y, n)
+        * (cast<float>(-0.5f) * mahal_grad_d(x, y, n)
+           + grad_norm_d(n) / max(norm_factor_b(n), kEps))
+        * chain_term(x, y, c, n);
+
+    Func grad_cov_a("grad_cov_a"), grad_cov_b("grad_cov_b"), grad_cov_d("grad_cov_d");
+    grad_cov_a(n) = cast<float>(0.0f);
+    grad_cov_b(n) = cast<float>(0.0f);
+    grad_cov_d(n) = cast<float>(0.0f);
+    grad_cov_a(n) += contrib_cov_a(r_all.x, r_all.y, r_all.z, n);
+    grad_cov_b(n) += contrib_cov_b(r_all.x, r_all.y, r_all.z, n);
+    grad_cov_d(n) += contrib_cov_d(r_all.x, r_all.y, r_all.z, n);
+
     Func grad_cov_out("grad_cov_out");
     grad_cov_out(n, c, r) = cast<float>(0.0f);
+    grad_cov_out(n, 0, 0) = grad_cov_a(n);  // Σ_00
+    grad_cov_out(n, 0, 1) = grad_cov_b(n);  // Σ_01
+    grad_cov_out(n, 1, 0) = grad_cov_b(n);  // Σ_10 = Σ_01
+    grad_cov_out(n, 1, 1) = grad_cov_d(n);  // Σ_11
 
     return {grad_means_out, grad_cov_out, grad_colors_out, grad_opacities_out};
 }

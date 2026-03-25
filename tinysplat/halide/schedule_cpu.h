@@ -9,13 +9,9 @@
  * Key decisions:
  *   - Tile the (x,y) canvas into 32×32 tiles.
  *   - Vectorise the inner x dimension (8-wide float32 SIMD).
- *   - Parallelise over tiles (Halide auto-parallelizes on CPU).
- *   - Inner Gaussian loop is fused into the tile computation.
- *
- * Schedule per Func:
- *   output:       root → tile(x,16,y,16) → vectorize(xi,8) → parallel(yo)
- *   accum_color:  computed at output tile → vectorize → unroll yi
- *   accum_weight: computed at output tile → vectorize
+ *   - Parallelise over outer tile y.
+ *   - Accumulation (accum_weight, accum_color): compute at innermost xi level
+ *     so each thread computes its tile's accumulation fully.
  */
 
 #include <Halide.h>
@@ -35,7 +31,6 @@ inline void apply_cpu_schedule(Func& output,
                                int width,
                                int num_channels) {
     Var x("x"), y("y"), c("c"), xi("xi"), yi("yi"), xo("xo"), yo("yo");
-
     (void)num_channels;
 
     // ---- output: tile → vectorize → parallel ----
@@ -44,19 +39,17 @@ inline void apply_cpu_schedule(Func& output,
         .vectorize(xi, 8, TailStrategy::RoundUp)
         .parallel(yo);
 
-    // ---- accum_weight: same tiling, fused at output ----
+    // ---- accum_weight: compute at innermost xi to fuse into tile ----
+    // accum_weight(x, y) computes Σ_n weight(x, y, n)
+    // by computing at xi, each thread's accum is computed within its tile
     accum_weight
-        .compute_at(output, xo)
-        .tile(x, y, xi, yi, 8, 8)
-        .vectorize(xi, 8)
-        .unroll(yi);
+        .compute_at(output, xi)
+        .vectorize(x, 8);
 
-    // ---- accum_color: same tiling with channel dim ----
+    // ---- accum_color: same, but with channel dim ----
     accum_color
-        .compute_at(output, xo)
-        .tile(x, y, xi, yi, 8, 4)
-        .vectorize(xi, 8)
-        .unroll(yi);
+        .compute_at(output, xi)
+        .vectorize(x, 8);
 }
 
 }  // namespace schedule
