@@ -28,13 +28,13 @@ namespace tinysplat_halide {
  * via apply_forward_schedule(Target) before realize().
  */
 struct ForwardPipeline {
-    Func output;           // (x, y, c) — final composited image
-    Func accum_color;      // (x, y, c) — numerator sum
-    Func accum_weight;     // (x, y)    — denominator sum
-    Func weight;           // (x, y, n) — per-Gaussian per-pixel weight
-    Func total_weight_pix; // (x, y)    — Σ weight[n] over n
-    Func total_color_pix;  // (x, y, c) — Σ weight[n] × colors[n] over n
-    Func output_norm;      // (x, y, c) — normalized output
+    Func output;           // (y, x, c) — final composited image
+    Func accum_color;      // (y, x, c) — numerator sum
+    Func accum_weight;     // (y, x)    — denominator sum
+    Func weight;           // (y, x, n) — per-Gaussian per-pixel weight
+    Func total_weight_pix; // (y, x)    — alias for accum_weight
+    Func total_color_pix;  // (y, x, c) — alias for accum_color
+    Func output_norm;      // (y, x, c) — normalized output
 };
 
 /**

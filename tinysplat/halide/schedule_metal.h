@@ -1,16 +1,6 @@
 #ifndef TINYSPLAT_HALIDE_SCHEDULE_METAL_H
 #define TINYSPLAT_HALIDE_SCHEDULE_METAL_H
 
-/**
- * Metal / MPS Schedule for TinySplat Halide Pipeline
- * ==================================================
- * Target: Apple Metal GPU (MPS backend on macOS)
- *
- * Forward schedule:
- *   - Threadgroup: 16×16 threads covering a pixel tile.
- *   - Threadgrid: full canvas split into tiles.
- */
-
 #include <Halide.h>
 
 namespace tinysplat_halide {
@@ -19,66 +9,47 @@ namespace schedule {
 using namespace Halide;
 
 /**
- * Apply Metal schedule to forward pipeline Funcs.
- * Metal gpu_tile maps to threadgroup scheduling.
+ * Apply Metal schedule to forward pipeline.
+ * Pipeline uses (y, x, c) convention.
  */
 inline void apply_metal_schedule(Func& output,
-                                Func& accum_color,
-                                Func& accum_weight,
-                                int height,
-                                int width,
-                                int num_channels) {
-    Var x("x"), y("y"), c("c"), xi("xi"), yi("yi");
-    (void)num_channels;
+                                 Func& accum_color,
+                                 Func& accum_weight,
+                                 int height,
+                                 int width,
+                                 int num_channels) {
+    Var x("x"), y("y"), c("c"), xi("xi"), yi("yi"), xo("xo"), yo("yo");
+    (void)height; (void)width; (void)num_channels;
 
-    // ---- Forward output ----
     output
-        .tile(x, y, xi, yi, 16, 16)
-        .reorder(xi, yi, c, x, y)
-        .gpu_blocks(x, y)
-        .gpu_threads(xi, yi);
+        .tile(y, x, yo, xo, yi, xi, 16, 16, TailStrategy::RoundUp)
+        .gpu_blocks(yo, xo)
+        .gpu_threads(yi, xi);
 
-    // ---- Accumulation ----
     accum_weight
-        .tile(x, y, xi, yi, 16, 16)
-        .gpu_blocks(x, y)
-        .gpu_threads(xi, yi);
+        .compute_at(output, xo)
+        .gpu_threads(x);
 
     accum_color
-        .tile(x, y, xi, yi, 16, 16)
-        .reorder(xi, yi, c, x, y)
-        .gpu_blocks(x, y)
-        .gpu_threads(xi, yi);
+        .compute_at(output, xo)
+        .gpu_threads(x, c);
 }
 
 /**
- * Apply Metal schedule to backward pipeline Funcs.
+ * Apply Metal schedule to backward pipeline.
  */
 inline void apply_metal_schedule_backward(Func& grad_means,
-                                        Func& grad_cov,
-                                        Func& grad_colors,
-                                        Func& grad_opacities,
-                                        int height,
-                                        int width,
-                                        int num_channels,
-                                        int N) {
-    Var n("n"), c("c");
+                                          Func& grad_cov,
+                                          Func& grad_colors,
+                                          Func& grad_opacities,
+                                          int height, int width,
+                                          int num_channels, int N) {
     (void)height; (void)width; (void)num_channels; (void)N;
 
-    // grad_colors: (n, c)
-    grad_colors
-        .gpu_blocks(n)
-        .gpu_threads(n);
-
-    // grad_opacities: (n,)
-    grad_opacities
-        .gpu_blocks(n)
-        .gpu_threads(n);
-
-    // grad_means: (n, 2)
-    grad_means
-        .gpu_blocks(n)
-        .gpu_threads(n);
+    grad_means.compute_root();
+    grad_cov.compute_root();
+    grad_colors.compute_root();
+    grad_opacities.compute_root();
 }
 
 }  // namespace schedule

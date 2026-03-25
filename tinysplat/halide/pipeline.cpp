@@ -86,7 +86,7 @@ int gaussian_splat_forward(float* means, float* covariances, float* colors,
         Buffer<float> cov_buf(covariances, {N, 2, 2});
         Buffer<float> colors_buf(colors, {N, C});
         Buffer<float> opacities_buf(opacities, {N});
-        Buffer<float> output_buf(output, {width, height, C});
+        Buffer<float> output_buf(output, {height, width, C});
 
         means_buf.set_host_dirty(true);
         cov_buf.set_host_dirty(true);
