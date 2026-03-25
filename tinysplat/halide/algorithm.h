@@ -19,27 +19,51 @@ using Halide::Func;
 namespace tinysplat_halide {
 
 // ---------------------------------------------------------------------------
-// Forward pass
+// Forward pass — returns Funcs for scheduling before realize
 // ---------------------------------------------------------------------------
 
 /**
- * Build the forward Gaussian splatting pipeline.
- *
- * @param means_var        (N, 2)    float32
- * @param covariances_var  (N, 2, 2) float32
- * @param colors_var       (N, C)    float32
- * @param opacities_var    (N,)      float32
- * @param height           canvas height
- * @param width            canvas width
- * @param num_channels     3 or 4
- * @return {output_func, intermediates}
+ * Forward pipeline Funcs.
+ * All Funcs are built but NOT scheduled — caller applies schedule
+ * via apply_forward_schedule(Target) before realize().
  */
-std::pair<Func, std::vector<Buffer<float>>>
+struct ForwardPipeline {
+    Func output;           // (x, y, c) — final composited image
+    Func accum_color;      // (x, y, c) — numerator sum
+    Func accum_weight;     // (x, y)    — denominator sum
+    Func weight;           // (x, y, n) — per-Gaussian per-pixel weight
+    Func total_weight_pix; // (x, y)    — Σ weight[n] over n
+    Func total_color_pix;  // (x, y, c) — Σ weight[n] × colors[n] over n
+    Func output_norm;      // (x, y, c) — normalized output
+};
+
+/**
+ * Build the forward pipeline.
+ * Returns ForwardPipeline with all Funcs defined.
+ * Caller applies schedule, then realizes output.
+ */
+ForwardPipeline
 build_forward_pipeline(const Buffer<float>& means_var,
-                       const Buffer<float>& covariances_var,
-                       const Buffer<float>& colors_var,
-                       const Buffer<float>& opacities_var,
-                       int height, int width, int num_channels);
+                      const Buffer<float>& covariances_var,
+                      const Buffer<float>& colors_var,
+                      const Buffer<float>& opacities_var,
+                      int height, int width, int num_channels);
+
+/**
+ * Apply CPU schedule to a ForwardPipeline.
+ */
+void apply_cpu_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
+
+/**
+ * Apply CUDA schedule to a ForwardPipeline.
+ */
+void apply_cuda_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
+
+/**
+ * Apply Metal schedule to a ForwardPipeline.
+ */
+void apply_metal_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
+
 
 // ---------------------------------------------------------------------------
 // Backward pass — analytical gradients
@@ -47,35 +71,40 @@ build_forward_pipeline(const Buffer<float>& means_var,
 
 /**
  * Gradient Funcs from backward pipeline.
- * Each Func can be realized into a Buffer of the appropriate shape.
  */
 struct GradientFuncs {
-    Func grad_means;      // (N, 2)
-    Func grad_cov;        // (N, 2, 2) — stub (zero)
-    Func grad_colors;     // (N, C)
-    Func grad_opacities;  // (N,)
+    Func grad_means;      // (n, c) — c=0 is x, c=1 is y
+    Func grad_cov;        // (n, c, r) — stub (zero) until Phase 3
+    Func grad_colors;     // (n, c)
+    Func grad_opacities;  // (n,)
 };
 
 /**
  * Build the backward gradient pipeline.
- *
- * Computes analytical gradients:
- *   grad_colors    = Σ_{x,y} grad_out[x,y,c] × weight[n,x,y] / total_weight[x,y]
- *   grad_opacities = Σ_{x,y,c} grad_out × norm × exp(-0.5×mahal)
- *                     × (colors - output) / total_weight
- *   grad_means     = Σ_{x,y,c} grad_out × weight × (colors - output) / total_weight
- *                     × (-inv_cov × (pixel - mean))
- *   grad_cov       = stub (zero); Phase 3 via Halide generate_adjoints
- *
- * @return GradientFuncs struct with Funcs ready to realize
+ * Returns GradientFuncs ready to schedule and realize.
  */
 GradientFuncs
 build_backward_pipeline(const Buffer<float>& grad_output_var,
-                         const Buffer<float>& means_var,
-                         const Buffer<float>& covariances_var,
-                         const Buffer<float>& colors_var,
-                         const Buffer<float>& opacities_var,
-                         int height, int width, int num_channels);
+                        const Buffer<float>& means_var,
+                        const Buffer<float>& covariances_var,
+                        const Buffer<float>& colors_var,
+                        const Buffer<float>& opacities_var,
+                        int height, int width, int num_channels);
+
+/**
+ * Apply CPU schedule to GradientFuncs.
+ */
+void apply_cpu_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
+
+/**
+ * Apply CUDA schedule to GradientFuncs.
+ */
+void apply_cuda_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
+
+/**
+ * Apply Metal schedule to GradientFuncs.
+ */
+void apply_metal_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
 
 }  // namespace tinysplat_halide
 
