@@ -2,12 +2,14 @@
  * pipeline.cpp
  *
  * JIT-compiled forward + backward pipelines for 2D Gaussian splatting.
- * Applies target-specific schedules (CPU/CUDA/Metal) before realize.
- * Exposes a C API callable from Python via ctypes.
+ *
+ * Key performance feature: pipelines are built and JIT-compiled ONCE per
+ * (H, W, C) configuration. Subsequent calls with the same dimensions
+ * rebind input buffers and re-execute without recompilation.
+ * N (number of Gaussians) is a runtime parameter via ImageParam extents.
  *
  * Build:
  *   HL_PATH=/path/to/halide make
- *
  *   Produces: libtinysplat_halide_pipeline.so
  */
 
@@ -15,20 +17,22 @@
 #include <HalideRuntime.h>
 #include <cstdio>
 #include <cstdlib>
-#include <vector>
+#include <memory>
 #include "algorithm.h"
 
 using namespace Halide;
 
 namespace {
 
-// Detect target from environment
+// -------------------------------------------------------------------------
+// Target detection
+// -------------------------------------------------------------------------
+
 enum class TargetBackend { Auto, CPU, CUDA, Metal };
 
 TargetBackend get_target_backend() {
     const char* env = getenv("HL_TARGET");
     if (!env) return TargetBackend::Auto;
-
     std::string target(env);
     if (target.find("cuda") != std::string::npos) return TargetBackend::CUDA;
     if (target.find("metal") != std::string::npos) return TargetBackend::Metal;
@@ -37,10 +41,8 @@ TargetBackend get_target_backend() {
 
 Target get_halide_target() {
     TargetBackend backend = get_target_backend();
-
     switch (backend) {
         case TargetBackend::CUDA: {
-            // Try CUDA target, fall back to host if unavailable
             Target t = get_host_target();
             t.set_feature(Target::CUDA);
             return t;
@@ -50,11 +52,87 @@ Target get_halide_target() {
             t.set_feature(Target::Metal);
             return t;
         }
-        case TargetBackend::CPU:
-        case TargetBackend::Auto:
         default:
             return get_host_target();
     }
+}
+
+// -------------------------------------------------------------------------
+// Pipeline cache: avoid JIT recompilation on every call
+// -------------------------------------------------------------------------
+
+struct ForwardCache {
+    std::unique_ptr<tinysplat_halide::ForwardPipeline> pipeline;
+    int H = 0, W = 0, C = 0;
+};
+
+struct BackwardCache {
+    std::unique_ptr<tinysplat_halide::GradientPipeline> pipeline;
+    int H = 0, W = 0, C = 0;
+};
+
+static ForwardCache  g_fwd_cache;
+static BackwardCache g_bwd_cache;
+
+tinysplat_halide::ForwardPipeline&
+ensure_forward_pipeline(int H, int W, int C, const Target& target) {
+    if (g_fwd_cache.pipeline &&
+        g_fwd_cache.H == H && g_fwd_cache.W == W && g_fwd_cache.C == C) {
+        return *g_fwd_cache.pipeline;
+    }
+
+    g_fwd_cache.pipeline = std::make_unique<tinysplat_halide::ForwardPipeline>();
+    auto& p = *g_fwd_cache.pipeline;
+
+    tinysplat_halide::build_forward(p, H, W, C);
+
+    TargetBackend backend = get_target_backend();
+    if (backend == TargetBackend::CUDA) {
+        tinysplat_halide::apply_cuda_schedule_forward(p, H, W, C);
+    } else if (backend == TargetBackend::Metal) {
+        tinysplat_halide::apply_metal_schedule_forward(p, H, W, C);
+    } else {
+        tinysplat_halide::apply_cpu_schedule_forward(p, H, W, C);
+    }
+
+    p.output.compile_jit(target);
+
+    g_fwd_cache.H = H;
+    g_fwd_cache.W = W;
+    g_fwd_cache.C = C;
+    return p;
+}
+
+tinysplat_halide::GradientPipeline&
+ensure_backward_pipeline(int H, int W, int C, const Target& target) {
+    if (g_bwd_cache.pipeline &&
+        g_bwd_cache.H == H && g_bwd_cache.W == W && g_bwd_cache.C == C) {
+        return *g_bwd_cache.pipeline;
+    }
+
+    g_bwd_cache.pipeline = std::make_unique<tinysplat_halide::GradientPipeline>();
+    auto& g = *g_bwd_cache.pipeline;
+
+    tinysplat_halide::build_backward(g, H, W, C);
+
+    TargetBackend backend = get_target_backend();
+    if (backend == TargetBackend::CUDA) {
+        tinysplat_halide::apply_cuda_schedule_backward(g, H, W, C);
+    } else if (backend == TargetBackend::Metal) {
+        tinysplat_halide::apply_metal_schedule_backward(g, H, W, C);
+    } else {
+        tinysplat_halide::apply_cpu_schedule_backward(g, H, W, C);
+    }
+
+    g.grad_means.compile_jit(target);
+    g.grad_cov.compile_jit(target);
+    g.grad_colors.compile_jit(target);
+    g.grad_opacities.compile_jit(target);
+
+    g_bwd_cache.H = H;
+    g_bwd_cache.W = W;
+    g_bwd_cache.C = C;
+    return g;
 }
 
 }  // anonymous namespace
@@ -62,26 +140,17 @@ Target get_halide_target() {
 
 extern "C" {
 
-// ---------------------------------------------------------------------------
-// Forward pass — C API
-// ---------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Forward pass: C API
+// -------------------------------------------------------------------------
 
-/**
- * gaussian_splat_forward(
- *     float* means,           // (N, 2)
- *     float* covariances,     // (N, 2, 2)
- *     float* colors,          // (N, C)
- *     float* opacities,       // (N,)
- *     int N, int height, int width, int C,
- *     float* output           // (height, width, C) — output
- * )
- *
- * Returns 0 on success, non-zero on error.
- */
 int gaussian_splat_forward(float* means, float* covariances, float* colors,
                            float* opacities, int N, int height, int width,
                            int C, float* output) {
     try {
+        Target target = get_halide_target();
+        auto& p = ensure_forward_pipeline(height, width, C, target);
+
         Buffer<float> means_buf(means, {N, 2});
         Buffer<float> cov_buf(covariances, {N, 2, 2});
         Buffer<float> colors_buf(colors, {N, C});
@@ -93,62 +162,32 @@ int gaussian_splat_forward(float* means, float* covariances, float* colors,
         colors_buf.set_host_dirty(true);
         opacities_buf.set_host_dirty(true);
 
-        // Build pipeline
-        auto p = tinysplat_halide::build_forward_pipeline(
-            means_buf, cov_buf, colors_buf, opacities_buf,
-            height, width, C);
+        p.means_ip.set(means_buf);
+        p.cov_ip.set(cov_buf);
+        p.colors_ip.set(colors_buf);
+        p.opacities_ip.set(opacities_buf);
 
-        // Apply target-specific schedule
-        Target target = get_halide_target();
-        TargetBackend backend = get_target_backend();
-
-        if (backend == TargetBackend::CUDA) {
-            tinysplat_halide::apply_cuda_schedule_forward(p, height, width, C);
-        } else if (backend == TargetBackend::Metal) {
-            tinysplat_halide::apply_metal_schedule_forward(p, height, width, C);
-        } else {
-            // CPU schedule or auto
-            tinysplat_halide::apply_cpu_schedule_forward(p, height, width, C);
-        }
-
-        // Realize
         p.output.realize(output_buf, target);
         output_buf.copy_to_host();
         return 0;
 
     } catch (const Halide::Error& e) {
-        fprintf(stderr, "Halide error: %s\n", e.what());
+        fprintf(stderr, "Halide forward error: %s\n", e.what());
         return -1;
     } catch (const std::exception& e) {
-        fprintf(stderr, "std error: %s\n", e.what());
+        fprintf(stderr, "std forward error: %s\n", e.what());
         return -1;
     } catch (...) {
-        fprintf(stderr, "Unknown error\n");
+        fprintf(stderr, "Unknown forward error\n");
         return -1;
     }
 }
 
 
-// ---------------------------------------------------------------------------
-// Backward pass — C API
-// ---------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Backward pass: C API
+// -------------------------------------------------------------------------
 
-/**
- * gaussian_splat_backward(
- *     float* grad_output,      // (height, width, C)
- *     float* means,           // (N, 2)
- *     float* covariances,     // (N, 2, 2)
- *     float* colors,          // (N, C)
- *     float* opacities,       // (N,)
- *     int N, int height, int width, int C,
- *     float* grad_means,      // (N, 2)      — output
- *     float* grad_cov,        // (N, 2, 2)   — output
- *     float* grad_colors,     // (N, C)      — output
- *     float* grad_opacities  // (N,)        — output
- * )
- *
- * Returns 0 on success, non-zero on error.
- */
 int gaussian_splat_backward(float* grad_output, float* means,
                             float* covariances, float* colors,
                             float* opacities, int N, int height,
@@ -156,6 +195,9 @@ int gaussian_splat_backward(float* grad_output, float* means,
                             float* grad_means, float* grad_cov,
                             float* grad_colors, float* grad_opacities) {
     try {
+        Target target = get_halide_target();
+        auto& g = ensure_backward_pipeline(height, width, C, target);
+
         Buffer<float> grad_out_buf(grad_output, {height, width, C});
         Buffer<float> means_buf(means, {N, 2});
         Buffer<float> cov_buf(covariances, {N, 2, 2});
@@ -168,27 +210,17 @@ int gaussian_splat_backward(float* grad_output, float* means,
         Buffer<float> grad_opacities_buf(grad_opacities, {N});
 
         grad_out_buf.set_host_dirty(true);
+        means_buf.set_host_dirty(true);
+        cov_buf.set_host_dirty(true);
+        colors_buf.set_host_dirty(true);
+        opacities_buf.set_host_dirty(true);
 
-        // Build backward pipeline
-        auto g = tinysplat_halide::build_backward_pipeline(
-            grad_out_buf, means_buf, cov_buf, colors_buf, opacities_buf,
-            height, width, C);
+        g.grad_output_ip.set(grad_out_buf);
+        g.means_ip.set(means_buf);
+        g.cov_ip.set(cov_buf);
+        g.colors_ip.set(colors_buf);
+        g.opacities_ip.set(opacities_buf);
 
-        Target target = get_halide_target();
-        TargetBackend backend = get_target_backend();
-
-        if (backend == TargetBackend::CUDA) {
-            tinysplat_halide::apply_cuda_schedule_backward(
-                g, height, width, C, N);
-        } else if (backend == TargetBackend::Metal) {
-            tinysplat_halide::apply_metal_schedule_backward(
-                g, height, width, C, N);
-        } else {
-            tinysplat_halide::apply_cpu_schedule_backward(
-                g, height, width, C, N);
-        }
-
-        // Realize gradients
         g.grad_means.realize(grad_means_buf, target);
         g.grad_cov.realize(grad_cov_buf, target);
         g.grad_colors.realize(grad_colors_buf, target);

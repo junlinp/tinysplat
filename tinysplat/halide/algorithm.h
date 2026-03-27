@@ -6,105 +6,75 @@
  * ======================================
  * Forward + Backward pipelines for 2D Gaussian splatting.
  *
+ * Uses ImageParam inputs so pipelines can be JIT-compiled once and reused
+ * across calls with different input data (N may vary at runtime).
+ *
  * Build:  HL_PATH=$HOME/halide make
  */
 
 #include <Halide.h>
-#include <vector>
-
-using Halide::Buffer;
-using Halide::Expr;
-using Halide::Func;
 
 namespace tinysplat_halide {
 
 // ---------------------------------------------------------------------------
-// Forward pass — returns Funcs for scheduling before realize
+// Forward pipeline
 // ---------------------------------------------------------------------------
 
-/**
- * Forward pipeline Funcs.
- * All Funcs are built but NOT scheduled — caller applies schedule
- * via apply_forward_schedule(Target) before realize().
- */
 struct ForwardPipeline {
-    Func output;           // (y, x, c) — final composited image
-    Func accum_color;      // (y, x, c) — numerator sum
-    Func accum_weight;     // (y, x)    — denominator sum
-    Func weight;           // (y, x, n) — per-Gaussian per-pixel weight
-    Func total_weight_pix; // (y, x)    — alias for accum_weight
-    Func total_color_pix;  // (y, x, c) — alias for accum_color
-    Func output_norm;      // (y, x, c) — normalized output
+    Halide::ImageParam means_ip{Halide::Float(32), 2, "means"};
+    Halide::ImageParam cov_ip{Halide::Float(32), 3, "cov"};
+    Halide::ImageParam colors_ip{Halide::Float(32), 2, "colors"};
+    Halide::ImageParam opacities_ip{Halide::Float(32), 1, "opacities"};
+
+    Halide::Func output{"forward_output"};
+
+    Halide::Func det{"det"};
+    Halide::Func norm_factor{"norm_factor"};
+    Halide::Func inv_cov{"inv_cov"};
+    Halide::Func accum_color{"accum_color"};
+    Halide::Func accum_weight{"accum_weight"};
+    Halide::Func weight{"weight"};
+    Halide::Func output_norm{"output_norm"};
+
+    bool built = false;
 };
 
-/**
- * Build the forward pipeline.
- * Returns ForwardPipeline with all Funcs defined.
- * Caller applies schedule, then realizes output.
- */
-ForwardPipeline
-build_forward_pipeline(const Buffer<float>& means_var,
-                      const Buffer<float>& covariances_var,
-                      const Buffer<float>& colors_var,
-                      const Buffer<float>& opacities_var,
-                      int height, int width, int num_channels);
-
-/**
- * Apply CPU schedule to a ForwardPipeline.
- */
+void build_forward(ForwardPipeline& p, int height, int width, int num_channels);
 void apply_cpu_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
-
-/**
- * Apply CUDA schedule to a ForwardPipeline.
- */
 void apply_cuda_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
-
-/**
- * Apply Metal schedule to a ForwardPipeline.
- */
 void apply_metal_schedule_forward(ForwardPipeline& p, int height, int width, int num_channels);
 
-
 // ---------------------------------------------------------------------------
-// Backward pass — analytical gradients
+// Backward pipeline
 // ---------------------------------------------------------------------------
 
-/**
- * Gradient Funcs from backward pipeline.
- */
-struct GradientFuncs {
-    Func grad_means;      // (n, c) — c=0 is x, c=1 is y
-    Func grad_cov;        // (n, c, r) — stub (zero) until Phase 3
-    Func grad_colors;     // (n, c)
-    Func grad_opacities;  // (n,)
+struct GradientPipeline {
+    Halide::ImageParam grad_output_ip{Halide::Float(32), 3, "grad_out"};
+    Halide::ImageParam means_ip{Halide::Float(32), 2, "means_b"};
+    Halide::ImageParam cov_ip{Halide::Float(32), 3, "cov_b"};
+    Halide::ImageParam colors_ip{Halide::Float(32), 2, "colors_b"};
+    Halide::ImageParam opacities_ip{Halide::Float(32), 1, "opacities_b"};
+
+    Halide::Func grad_means{"grad_means_out"};
+    Halide::Func grad_cov{"grad_cov_out"};
+    Halide::Func grad_colors{"grad_colors_out"};
+    Halide::Func grad_opacities{"grad_opacities_out"};
+
+    Halide::Func det{"det_b"};
+    Halide::Func norm_factor{"norm_b"};
+    Halide::Func inv_cov{"inv_cov_b"};
+    Halide::Func total_weight_pix{"total_weight_pix_b"};
+    Halide::Func total_color_pix{"total_color_pix_b"};
+    Halide::Func weight{"weight_b"};
+    Halide::Func output_norm{"output_norm_b"};
+
+    bool built = false;
 };
 
-/**
- * Build the backward gradient pipeline.
- * Returns GradientFuncs ready to schedule and realize.
- */
-GradientFuncs
-build_backward_pipeline(const Buffer<float>& grad_output_var,
-                        const Buffer<float>& means_var,
-                        const Buffer<float>& covariances_var,
-                        const Buffer<float>& colors_var,
-                        const Buffer<float>& opacities_var,
-                        int height, int width, int num_channels);
-
-/**
- * Apply CPU schedule to GradientFuncs.
- */
-void apply_cpu_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
-
-/**
- * Apply CUDA schedule to GradientFuncs.
- */
-void apply_cuda_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
-
-/**
- * Apply Metal schedule to GradientFuncs.
- */
-void apply_metal_schedule_backward(GradientFuncs& g, int height, int width, int num_channels, int N);
+void build_backward(GradientPipeline& g, int height, int width, int num_channels);
+void apply_cpu_schedule_backward(GradientPipeline& g, int height, int width, int num_channels);
+void apply_cuda_schedule_backward(GradientPipeline& g, int height, int width, int num_channels);
+void apply_metal_schedule_backward(GradientPipeline& g, int height, int width, int num_channels);
 
 }  // namespace tinysplat_halide
 

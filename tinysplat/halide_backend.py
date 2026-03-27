@@ -7,20 +7,14 @@ pipelines to the torch.autograd.Function interface used by GaussianSplat2DFuncti
 Usage:
     export HL_PATH=$HOME/halide
     export TINYSPLAT_HALIDE_LIB=/path/to/libtinysplat_halide_pipeline.so
-    export TINYSPLAT_BACKEND=halide   # optional, forces Halide over other backends
-
-    # Then tinyplat will auto-detect and use the Halide backend.
+    export TINYSPLAT_BACKEND=halide
 """
 
 import ctypes
 import os
 import torch
 import numpy as np
-from typing import Tuple, List
-
-# ---------------------------------------------------------------------------
-# Load the Halide shared library (deferred to first use)
-# ---------------------------------------------------------------------------
+from typing import Tuple
 
 _HALIDE_LIB_PATH = os.environ.get("TINYSPLAT_HALIDE_LIB", "")
 _halide_lib = None
@@ -37,7 +31,6 @@ def _try_load_halide_lib():
     try:
         _halide_lib = ctypes.CDLL(_HALIDE_LIB_PATH)
 
-        # C function signatures
         _halide_lib.gaussian_splat_forward.argtypes = [
             ctypes.c_void_p,   # means
             ctypes.c_void_p,   # covariances
@@ -82,22 +75,28 @@ def _ensure_halide():
         )
 
 
+def _to_contiguous_float32_cpu(t: torch.Tensor) -> torch.Tensor:
+    """Ensure tensor is contiguous float32 on CPU."""
+    t = t.detach()
+    if t.device.type != "cpu":
+        t = t.cpu()
+    if t.dtype != torch.float32:
+        t = t.to(torch.float32)
+    return t.contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Forward pass
 # ---------------------------------------------------------------------------
 
 def forward_halide(
-    means: torch.Tensor,          # (N, 2)
-    covariances: torch.Tensor,    # (N, 2, 2)
-    colors: torch.Tensor,          # (N, C)
-    opacities: torch.Tensor,      # (N,)
+    means: torch.Tensor,
+    covariances: torch.Tensor,
+    colors: torch.Tensor,
+    opacities: torch.Tensor,
     height: int,
     width: int,
 ) -> Tuple[torch.Tensor, list]:
-    """
-    Forward pass using the Halide JIT-compiled pipeline.
-    Falls back to pure-PyTorch if Halide library unavailable.
-    """
     if _halide_lib is None and not _try_load_halide_lib():
         from .backends.python import forward_pytorch
         return forward_pytorch(means, covariances, colors, opacities, height, width)
@@ -105,33 +104,30 @@ def forward_halide(
     N, C = colors.shape
     device = means.device
 
-    # Move to CPU, contiguous numpy arrays (Halide reads host memory)
-    means_np     = means.detach().cpu().numpy().astype(np.float32)
-    cov_np       = covariances.detach().cpu().numpy().astype(np.float32)
-    colors_np    = colors.detach().cpu().numpy().astype(np.float32)
-    opacities_np = opacities.detach().cpu().numpy().astype(np.float32)
-    output_np    = np.zeros((height, width, C), dtype=np.float32)
+    means_c     = _to_contiguous_float32_cpu(means)
+    cov_c       = _to_contiguous_float32_cpu(covariances)
+    colors_c    = _to_contiguous_float32_cpu(colors)
+    opacities_c = _to_contiguous_float32_cpu(opacities)
+    output_t    = torch.zeros(height, width, C, dtype=torch.float32)
 
     rc = _halide_lib.gaussian_splat_forward(
-        means_np.ctypes.data,
-        cov_np.ctypes.data,
-        colors_np.ctypes.data,
-        opacities_np.ctypes.data,
+        means_c.data_ptr(),
+        cov_c.data_ptr(),
+        colors_c.data_ptr(),
+        opacities_c.data_ptr(),
         N, height, width, C,
-        output_np.ctypes.data,
+        output_t.data_ptr(),
     )
 
     if rc != 0:
-        # Fall back on error
         from .backends.python import forward_pytorch
         return forward_pytorch(means, covariances, colors, opacities, height, width)
 
-    output = torch.from_numpy(output_np).to(device)
-    return output, []
+    return output_t.to(device), []
 
 
 # ---------------------------------------------------------------------------
-# Backward pass (Phase 2 — for now always fall back to PyTorch)
+# Backward pass — uses Halide analytical gradients
 # ---------------------------------------------------------------------------
 
 def backward_halide(
@@ -145,15 +141,53 @@ def backward_halide(
     intermediates: list,
     needs_input_grad: tuple,
 ):
-    """
-    Backward pass. Phase 1: always falls back to PyTorch.
-    Phase 2: will call _halide_lib.gaussian_splat_backward.
-    """
-    from .backends.python import backward_pytorch
-    return backward_pytorch(
-        grad_output, means, covariances, colors, opacities,
-        height, width, intermediates, needs_input_grad,
+    if _halide_lib is None and not _try_load_halide_lib():
+        from .backends.python import backward_pytorch
+        return backward_pytorch(
+            grad_output, means, covariances, colors, opacities,
+            height, width, intermediates, needs_input_grad,
+        )
+
+    N, C = colors.shape
+    device = means.device
+
+    grad_out_c  = _to_contiguous_float32_cpu(grad_output)
+    means_c     = _to_contiguous_float32_cpu(means)
+    cov_c       = _to_contiguous_float32_cpu(covariances)
+    colors_c    = _to_contiguous_float32_cpu(colors)
+    opacities_c = _to_contiguous_float32_cpu(opacities)
+
+    grad_means_t     = torch.zeros(N, 2, dtype=torch.float32)
+    grad_cov_t       = torch.zeros(N, 2, 2, dtype=torch.float32)
+    grad_colors_t    = torch.zeros(N, C, dtype=torch.float32)
+    grad_opacities_t = torch.zeros(N, dtype=torch.float32)
+
+    rc = _halide_lib.gaussian_splat_backward(
+        grad_out_c.data_ptr(),
+        means_c.data_ptr(),
+        cov_c.data_ptr(),
+        colors_c.data_ptr(),
+        opacities_c.data_ptr(),
+        N, height, width, C,
+        grad_means_t.data_ptr(),
+        grad_cov_t.data_ptr(),
+        grad_colors_t.data_ptr(),
+        grad_opacities_t.data_ptr(),
     )
+
+    if rc != 0:
+        from .backends.python import backward_pytorch
+        return backward_pytorch(
+            grad_output, means, covariances, colors, opacities,
+            height, width, intermediates, needs_input_grad,
+        )
+
+    grad_means     = grad_means_t.to(device)     if needs_input_grad[0] else None
+    grad_cov       = grad_cov_t.to(device)       if needs_input_grad[1] else None
+    grad_colors    = grad_colors_t.to(device)    if needs_input_grad[2] else None
+    grad_opacities = grad_opacities_t.to(device) if needs_input_grad[3] else None
+
+    return grad_means, grad_cov, grad_colors, grad_opacities
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +204,7 @@ HALIDE_BACKEND = BackendOps(
 )
 
 
-# ---------------------------------------------------------------------------
-# Smoke test (run with: python -m tinysplat.halide_backend)
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    import torch
-
     print("Smoke test: Halide backend")
     print(f"  Library path: {_HALIDE_LIB_PATH}")
     print(f"  Library loaded: {_halide_lib is not None}")

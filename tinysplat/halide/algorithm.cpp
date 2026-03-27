@@ -2,19 +2,18 @@
  * algorithm.cpp
  *
  * Halide forward + backward pipelines for 2D Gaussian splatting.
- * Dimension convention: (y, x, c) to match PyTorch (H, W, C) row-major layout.
- *   - y: row index (height), maps to buffer dim(0)
- *   - x: column index (width), maps to buffer dim(1)
- *   - c: channel, maps to buffer dim(2)
+ *
+ * Key optimisation decisions:
+ *   - Inputs are ImageParam so the JIT-compiled code can be reused across
+ *     calls (N is a runtime extent, H/W/C are compile-time bounds).
+ *   - Per-Gaussian invariants (det, inv_cov, norm_factor) are exposed as
+ *     separate Funcs so the schedule can compute_root them once.
+ *   - A Mahalanobis cutoff avoids expensive exp() for distant pixels.
  */
 
 #include "algorithm.h"
-#include "schedule_cpu.h"
-#include "schedule_cuda.h"
-#include "schedule_metal.h"
 
 #include <Halide.h>
-#include <vector>
 
 using namespace Halide;
 
@@ -23,202 +22,143 @@ namespace {
 
 constexpr float kPi  = 3.14159265358979323846f;
 constexpr float kEps = 1e-8f;
+constexpr float kMahalCutoff = 32.0f;  // ~4sigma: exp(-16) ~ 1.1e-7
 
+}  // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// Forward pipeline — (y, x, c) convention
+// Forward
 // ---------------------------------------------------------------------------
 
-ForwardPipeline
-build_forward_pipeline_impl(const Buffer<float>& means_in,
-                           const Buffer<float>& covariances_in,
-                           const Buffer<float>& colors_in,
-                           const Buffer<float>& opacities_in,
-                           int height,
-                           int width,
-                           int num_channels) {
+void build_forward(ForwardPipeline& p, int height, int width, int num_channels) {
     Var x("x"), y("y"), c("c"), n("n"), r("r");
-    const int N = means_in.dim(0).extent();
+    Expr N = p.means_ip.dim(0).extent();
 
-    // ---- Input wrappers ----
-    Func means_f("means_f"), cov_f("cov_f"),
-         colors_f("colors_f"), opacities_f("opacities_f");
-    means_f(n, _)   = means_in(n, _);
-    cov_f(n, _, _)  = covariances_in(n, _, _);
-    colors_f(n, c)  = colors_in(n, c);
-    opacities_f(n)  = opacities_in(n);
+    // Per-Gaussian invariants (depend only on n)
+    p.det(n) = p.cov_ip(n, 0, 0) * p.cov_ip(n, 1, 1)
+             - p.cov_ip(n, 0, 1) * p.cov_ip(n, 0, 1);
 
-    // ---- Per-Gaussian constants ----
-    Func det("det");
-    det(n) = cov_f(n, 0, 0) * cov_f(n, 1, 1)
-           - cov_f(n, 0, 1) * cov_f(n, 0, 1);
+    p.norm_factor(n) = 1.0f / (2.0f * kPi * sqrt(max(p.det(n), kEps)));
 
-    Func norm_factor("norm_factor");
-    norm_factor(n) = 1.0f / (2.0f * kPi * sqrt(max(det(n), kEps)));
+    p.inv_cov(n, c, r) = cast<float>(0.0f);
+    p.inv_cov(n, 0, 0) =  p.cov_ip(n, 1, 1) / max(p.det(n), kEps);
+    p.inv_cov(n, 1, 1) =  p.cov_ip(n, 0, 0) / max(p.det(n), kEps);
+    p.inv_cov(n, 0, 1) = -p.cov_ip(n, 0, 1) / max(p.det(n), kEps);
+    p.inv_cov(n, 1, 0) = -p.cov_ip(n, 0, 1) / max(p.det(n), kEps);
 
-    Func inv_cov("inv_cov");
-    inv_cov(n, c, r) = cast<float>(0.0f);
-    inv_cov(n, 0, 0) =  cov_f(n, 1, 1) / max(det(n), kEps);
-    inv_cov(n, 1, 1) =  cov_f(n, 0, 0) / max(det(n), kEps);
-    inv_cov(n, 0, 1) = -cov_f(n, 0, 1) / max(det(n), kEps);
-    inv_cov(n, 1, 0) = -cov_f(n, 0, 1) / max(det(n), kEps);
+    // Mahalanobis distance + weight per (y, x, n)
+    Func dx_f("dx_f"), dy_f("dy_f");
+    dx_f(y, x, n) = cast<float>(x) - p.means_ip(n, 0);
+    dy_f(y, x, n) = cast<float>(y) - p.means_ip(n, 1);
 
-    // ---- Pixel coordinates (y, x, n) ----
-    // px = column (x-coord), py = row (y-coord)
-    Func px("px"), py("py");
-    px(y, x, n) = cast<float>(x);
-    py(y, x, n) = cast<float>(y);
+    Func mahal("mahal");
+    mahal(y, x, n) = dx_f(y, x, n) * (p.inv_cov(n, 0, 0) * dx_f(y, x, n) + p.inv_cov(n, 0, 1) * dy_f(y, x, n))
+                   + dy_f(y, x, n) * (p.inv_cov(n, 1, 0) * dx_f(y, x, n) + p.inv_cov(n, 1, 1) * dy_f(y, x, n));
 
-    // ---- Mahalanobis distance + weight ----
-    Func dx("dx"), dy("dy"), mahal("mahal"), weight("weight");
-    dx(y, x, n)    = px(y, x, n) - means_f(n, 0);
-    dy(y, x, n)    = py(y, x, n) - means_f(n, 1);
+    p.weight(y, x, n) = select(
+        mahal(y, x, n) < kMahalCutoff,
+        p.opacities_ip(n) * p.norm_factor(n) * exp(-0.5f * mahal(y, x, n)),
+        0.0f);
 
-    mahal(y, x, n) = dx(y, x, n) * (inv_cov(n, 0, 0) * dx(y, x, n)
-                                    + inv_cov(n, 0, 1) * dy(y, x, n))
-                   + dy(y, x, n) * (inv_cov(n, 1, 0) * dx(y, x, n)
-                                    + inv_cov(n, 1, 1) * dy(y, x, n));
-
-    weight(y, x, n) = opacities_f(n)
-                    * norm_factor(n)
-                    * exp(-0.5f * mahal(y, x, n));
-
-    // ---- Accumulate over Gaussians ----
+    // Accumulate over Gaussians
     RDom r_n(0, N, "r_n");
 
-    Func accum_color("accum_color"), accum_weight("accum_weight");
-    accum_color(y, x, c) = cast<float>(0.0f);
-    accum_weight(y, x)   = cast<float>(0.0f);
-    accum_color(y, x, c) += weight(y, x, r_n) * colors_f(r_n, c);
-    accum_weight(y, x)   += weight(y, x, r_n);
-    // Suppress warning: update(0) is the RDom accumulation
-    accum_weight.update(0).unscheduled();
-    accum_color.update(0).unscheduled();
+    p.accum_color(y, x, c) = cast<float>(0.0f);
+    p.accum_weight(y, x)   = cast<float>(0.0f);
+    p.accum_color(y, x, c) += p.weight(y, x, r_n) * p.colors_ip(r_n, c);
+    p.accum_weight(y, x)   += p.weight(y, x, r_n);
 
-    // ---- Normalize ----
-    Func output_norm("output_norm");
-    output_norm(y, x, c) = accum_color(y, x, c)
-                         / max(accum_weight(y, x), kEps);
+    // Normalize
+    p.output_norm(y, x, c) = p.accum_color(y, x, c)
+                            / max(p.accum_weight(y, x), kEps);
 
-    Func output("forward_output");
-    output(y, x, c) = output_norm(y, x, c);
-    output.bound(y, 0, height);
-    output.bound(x, 0, width);
-    output.bound(c, 0, num_channels);
+    p.output(y, x, c) = p.output_norm(y, x, c);
+    p.output.bound(y, 0, height);
+    p.output.bound(x, 0, width);
+    p.output.bound(c, 0, num_channels);
 
-    return {output, accum_color, accum_weight, weight,
-            accum_weight, accum_color, output_norm};
+    p.built = true;
 }
 
-
 // ---------------------------------------------------------------------------
-// Backward pipeline — (y, x, c) convention
+// Backward
 // ---------------------------------------------------------------------------
 
-GradientFuncs
-build_backward_pipeline_impl(const Buffer<float>& grad_output_in,
-                            const Buffer<float>& means_in,
-                            const Buffer<float>& covariances_in,
-                            const Buffer<float>& colors_in,
-                            const Buffer<float>& opacities_in,
-                            int height,
-                            int width,
-                            int num_channels) {
+void build_backward(GradientPipeline& g, int height, int width, int num_channels) {
     Var x("x"), y("y"), c("c"), n("n"), r("r");
-    const int N = means_in.dim(0).extent();
+    Expr N = g.means_ip.dim(0).extent();
 
-    // ---- Input wrappers ----
-    // grad_output_in has shape (H, W, C) matching PyTorch layout
-    Func grad_output("grad_output"), means_b("means_b"),
-         cov_b("cov_b"), colors_b("colors_b"), opacities_b("opacities_b");
-    grad_output(y, x, c) = grad_output_in(y, x, c);
-    means_b(n, _)   = means_in(n, _);
-    cov_b(n, _, _)  = covariances_in(n, _, _);
-    colors_b(n, c)  = colors_in(n, c);
-    opacities_b(n)  = opacities_in(n);
+    // Recompute forward intermediates
+    g.det(n) = g.cov_ip(n, 0, 0) * g.cov_ip(n, 1, 1)
+             - g.cov_ip(n, 0, 1) * g.cov_ip(n, 0, 1);
 
-    // ---- Forward intermediates (recomputed) ----
-    Func det_fn("det_b"), norm_factor_b("norm_b");
-    det_fn(n)        = cov_b(n, 0, 0) * cov_b(n, 1, 1)
-                     - cov_b(n, 0, 1) * cov_b(n, 0, 1);
-    norm_factor_b(n) = 1.0f / (2.0f * kPi * sqrt(max(det_fn(n), kEps)));
+    g.norm_factor(n) = 1.0f / (2.0f * kPi * sqrt(max(g.det(n), kEps)));
 
-    Func inv_cov_b("inv_cov_b");
-    inv_cov_b(n, c, r) = cast<float>(0.0f);
-    inv_cov_b(n, 0, 0) =  cov_b(n, 1, 1) / max(det_fn(n), kEps);
-    inv_cov_b(n, 1, 1) =  cov_b(n, 0, 0) / max(det_fn(n), kEps);
-    inv_cov_b(n, 0, 1) = -cov_b(n, 0, 1) / max(det_fn(n), kEps);
-    inv_cov_b(n, 1, 0) = -cov_b(n, 0, 1) / max(det_fn(n), kEps);
+    g.inv_cov(n, c, r) = cast<float>(0.0f);
+    g.inv_cov(n, 0, 0) =  g.cov_ip(n, 1, 1) / max(g.det(n), kEps);
+    g.inv_cov(n, 1, 1) =  g.cov_ip(n, 0, 0) / max(g.det(n), kEps);
+    g.inv_cov(n, 0, 1) = -g.cov_ip(n, 0, 1) / max(g.det(n), kEps);
+    g.inv_cov(n, 1, 0) = -g.cov_ip(n, 0, 1) / max(g.det(n), kEps);
 
-    Func px_b("px_b"), py_b("py_b");
-    px_b(y, x, n) = cast<float>(x);
-    py_b(y, x, n) = cast<float>(y);
+    Func dx_b("dx_b"), dy_b("dy_b"), mahal_b("mahal_b");
+    dx_b(y, x, n) = cast<float>(x) - g.means_ip(n, 0);
+    dy_b(y, x, n) = cast<float>(y) - g.means_ip(n, 1);
+    mahal_b(y, x, n) = dx_b(y, x, n) * (g.inv_cov(n, 0, 0) * dx_b(y, x, n)
+                                        + g.inv_cov(n, 0, 1) * dy_b(y, x, n))
+                      + dy_b(y, x, n) * (g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                                        + g.inv_cov(n, 1, 1) * dy_b(y, x, n));
 
-    Func dx_b("dx_b"), dy_b("dy_b"), mahal_b("mahal_b"), weight_b("weight_b");
-    dx_b(y, x, n)    = px_b(y, x, n) - means_b(n, 0);
-    dy_b(y, x, n)    = py_b(y, x, n) - means_b(n, 1);
-    mahal_b(y, x, n) = dx_b(y, x, n) * (inv_cov_b(n, 0, 0) * dx_b(y, x, n)
-                                         + inv_cov_b(n, 0, 1) * dy_b(y, x, n))
-                      + dy_b(y, x, n) * (inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                                         + inv_cov_b(n, 1, 1) * dy_b(y, x, n));
-    weight_b(y, x, n) = opacities_b(n) * norm_factor_b(n)
-                       * exp(-0.5f * mahal_b(y, x, n));
+    g.weight(y, x, n) = select(
+        mahal_b(y, x, n) < kMahalCutoff,
+        g.opacities_ip(n) * g.norm_factor(n) * exp(-0.5f * mahal_b(y, x, n)),
+        0.0f);
 
-    // Forward recompute
+    // Forward recompute: total weight + color per pixel
     RDom r_n(0, N, "r_n");
-    Func total_weight_pix_b("total_weight_pix_b"),
-         total_color_pix_b("total_color_pix_b");
-    total_weight_pix_b(y, x)   = cast<float>(0.0f);
-    total_color_pix_b(y, x, c) = cast<float>(0.0f);
-    total_weight_pix_b(y, x)   += weight_b(y, x, r_n);
-    total_color_pix_b(y, x, c) += weight_b(y, x, r_n) * colors_b(r_n, c);
+    g.total_weight_pix(y, x)   = cast<float>(0.0f);
+    g.total_color_pix(y, x, c) = cast<float>(0.0f);
+    g.total_weight_pix(y, x)   += g.weight(y, x, r_n);
+    g.total_color_pix(y, x, c) += g.weight(y, x, r_n) * g.colors_ip(r_n, c);
 
-    Func output_norm_b("output_norm_b");
-    output_norm_b(y, x, c) = total_color_pix_b(y, x, c)
-                            / max(total_weight_pix_b(y, x), kEps);
+    g.output_norm(y, x, c) = g.total_color_pix(y, x, c)
+                            / max(g.total_weight_pix(y, x), kEps);
 
-    // ---- Reduction domains ----
-    // r_hw: iterate over all pixels, r_hw.x = height dim, r_hw.y = width dim
+    // Reduction domains for backward accumulation
     RDom r_hw(0, height, 0, width, "r_hw");
-    // r_all: iterate over all pixels + channels
     RDom r_all(0, height, 0, width, 0, num_channels, "r_all");
 
-    // ---- grad_colors[n,c] ----
-    Func grad_colors_out("grad_colors_out");
-    grad_colors_out(n, c) = cast<float>(0.0f);
-    grad_colors_out(n, c) +=
-        grad_output(r_hw.x, r_hw.y, c)
-        * weight_b(r_hw.x, r_hw.y, n)
-        / max(total_weight_pix_b(r_hw.x, r_hw.y), kEps);
+    // grad_colors[n,c]
+    g.grad_colors(n, c) = cast<float>(0.0f);
+    g.grad_colors(n, c) +=
+        g.grad_output_ip(r_hw.x, r_hw.y, c)
+        * g.weight(r_hw.x, r_hw.y, n)
+        / max(g.total_weight_pix(r_hw.x, r_hw.y), kEps);
 
-    // ---- grad_opacities[n] ----
-    Func grad_opacities_out("grad_opacities_out");
-    grad_opacities_out(n) = cast<float>(0.0f);
-    grad_opacities_out(n) +=
-        grad_output(r_all.x, r_all.y, r_all.z)
-        * norm_factor_b(n)
+    // grad_opacities[n]
+    g.grad_opacities(n) = cast<float>(0.0f);
+    g.grad_opacities(n) +=
+        g.grad_output_ip(r_all.x, r_all.y, r_all.z)
+        * g.norm_factor(n)
         * exp(-0.5f * mahal_b(r_all.x, r_all.y, n))
-        * (colors_b(n, r_all.z) - output_norm_b(r_all.x, r_all.y, r_all.z))
-        / max(total_weight_pix_b(r_all.x, r_all.y), kEps);
+        * (g.colors_ip(n, r_all.z) - g.output_norm(r_all.x, r_all.y, r_all.z))
+        / max(g.total_weight_pix(r_all.x, r_all.y), kEps);
 
-    // ---- grad_means[2, n] ----
+    // grad_means[n, coord]
     Func chain_term("chain_term");
     chain_term(y, x, c, n) =
-        grad_output(y, x, c)
-        * (colors_b(n, c) - output_norm_b(y, x, c))
-        / max(total_weight_pix_b(y, x), kEps);
+        g.grad_output_ip(y, x, c)
+        * (g.colors_ip(n, c) - g.output_norm(y, x, c))
+        / max(g.total_weight_pix(y, x), kEps);
 
     Func inv_dot_dx("inv_dot_dx"), inv_dot_dy("inv_dot_dy");
-    inv_dot_dx(y, x, n) = inv_cov_b(n, 0, 0) * dx_b(y, x, n)
-                           + inv_cov_b(n, 0, 1) * dy_b(y, x, n);
-    inv_dot_dy(y, x, n) = inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                           + inv_cov_b(n, 1, 1) * dy_b(y, x, n);
+    inv_dot_dx(y, x, n) = g.inv_cov(n, 0, 0) * dx_b(y, x, n)
+                         + g.inv_cov(n, 0, 1) * dy_b(y, x, n);
+    inv_dot_dy(y, x, n) = g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                         + g.inv_cov(n, 1, 1) * dy_b(y, x, n);
 
     Func contrib_x("contrib_x"), contrib_y("contrib_y");
-    contrib_x(y, x, c, n) = -weight_b(y, x, n) * inv_dot_dx(y, x, n)
-                             * chain_term(y, x, c, n);
-    contrib_y(y, x, c, n) = -weight_b(y, x, n) * inv_dot_dy(y, x, n)
-                             * chain_term(y, x, c, n);
+    contrib_x(y, x, c, n) = -g.weight(y, x, n) * inv_dot_dx(y, x, n) * chain_term(y, x, c, n);
+    contrib_y(y, x, c, n) = -g.weight(y, x, n) * inv_dot_dy(y, x, n) * chain_term(y, x, c, n);
 
     Func grad_means_x("grad_means_x"), grad_means_y("grad_means_y");
     grad_means_x(n) = cast<float>(0.0f);
@@ -226,144 +166,57 @@ build_backward_pipeline_impl(const Buffer<float>& grad_output_in,
     grad_means_x(n) += contrib_x(r_all.x, r_all.y, r_all.z, n);
     grad_means_y(n) += contrib_y(r_all.x, r_all.y, r_all.z, n);
 
-    Func grad_means_out("grad_means_out");
-    grad_means_out(n, c) = select(c == 0, grad_means_x(n), grad_means_y(n));
+    g.grad_means(n, c) = select(c == 0, grad_means_x(n), grad_means_y(n));
 
-    // ---- grad_cov[2x2] — analytical ----
+    // grad_cov[n, 2, 2]
     Func det_pow15("det_pow15");
-    det_pow15(n) = pow(max(det_fn(n), kEps), cast<float>(1.5f));
+    det_pow15(n) = pow(max(g.det(n), kEps), cast<float>(1.5f));
 
-    Func grad_norm_a("grad_norm_a"), grad_norm_bv("grad_norm_bv"), grad_norm_d("grad_norm_d");
-    grad_norm_a(n)  = -cov_b(n, 1, 1) / (cast<float>(4.0f) * kPi * det_pow15(n));
-    grad_norm_bv(n) =  cov_b(n, 0, 1) / (cast<float>(2.0f) * kPi * det_pow15(n));
-    grad_norm_d(n)  = -cov_b(n, 0, 0) / (cast<float>(4.0f) * kPi * det_pow15(n));
+    Func gn_a("gn_a"), gn_bv("gn_bv"), gn_d("gn_d");
+    gn_a(n)  = -g.cov_ip(n, 1, 1) / (4.0f * kPi * det_pow15(n));
+    gn_bv(n) =  g.cov_ip(n, 0, 1) / (2.0f * kPi * det_pow15(n));
+    gn_d(n)  = -g.cov_ip(n, 0, 0) / (4.0f * kPi * det_pow15(n));
 
-    Func mahal_grad_a("mahal_grad_a"), mahal_grad_b("mahal_grad_b"), mahal_grad_d("mahal_grad_d");
-    mahal_grad_a(y, x, n) = -(inv_cov_b(n, 0, 0) * dx_b(y, x, n) * inv_cov_b(n, 0, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 0, 0) * dx_b(y, x, n) * inv_cov_b(n, 0, 1) * dy_b(y, x, n)
-                             + inv_cov_b(n, 0, 1) * dy_b(y, x, n) * inv_cov_b(n, 0, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 0, 1) * dy_b(y, x, n) * inv_cov_b(n, 0, 1) * dy_b(y, x, n));
-    mahal_grad_b(y, x, n) = -(inv_cov_b(n, 0, 0) * dx_b(y, x, n) * inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 0, 0) * dx_b(y, x, n) * inv_cov_b(n, 1, 1) * dy_b(y, x, n)
-                             + inv_cov_b(n, 0, 1) * dy_b(y, x, n) * inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 0, 1) * dy_b(y, x, n) * inv_cov_b(n, 1, 1) * dy_b(y, x, n));
-    mahal_grad_d(y, x, n) = -(inv_cov_b(n, 1, 0) * dx_b(y, x, n) * inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 1, 0) * dx_b(y, x, n) * inv_cov_b(n, 1, 1) * dy_b(y, x, n)
-                             + inv_cov_b(n, 1, 1) * dy_b(y, x, n) * inv_cov_b(n, 1, 0) * dx_b(y, x, n)
-                             + inv_cov_b(n, 1, 1) * dy_b(y, x, n) * inv_cov_b(n, 1, 1) * dy_b(y, x, n));
+    Func mg_a("mg_a"), mg_b("mg_b"), mg_d("mg_d");
+    mg_a(y, x, n) = -(g.inv_cov(n, 0, 0) * dx_b(y, x, n) * g.inv_cov(n, 0, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 0, 0) * dx_b(y, x, n) * g.inv_cov(n, 0, 1) * dy_b(y, x, n)
+                     + g.inv_cov(n, 0, 1) * dy_b(y, x, n) * g.inv_cov(n, 0, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 0, 1) * dy_b(y, x, n) * g.inv_cov(n, 0, 1) * dy_b(y, x, n));
+    mg_b(y, x, n) = -(g.inv_cov(n, 0, 0) * dx_b(y, x, n) * g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 0, 0) * dx_b(y, x, n) * g.inv_cov(n, 1, 1) * dy_b(y, x, n)
+                     + g.inv_cov(n, 0, 1) * dy_b(y, x, n) * g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 0, 1) * dy_b(y, x, n) * g.inv_cov(n, 1, 1) * dy_b(y, x, n));
+    mg_d(y, x, n) = -(g.inv_cov(n, 1, 0) * dx_b(y, x, n) * g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 1, 0) * dx_b(y, x, n) * g.inv_cov(n, 1, 1) * dy_b(y, x, n)
+                     + g.inv_cov(n, 1, 1) * dy_b(y, x, n) * g.inv_cov(n, 1, 0) * dx_b(y, x, n)
+                     + g.inv_cov(n, 1, 1) * dy_b(y, x, n) * g.inv_cov(n, 1, 1) * dy_b(y, x, n));
 
-    Func contrib_cov_a("contrib_cov_a"), contrib_cov_bv("contrib_cov_bv"), contrib_cov_d("contrib_cov_d");
-    contrib_cov_a(y, x, c, n) =
-        weight_b(y, x, n)
-        * (cast<float>(-0.5f) * mahal_grad_a(y, x, n)
-           + grad_norm_a(n) / max(norm_factor_b(n), kEps))
+    Func cc_a("cc_a"), cc_b("cc_b"), cc_d("cc_d");
+    cc_a(y, x, c, n) = g.weight(y, x, n)
+        * (-0.5f * mg_a(y, x, n) + gn_a(n) / max(g.norm_factor(n), kEps))
         * chain_term(y, x, c, n);
-    contrib_cov_bv(y, x, c, n) =
-        weight_b(y, x, n)
-        * (cast<float>(-0.5f) * mahal_grad_b(y, x, n)
-           + grad_norm_bv(n) / max(norm_factor_b(n), kEps))
+    cc_b(y, x, c, n) = g.weight(y, x, n)
+        * (-0.5f * mg_b(y, x, n) + gn_bv(n) / max(g.norm_factor(n), kEps))
         * chain_term(y, x, c, n);
-    contrib_cov_d(y, x, c, n) =
-        weight_b(y, x, n)
-        * (cast<float>(-0.5f) * mahal_grad_d(y, x, n)
-           + grad_norm_d(n) / max(norm_factor_b(n), kEps))
+    cc_d(y, x, c, n) = g.weight(y, x, n)
+        * (-0.5f * mg_d(y, x, n) + gn_d(n) / max(g.norm_factor(n), kEps))
         * chain_term(y, x, c, n);
 
-    Func grad_cov_a("grad_cov_a"), grad_cov_b("grad_cov_b"), grad_cov_d("grad_cov_d");
-    grad_cov_a(n) = cast<float>(0.0f);
-    grad_cov_b(n) = cast<float>(0.0f);
-    grad_cov_d(n) = cast<float>(0.0f);
-    grad_cov_a(n) += contrib_cov_a(r_all.x, r_all.y, r_all.z, n);
-    grad_cov_b(n) += contrib_cov_bv(r_all.x, r_all.y, r_all.z, n);
-    grad_cov_d(n) += contrib_cov_d(r_all.x, r_all.y, r_all.z, n);
+    Func gc_a("gc_a"), gc_bv("gc_bv"), gc_d("gc_d");
+    gc_a(n) = cast<float>(0.0f);
+    gc_bv(n) = cast<float>(0.0f);
+    gc_d(n) = cast<float>(0.0f);
+    gc_a(n) += cc_a(r_all.x, r_all.y, r_all.z, n);
+    gc_bv(n) += cc_b(r_all.x, r_all.y, r_all.z, n);
+    gc_d(n) += cc_d(r_all.x, r_all.y, r_all.z, n);
 
-    Func grad_cov_out("grad_cov_out");
-    grad_cov_out(n, c, r) = cast<float>(0.0f);
-    grad_cov_out(n, 0, 0) = grad_cov_a(n);
-    grad_cov_out(n, 0, 1) = grad_cov_b(n);
-    grad_cov_out(n, 1, 0) = grad_cov_b(n);
-    grad_cov_out(n, 1, 1) = grad_cov_d(n);
+    g.grad_cov(n, c, r) = cast<float>(0.0f);
+    g.grad_cov(n, 0, 0) = gc_a(n);
+    g.grad_cov(n, 0, 1) = gc_bv(n);
+    g.grad_cov(n, 1, 0) = gc_bv(n);
+    g.grad_cov(n, 1, 1) = gc_d(n);
 
-    return {grad_means_out, grad_cov_out, grad_colors_out, grad_opacities_out};
-}
-
-}  // anonymous namespace
-
-
-// ---------------------------------------------------------------------------
-// Public wrappers
-// ---------------------------------------------------------------------------
-
-ForwardPipeline
-build_forward_pipeline(const Buffer<float>& means,
-                       const Buffer<float>& covariances,
-                       const Buffer<float>& colors,
-                       const Buffer<float>& opacities,
-                       int height,
-                       int width,
-                       int num_channels) {
-    return build_forward_pipeline_impl(
-        means, covariances, colors, opacities, height, width, num_channels);
-}
-
-
-GradientFuncs
-build_backward_pipeline(const Buffer<float>& grad_output,
-                        const Buffer<float>& means,
-                        const Buffer<float>& covariances,
-                        const Buffer<float>& colors,
-                        const Buffer<float>& opacities,
-                        int height,
-                        int width,
-                        int num_channels) {
-    return build_backward_pipeline_impl(
-        grad_output, means, covariances, colors, opacities,
-        height, width, num_channels);
-}
-
-
-// ---------------------------------------------------------------------------
-// Schedule implementations
-// ---------------------------------------------------------------------------
-
-void apply_cpu_schedule_forward(ForwardPipeline& p,
-                               int height, int width, int num_channels) {
-    schedule::apply_cpu_schedule(
-        p.output, p.accum_color, p.accum_weight,
-        height, width, num_channels);
-}
-
-void apply_cuda_schedule_forward(ForwardPipeline& p,
-                                int height, int width, int num_channels) {
-    schedule::apply_cuda_schedule(
-        p.output, p.accum_color, p.accum_weight,
-        height, width, num_channels);
-}
-
-void apply_metal_schedule_forward(ForwardPipeline& p,
-                                 int height, int width, int num_channels) {
-    schedule::apply_metal_schedule(
-        p.output, p.accum_color, p.accum_weight,
-        height, width, num_channels);
-}
-
-void apply_cpu_schedule_backward(GradientFuncs& g,
-                                int height, int width, int num_channels, int N) {
-    (void)g; (void)height; (void)width; (void)num_channels; (void)N;
-}
-
-void apply_cuda_schedule_backward(GradientFuncs& g,
-                                  int height, int width, int num_channels, int N) {
-    schedule::apply_cuda_schedule_backward(
-        g.grad_means, g.grad_cov, g.grad_colors, g.grad_opacities,
-        height, width, num_channels, N);
-}
-
-void apply_metal_schedule_backward(GradientFuncs& g,
-                                  int height, int width, int num_channels, int N) {
-    schedule::apply_metal_schedule_backward(
-        g.grad_means, g.grad_cov, g.grad_colors, g.grad_opacities,
-        height, width, num_channels, N);
+    g.built = true;
 }
 
 }  // namespace tinysplat_halide
