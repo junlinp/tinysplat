@@ -13,17 +13,20 @@ Usage:
 import ctypes
 import os
 import torch
-import numpy as np
 from typing import Tuple
 
 _HALIDE_LIB_PATH = os.environ.get("TINYSPLAT_HALIDE_LIB", "")
 _halide_lib = None
+_halide_load_attempted = False
 
 
 def _try_load_halide_lib():
-    global _halide_lib
+    global _halide_lib, _halide_load_attempted
     if _halide_lib is not None:
         return True
+    if _halide_load_attempted:
+        return False
+    _halide_load_attempted = True
 
     if not _HALIDE_LIB_PATH or not os.path.exists(_HALIDE_LIB_PATH):
         return False
@@ -68,10 +71,21 @@ def _try_load_halide_lib():
 
 
 def _ensure_halide():
-    if _halide_lib is None and not _try_load_halide_lib():
+    if _halide_lib is not None:
+        return
+    if not _try_load_halide_lib():
         raise ImportError(
             "Halide backend not available. Set TINYSPLAT_HALIDE_LIB "
-            "to the path of libtinysplat_halide_pipeline.so"
+            "to the path of libtinysplat_halide_pipeline.so and ensure "
+            "the Halide runtime loads (e.g. matching libstdc++)."
+        )
+
+
+def _require_cpu_halide(means: torch.Tensor):
+    if means.device.type != "cpu":
+        raise RuntimeError(
+            "TINYSPLAT_BACKEND=halide requires CPU tensors; "
+            f"got device {means.device!r}. Use CPU tensors or pick cuda/mps/cpu backend."
         )
 
 
@@ -97,18 +111,21 @@ def forward_halide(
     height: int,
     width: int,
 ) -> Tuple[torch.Tensor, list]:
-    if _halide_lib is None and not _try_load_halide_lib():
-        from .backends.python import forward_pytorch
-        return forward_pytorch(means, covariances, colors, opacities, height, width)
+    _require_cpu_halide(means)
+    _ensure_halide()
 
     N, C = colors.shape
     device = means.device
 
-    means_c     = _to_contiguous_float32_cpu(means)
-    cov_c       = _to_contiguous_float32_cpu(covariances)
-    colors_c    = _to_contiguous_float32_cpu(colors)
+    # Halide runtime buffers in pipeline.cpp are created as:
+    # means: [N,2], cov: [N,2,2], colors: [N,C], output: [H,W,C]
+    # with compact dim0-major storage. Convert PyTorch row-major tensors into
+    # matching compact memory layouts before passing raw pointers.
+    means_c     = _to_contiguous_float32_cpu(means).transpose(0, 1).contiguous()      # [2, N]
+    cov_c       = _to_contiguous_float32_cpu(covariances).permute(1, 2, 0).contiguous()  # [2, 2, N]
+    colors_c    = _to_contiguous_float32_cpu(colors).transpose(0, 1).contiguous()     # [C, N]
     opacities_c = _to_contiguous_float32_cpu(opacities)
-    output_t    = torch.zeros(height, width, C, dtype=torch.float32)
+    output_planar = torch.zeros(C, width, height, dtype=torch.float32)                # [C, W, H]
 
     rc = _halide_lib.gaussian_splat_forward(
         means_c.data_ptr(),
@@ -116,13 +133,13 @@ def forward_halide(
         colors_c.data_ptr(),
         opacities_c.data_ptr(),
         N, height, width, C,
-        output_t.data_ptr(),
+        output_planar.data_ptr(),
     )
 
     if rc != 0:
-        from .backends.python import forward_pytorch
-        return forward_pytorch(means, covariances, colors, opacities, height, width)
+        raise RuntimeError(f"gaussian_splat_forward failed (rc={rc})")
 
+    output_t = output_planar.permute(2, 1, 0).contiguous()  # [H, W, C]
     return output_t.to(device), []
 
 
@@ -141,26 +158,27 @@ def backward_halide(
     intermediates: list,
     needs_input_grad: tuple,
 ):
-    if _halide_lib is None and not _try_load_halide_lib():
-        from .backends.python import backward_pytorch
-        return backward_pytorch(
-            grad_output, means, covariances, colors, opacities,
-            height, width, intermediates, needs_input_grad,
-        )
+    _require_cpu_halide(means)
+    _ensure_halide()
 
     N, C = colors.shape
     device = means.device
 
-    grad_out_c  = _to_contiguous_float32_cpu(grad_output)
-    means_c     = _to_contiguous_float32_cpu(means)
-    cov_c       = _to_contiguous_float32_cpu(covariances)
-    colors_c    = _to_contiguous_float32_cpu(colors)
+    grad_out_c  = _to_contiguous_float32_cpu(grad_output).permute(2, 1, 0).contiguous()  # [C, W, H]
+    means_c     = _to_contiguous_float32_cpu(means).transpose(0, 1).contiguous()          # [2, N]
+    cov_c       = _to_contiguous_float32_cpu(covariances).permute(1, 2, 0).contiguous()   # [2, 2, N]
+    colors_c    = _to_contiguous_float32_cpu(colors).transpose(0, 1).contiguous()         # [C, N]
     opacities_c = _to_contiguous_float32_cpu(opacities)
 
-    grad_means_t     = torch.zeros(N, 2, dtype=torch.float32)
-    grad_cov_t       = torch.zeros(N, 2, 2, dtype=torch.float32)
-    grad_colors_t    = torch.zeros(N, C, dtype=torch.float32)
-    grad_opacities_t = torch.zeros(N, dtype=torch.float32)
+    need_means = len(needs_input_grad) > 0 and needs_input_grad[0]
+    need_cov = len(needs_input_grad) > 1 and needs_input_grad[1]
+    need_colors = len(needs_input_grad) > 2 and needs_input_grad[2]
+    need_opacities = len(needs_input_grad) > 3 and needs_input_grad[3]
+
+    grad_means_planar = torch.zeros(2, N, dtype=torch.float32) if need_means else None
+    grad_cov_planar = torch.zeros(2, 2, N, dtype=torch.float32) if need_cov else None
+    grad_colors_planar = torch.zeros(C, N, dtype=torch.float32) if need_colors else None
+    grad_opacities_t = torch.zeros(N, dtype=torch.float32) if need_opacities else None
 
     rc = _halide_lib.gaussian_splat_backward(
         grad_out_c.data_ptr(),
@@ -169,23 +187,23 @@ def backward_halide(
         colors_c.data_ptr(),
         opacities_c.data_ptr(),
         N, height, width, C,
-        grad_means_t.data_ptr(),
-        grad_cov_t.data_ptr(),
-        grad_colors_t.data_ptr(),
-        grad_opacities_t.data_ptr(),
+        grad_means_planar.data_ptr() if grad_means_planar is not None else None,
+        grad_cov_planar.data_ptr() if grad_cov_planar is not None else None,
+        grad_colors_planar.data_ptr() if grad_colors_planar is not None else None,
+        grad_opacities_t.data_ptr() if grad_opacities_t is not None else None,
     )
 
     if rc != 0:
-        from .backends.python import backward_pytorch
-        return backward_pytorch(
-            grad_output, means, covariances, colors, opacities,
-            height, width, intermediates, needs_input_grad,
-        )
+        raise RuntimeError(f"gaussian_splat_backward failed (rc={rc})")
 
-    grad_means     = grad_means_t.to(device)     if needs_input_grad[0] else None
-    grad_cov       = grad_cov_t.to(device)       if needs_input_grad[1] else None
-    grad_colors    = grad_colors_t.to(device)    if needs_input_grad[2] else None
-    grad_opacities = grad_opacities_t.to(device) if needs_input_grad[3] else None
+    grad_means_t = grad_means_planar.transpose(0, 1).contiguous() if need_means else None
+    grad_cov_t = grad_cov_planar.permute(2, 0, 1).contiguous() if need_cov else None
+    grad_colors_t = grad_colors_planar.transpose(0, 1).contiguous() if need_colors else None
+
+    grad_means = grad_means_t.to(device) if need_means else None
+    grad_cov = grad_cov_t.to(device) if need_cov else None
+    grad_colors = grad_colors_t.to(device) if need_colors else None
+    grad_opacities = grad_opacities_t.to(device) if need_opacities else None
 
     return grad_means, grad_cov, grad_colors, grad_opacities
 

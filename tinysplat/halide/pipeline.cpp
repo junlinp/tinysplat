@@ -19,6 +19,9 @@
 #include <cstdlib>
 #include <memory>
 #include "algorithm.h"
+#include "schedule_cpu.h"
+#include "schedule_cuda.h"
+#include "schedule_metal.h"
 
 using namespace Halide;
 
@@ -137,7 +140,6 @@ ensure_backward_pipeline(int H, int W, int C, const Target& target) {
 
 }  // anonymous namespace
 
-
 extern "C" {
 
 // -------------------------------------------------------------------------
@@ -204,11 +206,6 @@ int gaussian_splat_backward(float* grad_output, float* means,
         Buffer<float> colors_buf(colors, {N, C});
         Buffer<float> opacities_buf(opacities, {N});
 
-        Buffer<float> grad_means_buf(grad_means, {N, 2});
-        Buffer<float> grad_cov_buf(grad_cov, {N, 2, 2});
-        Buffer<float> grad_colors_buf(grad_colors, {N, C});
-        Buffer<float> grad_opacities_buf(grad_opacities, {N});
-
         grad_out_buf.set_host_dirty(true);
         means_buf.set_host_dirty(true);
         cov_buf.set_host_dirty(true);
@@ -221,15 +218,26 @@ int gaussian_splat_backward(float* grad_output, float* means,
         g.colors_ip.set(colors_buf);
         g.opacities_ip.set(opacities_buf);
 
-        g.grad_means.realize(grad_means_buf, target);
-        g.grad_cov.realize(grad_cov_buf, target);
-        g.grad_colors.realize(grad_colors_buf, target);
-        g.grad_opacities.realize(grad_opacities_buf, target);
-
-        grad_means_buf.copy_to_host();
-        grad_cov_buf.copy_to_host();
-        grad_colors_buf.copy_to_host();
-        grad_opacities_buf.copy_to_host();
+        if (grad_means != nullptr) {
+            Buffer<float> grad_means_buf(grad_means, {N, 2});
+            g.grad_means.realize(grad_means_buf, target);
+            grad_means_buf.copy_to_host();
+        }
+        if (grad_cov != nullptr) {
+            Buffer<float> grad_cov_buf(grad_cov, {N, 2, 2});
+            g.grad_cov.realize(grad_cov_buf, target);
+            grad_cov_buf.copy_to_host();
+        }
+        if (grad_colors != nullptr) {
+            Buffer<float> grad_colors_buf(grad_colors, {N, C});
+            g.grad_colors.realize(grad_colors_buf, target);
+            grad_colors_buf.copy_to_host();
+        }
+        if (grad_opacities != nullptr) {
+            Buffer<float> grad_opacities_buf(grad_opacities, {N});
+            g.grad_opacities.realize(grad_opacities_buf, target);
+            grad_opacities_buf.copy_to_host();
+        }
 
         return 0;
 
