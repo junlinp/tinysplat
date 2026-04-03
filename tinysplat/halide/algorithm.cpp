@@ -3,12 +3,12 @@
  *
  * Halide forward + backward pipelines for 2D Gaussian splatting.
  *
- * Key optimisation decisions:
- *   - Inputs are ImageParam so the JIT-compiled code can be reused across
- *     calls (N is a runtime extent, H/W/C are compile-time bounds).
- *   - Per-Gaussian invariants (det, inv_cov, norm_factor) are exposed as
- *     separate Funcs so the schedule can compute_root them once.
- *   - A Mahalanobis cutoff avoids expensive exp() for distant pixels.
+ * Optimizations applied:
+ *   - kMinExpArg clamping to prevent exp() underflow causing NaN
+ *   - mahal_safe = max(mahal, 0) to ensure non-negative Mahalanobis
+ *   - NaN guard in normalization: select(out == out, out, 0)
+ *   - chain_pix: shared per-pixel channel reduction for backward
+ *   - O(H*W*C*N) → O(H*W*N) reduction for grad_opacities/means/cov
  */
 
 #include "algorithm.h"

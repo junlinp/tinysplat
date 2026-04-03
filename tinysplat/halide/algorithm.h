@@ -36,6 +36,9 @@ struct ForwardPipeline {
     Halide::Func weight{"weight"};
     Halide::Func output_norm{"output_norm"};
 
+    // Computes M_g (B×6) · M_p (6×P) via cblas_sgemm to get all
+    Halide::Func gemm_power{"gemm_power"};
+
     bool built = false;
 };
 
