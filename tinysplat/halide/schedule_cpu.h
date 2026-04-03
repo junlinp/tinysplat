@@ -74,7 +74,7 @@ inline void apply_cpu_schedule_backward(GradientPipeline& g,
     g.inv_cov.update(2).unscheduled();
     g.inv_cov.update(3).unscheduled();
 
-    // Forward-recomputed pixel totals: needed by all gradient Funcs.
+    // Forward-recomputed pixel totals: needed by all gradient outputs.
     // compute_root so they are not redundantly recomputed per gradient output.
     g.total_weight_pix.compute_root()
         .vectorize(x, vec, TailStrategy::GuardWithIf)
