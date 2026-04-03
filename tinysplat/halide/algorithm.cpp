@@ -7,8 +7,15 @@
  *   - kMinExpArg clamping to prevent exp() underflow causing NaN
  *   - mahal_safe = max(mahal, 0) to ensure non-negative Mahalanobis
  *   - NaN guard in normalization: select(out == out, out, 0)
- *   - chain_pix: shared per-pixel channel reduction for backward
- *   - O(H*W*C*N) → O(H*W*N) reduction for grad_opacities/means/cov
+ *   - chain_pix: shared per-pixel channel reduction for backward pass
+ *     Reduces grad_opacities/means/cov from O(H*W*C*N) to O(H*W*N) + O(H*W*C)
+ *
+ * GEMM-GS style batching (arxiv:2604.02120) — planned:
+ *   Reformulate mahal² as v_g · v_p where:
+ *     v_p(x̄,ȳ) = [x̄², ȳ², x̄*ȳ, x̄, ȳ, 1]  (per pixel, precomputed per tile)
+ *     v_g       = f(inv_cov, gaussian offset from tile center)  (per Gaussian)
+ *   Then M_power (B×256) = M_g (B×6) · M_p (6×256) via one cblas_sgemm.
+ *   This reduces inv_cov loads from once-per-pixel to once-per-batch.
  */
 
 #include "algorithm.h"
@@ -23,7 +30,7 @@ namespace {
 constexpr float kPi  = 3.14159265358979323846f;
 constexpr float kEps = 1e-8f;
 constexpr float kMahalCutoff = 32.0f;  // ~4sigma: exp(-16) ~ 1.1e-7
-constexpr float kMinExpArg = -80.0f;   // avoid extreme underflow/denorm behavior
+constexpr float kMinExpArg = -80.0f;   // avoid extreme underflow/denorm
 
 }  // anonymous namespace
 
@@ -35,7 +42,7 @@ void build_forward(ForwardPipeline& p, int height, int width, int num_channels) 
     Var x("x"), y("y"), c("c"), n("n"), r("r");
     Expr N = p.means_ip.dim(0).extent();
 
-    // Per-Gaussian invariants (depend only on n)
+    // Per-Gaussian invariants (vectorized over n)
     p.det(n) = p.cov_ip(n, 0, 0) * p.cov_ip(n, 1, 1)
              - p.cov_ip(n, 0, 1) * p.cov_ip(n, 0, 1);
 
@@ -47,19 +54,19 @@ void build_forward(ForwardPipeline& p, int height, int width, int num_channels) 
     p.inv_cov(n, 0, 1) = -p.cov_ip(n, 0, 1) / max(p.det(n), kEps);
     p.inv_cov(n, 1, 0) = -p.cov_ip(n, 0, 1) / max(p.det(n), kEps);
 
-    // Mahalanobis distance + weight per (y, x, n)
+    // Per-pixel, per-Gaussian computation
     Func dx_f("dx_f"), dy_f("dy_f");
     dx_f(y, x, n) = cast<float>(x) - p.means_ip(n, 0);
     dy_f(y, x, n) = cast<float>(y) - p.means_ip(n, 1);
 
-    Func mahal("mahal"), mahal_safe("mahal_safe"), exp_arg_f("exp_arg_f");
-    mahal(y, x, n) = dx_f(y, x, n) * (p.inv_cov(n, 0, 0) * dx_f(y, x, n) + p.inv_cov(n, 0, 1) * dy_f(y, x, n))
-                   + dy_f(y, x, n) * (p.inv_cov(n, 1, 0) * dx_f(y, x, n) + p.inv_cov(n, 1, 1) * dy_f(y, x, n));
-    mahal_safe(y, x, n) = max(mahal(y, x, n), 0.0f);
-    exp_arg_f(y, x, n) = max(-0.5f * mahal_safe(y, x, n), kMinExpArg);
+    Func mahal_f("mahal_f"), mahal_safe_f("mahal_safe_f"), exp_arg_f("exp_arg_f");
+    mahal_f(y, x, n) = dx_f(y, x, n) * (p.inv_cov(n, 0, 0) * dx_f(y, x, n) + p.inv_cov(n, 0, 1) * dy_f(y, x, n))
+                     + dy_f(y, x, n) * (p.inv_cov(n, 1, 0) * dx_f(y, x, n) + p.inv_cov(n, 1, 1) * dy_f(y, x, n));
+    mahal_safe_f(y, x, n) = max(mahal_f(y, x, n), 0.0f);
+    exp_arg_f(y, x, n) = max(-0.5f * mahal_safe_f(y, x, n), kMinExpArg);
 
     p.weight(y, x, n) = select(
-        mahal_safe(y, x, n) < kMahalCutoff,
+        mahal_safe_f(y, x, n) < kMahalCutoff,
         p.opacities_ip(n) * p.norm_factor(n) * exp(exp_arg_f(y, x, n)),
         0.0f);
 
@@ -143,9 +150,9 @@ void build_backward(GradientPipeline& g, int height, int width, int num_channels
         * g.weight(r_hw.x, r_hw.y, n)
         / max(g.total_weight_pix(r_hw.x, r_hw.y), kEps);
 
-    // Shared per-pixel channel reduction used by multiple parameter gradients.
-    // This reduces duplicated work in grad_opacities/means/cov from O(H*W*C*N)
-    // to one O(H*W*C*N) term reused by three outputs.
+    // Shared per-pixel channel reduction.
+    // Reduces O(H*W*C*N) duplicated work → one O(H*W*C*N) term shared by
+    // grad_opacities, grad_means, and grad_cov.
     Func chain_pix("chain_pix");
     RDom r_c(0, num_channels, "r_c");
     chain_pix(y, x, n) = cast<float>(0.0f);
