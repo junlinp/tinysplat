@@ -6,22 +6,7 @@ from typing import Callable
 import torch
 
 
-Render3DFn = Callable[
-    [
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        int,
-        float,
-        float,
-        float,
-    ],
-    torch.Tensor,
-]
+Render3DFn = Callable[..., torch.Tensor]
 
 
 @dataclass(frozen=True)

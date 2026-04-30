@@ -34,6 +34,8 @@ def gaussian_splat_3d(
     near_plane: float = 1e-4,
     min_covariance: float = 1e-4,
     sigma_radius: float = 3.0,
+    scales: Optional[torch.Tensor] = None,
+    quats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Render 3D Gaussians using camera intrinsics and a camera-to-world pose.
@@ -48,9 +50,13 @@ def gaussian_splat_3d(
     opacities = opacities.to(device_obj)
     intrinsics = intrinsics.to(device_obj)
     camera_to_world = camera_to_world.to(device_obj)
+    if scales is not None:
+        scales = scales.to(device_obj)
+    if quats is not None:
+        quats = quats.to(device_obj)
 
     backend = get_backend_3d(device_obj.type)
-    return backend.render(
+    render_kwargs = dict(
         means=means,
         covariances=covariances,
         colors=colors,
@@ -63,6 +69,10 @@ def gaussian_splat_3d(
         min_covariance=min_covariance,
         sigma_radius=sigma_radius,
     )
+    if backend.name == "cuda" and scales is not None and quats is not None:
+        render_kwargs["scales"] = scales
+        render_kwargs["quats"] = quats
+    return backend.render(**render_kwargs)
 
 
 class GaussianSplat3D(nn.Module):

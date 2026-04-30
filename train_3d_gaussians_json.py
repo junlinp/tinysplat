@@ -21,6 +21,14 @@ from tqdm.auto import tqdm
 
 from tinysplat import gaussian_splat_3d
 from tinysplat.gaussian_splat_3d_core import project_gaussians_3d_to_2d
+from tinysplat.backends_3d.cuda import get_last_render_info
+
+try:
+    from gsplat.strategy.default import DefaultStrategy
+    _HAS_GSPLAT_STRATEGY = True
+except Exception:
+    DefaultStrategy = None
+    _HAS_GSPLAT_STRATEGY = False
 
 try:
     from pytorch_msssim import ssim as _compute_ssim
@@ -271,8 +279,8 @@ def parse_args():
     parser.add_argument(
         "--densify-every",
         type=int,
-        default=1000,
-        help="Run densify/prune every N steps. Use 0 to disable. (nerfstudio default: 3000)",
+        default=100,
+        help="Run densify/prune every N steps. Use 0 to disable. (nerfstudio default: 100)",
     )
     parser.add_argument(
         "--densify-from",
@@ -283,13 +291,13 @@ def parse_args():
     parser.add_argument(
         "--densify-until",
         type=int,
-        default=-1,
-        help="Stop densification after this many steps. Use -1 to run until the end.",
+        default=15000,
+        help="Stop densification after this many steps. (nerfstudio default: 15000)",
     )
     parser.add_argument(
         "--densify-grad-thresh",
         type=float,
-        default=1e-6,
+        default=8e-4,
         help="Split/duplicate gaussians whose mean gradient norm exceeds this value.",
     )
     parser.add_argument(
@@ -307,7 +315,7 @@ def parse_args():
     parser.add_argument(
         "--max-gaussians",
         type=int,
-        default=50000,
+        default=5000000,
         help="Maximum number of gaussians after densification.",
     )
     parser.add_argument(
@@ -483,119 +491,114 @@ def backproject_pixels_to_world(
     return points_camera @ rotation.transpose(0, 1) + translation
 
 
-def build_pixel_gaussians_3d(
+def _pose_centers_bbox(frames: List[FrameSample], dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    centers = torch.stack([frame.camera_to_world[:3, 3] for frame in frames], dim=0).to(device=device, dtype=dtype)
+    bbox_min = centers.min(dim=0).values
+    bbox_max = centers.max(dim=0).values
+    eps = torch.tensor([0.1, 0.1, 0.1], device=device, dtype=dtype)
+    return bbox_min - eps, bbox_max + eps
+
+
+def build_pose_bbox_gaussians_3d(
     target: torch.Tensor,
-    intrinsics: torch.Tensor,
-    camera_to_world: torch.Tensor,
-    init_grid_long_side: int,
+    frames: List[FrameSample],
+    voxel_size: float = 0.1,
 ) -> Dict[str, torch.Tensor]:
-    height, width, channels = target.shape
-    grid_height, grid_width = compute_initial_grid_shape(
-        height=height,
-        width=width,
-        long_side_limit=init_grid_long_side,
-    )
+    channels = target.shape[2]
     dtype = target.dtype
     device = target.device
 
-    y_coords = (
-        (torch.arange(grid_height, device=device, dtype=dtype) + 0.5) * (height / grid_height) - 0.5
-    ).clamp(0, height - 1)
-    x_coords = (
-        (torch.arange(grid_width, device=device, dtype=dtype) + 0.5) * (width / grid_width) - 0.5
-    ).clamp(0, width - 1)
+    bbox_min, bbox_max = _pose_centers_bbox(frames, dtype=dtype, device=device)
 
-    pixel_centers = torch.stack(
-        [
-            x_coords.repeat(grid_height),
-            y_coords.repeat_interleave(grid_width),
-        ],
-        dim=1,
-    )
+    step = float(voxel_size)
+    xs = torch.arange(float(bbox_min[0]), float(bbox_max[0]) + 0.5 * step, step, device=device, dtype=dtype)
+    ys = torch.arange(float(bbox_min[1]), float(bbox_max[1]) + 0.5 * step, step, device=device, dtype=dtype)
+    zs = torch.arange(float(bbox_min[2]), float(bbox_max[2]) + 0.5 * step, step, device=device, dtype=dtype)
 
-    pooled_input = target.permute(2, 0, 1).unsqueeze(0)
-    if target.device.type == "mps":
-        pooled = F.adaptive_avg_pool2d(
-            pooled_input.cpu(),
-            output_size=(grid_height, grid_width),
-        ).to(device)
-    else:
-        pooled = F.adaptive_avg_pool2d(
-            pooled_input,
-            output_size=(grid_height, grid_width),
+    gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')
+    means = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3).contiguous()
+
+    num_gaussians = means.shape[0]
+    if num_gaussians <= 0:
+        raise ValueError('Pose bounding-box initialization produced zero gaussians.')
+    if num_gaussians > 2_000_000:
+        raise ValueError(
+            f'Pose bounding-box initialization produced {num_gaussians} gaussians (>2,000,000). '
+            'Increase voxel size or reduce pose extent.'
         )
-    colors = pooled.squeeze(0).permute(1, 2, 0).reshape(-1, channels).contiguous()
 
-    min_depth = 1.0
-    max_depth = 8.0
-    depths = (
-        torch.rand(grid_height * grid_width, device=device, dtype=dtype) * (max_depth - min_depth)
-        + min_depth
-    )
-    means = backproject_pixels_to_world(
-        pixel_centers=pixel_centers,
-        depth=depths,
-        intrinsics=intrinsics,
-        camera_to_world=camera_to_world,
-    )
+    init_scale = max(step * 0.5, 1e-3)
+    log_scales = torch.full((num_gaussians, 3), math.log(init_scale), device=device, dtype=dtype)
 
-    pixel_size_x = max_depth / intrinsics[0, 0]
-    pixel_size_y = max_depth / intrinsics[1, 1]
-    patch_scale_x = pixel_size_x * max(width / grid_width, 1.0) * 1.0
-    patch_scale_y = pixel_size_y * max(height / grid_height, 1.0) * 1.0
-    patch_scale_z = 0.1
-
-    log_scales = torch.stack(
-        [
-            torch.full(
-                (grid_height * grid_width,),
-                math.log(float(patch_scale_x)),
-                device=device,
-                dtype=dtype,
-            ),
-            torch.full(
-                (grid_height * grid_width,),
-                math.log(float(patch_scale_y)),
-                device=device,
-                dtype=dtype,
-            ),
-            torch.full(
-                (grid_height * grid_width,),
-                math.log(float(patch_scale_z)),
-                device=device,
-                dtype=dtype,
-            ),
-        ],
-        dim=1,
-    )
+    flat_colors = target.reshape(-1, channels)
+    color_idx = torch.randint(0, flat_colors.shape[0], (num_gaussians,), device=device)
+    colors = flat_colors[color_idx].contiguous()
+    # Keep initial splats visible in viser even when source images are very dark.
+    colors = torch.clamp(colors * 0.9 + 0.1, 0.0, 1.0)
 
     initial_alpha = 0.99
-    initial_opacity_logit = torch.logit(
-        torch.tensor(initial_alpha, device=device, dtype=dtype)
-    ).item()
-    opacity_logits = torch.full(
-        (grid_height * grid_width,),
-        initial_opacity_logit,
-        device=device,
-        dtype=dtype,
-    )
+    initial_opacity_logit = torch.logit(torch.tensor(initial_alpha, device=device, dtype=dtype)).item()
+    opacity_logits = torch.full((num_gaussians,), initial_opacity_logit, device=device, dtype=dtype)
 
-    num_gaussians = grid_height * grid_width
     rotations = torch.zeros(num_gaussians, 4, device=device, dtype=dtype)
     rotations[:, 0] = 1.0
 
     return {
-        "means": means,
-        "log_scales": log_scales,
-        "rotations": rotations,
-        "colors": colors,
-        "opacities": opacity_logits,
+        'means': means,
+        'log_scales': log_scales,
+        'rotations': rotations,
+        'colors': colors,
+        'opacities': opacity_logits,
     }
 
 
-def load_dataset_frames(dataset_json: Path, device: str) -> Tuple[Path, List[FrameSample]]:
+def build_sparse_points_gaussians_3d(
+    points3d: List[Dict[str, object]],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Dict[str, torch.Tensor]:
+    if not points3d:
+        raise ValueError("Dataset JSON does not contain points3d for sparse initialization.")
+
+    xyz = torch.tensor([p["xyz"] for p in points3d], dtype=dtype, device=device)
+    rgb = torch.tensor([p.get("rgb", [128, 128, 128]) for p in points3d], dtype=dtype, device=device) / 255.0
+    rgb = torch.clamp(rgb, 0.0, 1.0)
+
+    n = xyz.shape[0]
+    if n < 2:
+        scales = torch.full((n, 3), 0.05, dtype=dtype, device=device)
+    else:
+        # Memory-safe nearest-neighbor distance estimate using sampled references.
+        ref_n = min(2048, n)
+        ref_idx = torch.randperm(n, device=device)[:ref_n]
+        refs = xyz[ref_idx]
+        nn = torch.full((n,), 1e9, dtype=dtype, device=device)
+        chunk = 8192
+        for st in range(0, n, chunk):
+            ed = min(st + chunk, n)
+            d = torch.cdist(xyz[st:ed], refs)
+            nn[st:ed] = d.min(dim=1).values
+        base = torch.clamp(nn, min=1e-3, max=1.0).unsqueeze(1)
+        scales = base.repeat(1, 3)
+
+    log_scales = torch.log(scales)
+    rotations = torch.zeros(n, 4, dtype=dtype, device=device)
+    rotations[:, 0] = 1.0
+    opa = torch.full((n,), torch.logit(torch.tensor(0.1, dtype=dtype, device=device)).item(), dtype=dtype, device=device)
+
+    return {
+        "means": xyz,
+        "log_scales": log_scales,
+        "rotations": rotations,
+        "colors": rgb,
+        "opacities": opa,
+    }
+
+
+def load_dataset_frames(dataset_json: Path, device: str) -> Tuple[Path, List[FrameSample], List[Dict[str, object]]]:
     dataset = json.loads(dataset_json.read_text(encoding="utf-8"))
     scene_dir = Path(dataset["scene_dir"])
+    points3d = dataset.get("points3d", [])
     frames: List[FrameSample] = []
     for frame in dataset["frames"]:
         intr = frame["intrinsics"]
@@ -623,7 +626,7 @@ def load_dataset_frames(dataset_json: Path, device: str) -> Tuple[Path, List[Fra
                 camera_to_world=camera_to_world,
             )
         )
-    return scene_dir, frames
+    return scene_dir, frames, points3d
 
 
 def load_frame_image(
@@ -765,6 +768,8 @@ class GaussianData:
             height=height,
             width=width,
             device=self._device.type,
+            scales=torch.exp(self.log_scales),
+            quats=F.normalize(self.rotations, dim=-1),
         )
 
     def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
@@ -774,6 +779,14 @@ class GaussianData:
             "opacities": self.visible_opacities().detach().cpu(),
             "covariances": self.covariance_matrices().detach().cpu(),
         }
+
+    def sync_from_strategy_params(self, params: Dict[str, torch.Tensor]):
+        self.means = params["means"]
+        self.log_scales = params["scales"]
+        self.rotations = params["quats"]
+        self.colors = params["colors"]
+        self.opacities = params["opacities"]
+
 
 
 def save_checkpoint(
@@ -848,13 +861,30 @@ def save_ply(
     PlyData([el], byte_order="<").write(str(output_path))
 
 
-def rebuild_optimizer(data: GaussianData, lr: float):
-    return torch.optim.Adam(data.parameters(), lr=lr)
+def build_optimizers(data: GaussianData, lr: float):
+    return {
+        "means": torch.optim.Adam([data.means], lr=lr),
+        "scales": torch.optim.Adam([data.log_scales], lr=lr),
+        "quats": torch.optim.Adam([data.rotations], lr=lr),
+        "colors": torch.optim.Adam([data.colors], lr=lr),
+        "opacities": torch.optim.Adam([data.opacities], lr=lr),
+    }
+
+
+def zero_optimizers(optimizers):
+    for opt in optimizers.values():
+        opt.zero_grad(set_to_none=True)
+
+
+def step_optimizers(optimizers):
+    for opt in optimizers.values():
+        opt.step()
 
 
 def densify_and_prune(
     data: GaussianData,
-    grad_norms: torch.Tensor,
+    grad_accum: torch.Tensor,
+    vis_count: torch.Tensor,
     grad_thresh: float,
     prune_opacity_thresh: float,
     max_gaussians: int,
@@ -877,7 +907,9 @@ def densify_and_prune(
         rotations = data.rotations.detach().clone()[:n]
         colors = data.colors.detach().clone()[:n]
         opacities = data.opacities.detach().clone()[:n]
-        grad_norms = grad_norms.detach().clone()[:n]
+        grad_accum = grad_accum.detach().clone()[:n]
+        vis_count = vis_count.detach().clone()[:n]
+        grad_norms = grad_accum / torch.clamp(vis_count, min=1.0)
 
         sizes = [
             means.shape[0],
@@ -990,17 +1022,31 @@ def densify_and_prune(
         capacity = max(0, max_gaussians - means.shape[0])
         n_new = (dupli_mask.sum() * 1 + split_mask.sum() * 2).item()
         if n_new > capacity and n_new > 0:
-            ratio = capacity / n_new
-            n_dupli = int(dupli_mask.sum().item() * ratio)
-            n_split = int(split_mask.sum().item() * ratio)
-            dupli_idx = torch.where(dupli_mask)[0][:n_dupli]
-            split_idx = torch.where(split_mask)[0][:n_split]
-            dupli_mask = torch.zeros_like(dupli_mask)
-            split_mask = torch.zeros_like(split_mask)
-            if n_dupli > 0:
-                dupli_mask[dupli_idx] = True
-            if n_split > 0:
-                split_mask[split_idx] = True
+            # Prefer high-gradient candidates under capacity constraints.
+            split_idx_all = torch.where(split_mask)[0]
+            dupli_idx_all = torch.where(dupli_mask)[0]
+
+            split_scores = grad_norms[split_idx_all] if split_idx_all.numel() > 0 else None
+            dupli_scores = grad_norms[dupli_idx_all] if dupli_idx_all.numel() > 0 else None
+
+            chosen_split = torch.zeros_like(split_mask)
+            chosen_dupli = torch.zeros_like(dupli_mask)
+
+            # Splits cost 2 slots, duplicates cost 1 slot.
+            remaining = int(capacity)
+            if split_idx_all.numel() > 0 and remaining >= 2:
+                max_splits = min(split_idx_all.numel(), remaining // 2)
+                topk = torch.topk(split_scores, k=max_splits, largest=True).indices
+                chosen_split[split_idx_all[topk]] = True
+                remaining -= int(max_splits) * 2
+
+            if dupli_idx_all.numel() > 0 and remaining > 0:
+                max_duplis = min(dupli_idx_all.numel(), remaining)
+                topk = torch.topk(dupli_scores, k=max_duplis, largest=True).indices
+                chosen_dupli[dupli_idx_all[topk]] = True
+
+            split_mask = chosen_split
+            dupli_mask = chosen_dupli
 
         n_dupli = dupli_mask.sum().item()
         n_split = split_mask.sum().item()
@@ -1035,7 +1081,7 @@ def densify_and_prune(
             samples = torch.einsum("nij,nj,bnj->bni", rotmats, sel_scales, noise)
 
             new_means.append((means[split_mask].unsqueeze(0) + samples).reshape(-1, 3))
-            new_log_scales.append(torch.log(torch.exp(log_scales[split_mask]) / 1.6).repeat(2, 1))
+            new_log_scales.append(torch.log(torch.exp(log_scales[split_mask]) / max(float(split_scale_shrink), 1.01)).repeat(2, 1))
             new_rotations.append(rotations[split_mask].repeat(2, 1))
             new_colors.append(colors[split_mask].repeat(2, 1))
             new_opacities.append(opacities[split_mask].repeat(2))
@@ -1054,6 +1100,7 @@ def densify_and_prune(
             means = torch.cat([means[keep_mask]] + new_means, dim=0)
             log_scales = torch.cat([log_scales[keep_mask]] + new_log_scales, dim=0)
             rotations = torch.cat([rotations[keep_mask]] + new_rotations, dim=0)
+            rotations = F.normalize(rotations, dim=-1)
             colors = torch.cat([colors[keep_mask]] + new_colors, dim=0)
             opacities = torch.cat([opacities[keep_mask]] + new_opacities, dim=0)
 
@@ -1072,17 +1119,19 @@ def densify_and_prune(
 
 
 def reset_opacities(data: GaussianData, value: float = 0.01):
-    """Reset opacities to prevent Gaussians from becoming permanently opaque/transparent."""
+    """Reset all opacities to the provided alpha value (in probability space)."""
     with torch.no_grad():
-        new_opacities = torch.clamp(
-            data.opacities.data,
-            max=torch.logit(torch.tensor(value)).item(),
-        )
-        data.opacities.data.copy_(new_opacities)
+        value = max(min(float(value), 1.0 - 1e-6), 1e-6)
+        reset_logit = torch.logit(
+            torch.tensor(value, device=data.opacities.device, dtype=data.opacities.dtype)
+        ).item()
+        data.opacities.data.fill_(reset_logit)
 
 
 def main():
     args = parse_args()
+    if not _HAS_SSIM:
+        raise RuntimeError("pytorch_msssim is required: pip install pytorch-msssim")
     device = resolve_device(args.device)
     set_seed(args.seed)
     configure_torch_threads(args.torch_num_threads, args.torch_num_inter_op_threads)
@@ -1090,7 +1139,7 @@ def main():
     if device == "mps" and effective_viser_update_every == 10:
         effective_viser_update_every = 100
 
-    scene_dir, frames = load_dataset_frames(args.dataset_json.resolve(), device)
+    scene_dir, frames, points3d = load_dataset_frames(args.dataset_json.resolve(), device)
     if not frames:
         raise ValueError("Dataset does not contain any frames.")
     if args.limit_frames > 0:
@@ -1127,14 +1176,53 @@ def main():
             max_resolution=args.max_resolution,
         )
 
-    gaussians = build_pixel_gaussians_3d(
-        target=first_target,
-        intrinsics=first_intrinsics,
-        camera_to_world=frames[0].camera_to_world,
-        init_grid_long_side=args.init_grid_long_side,
-    )
+    if points3d:
+        gaussians = build_sparse_points_gaussians_3d(
+            points3d=points3d,
+            device=first_target.device,
+            dtype=first_target.dtype,
+        )
+        init_voxel_size = None
+    else:
+        init_voxel_size = 0.1
+        gaussians = build_pose_bbox_gaussians_3d(
+            target=first_target,
+            frames=frames,
+            voxel_size=init_voxel_size,
+        )
     gauss_data = GaussianData(gaussians, device)
-    optimizer = torch.optim.Adam(gauss_data.parameters(), lr=args.lr)
+    optimizers = build_optimizers(gauss_data, args.lr)
+    strategy = None
+    strategy_state = None
+    strategy_params = None
+    if _HAS_GSPLAT_STRATEGY:
+        strategy = DefaultStrategy(
+            prune_opa=args.prune_opacity_thresh,
+            grow_grad2d=args.densify_grad_thresh,
+            grow_scale3d=0.01,
+            grow_scale2d=args.split_screen_size,
+            prune_scale3d=0.1,
+            prune_scale2d=args.cull_screen_size,
+            refine_scale2d_stop_iter=args.densify_until if args.densify_until > 0 else 0,
+            refine_start_iter=args.densify_from,
+            refine_stop_iter=args.densify_until if args.densify_until > 0 else max(args.iterations, 1 << 30),
+            reset_every=args.reset_opacity_every if args.reset_opacity_every > 0 else (1 << 30),
+            refine_every=args.densify_every if args.densify_every > 0 else (1 << 30),
+            pause_refine_after_reset=len(frames) + (args.densify_every if args.densify_every > 0 else 0),
+            absgrad=False,
+            revised_opacity=True,
+            verbose=False,
+            key_for_gradient="means2d",
+        )
+        strategy_params = {
+            "means": gauss_data.means,
+            "scales": gauss_data.log_scales,
+            "quats": gauss_data.rotations,
+            "colors": gauss_data.colors,
+            "opacities": gauss_data.opacities,
+        }
+        strategy.check_sanity(strategy_params, optimizers)
+        strategy_state = strategy.initialize_state(scene_scale=1.0)
 
     visualizer.set_cameras(frames)
     with torch.no_grad():
@@ -1164,7 +1252,10 @@ def main():
     print(f"Frames: {len(frames)}")
     print(f"Resolution: {first_width}x{first_height}")
     print(f"Initial gaussians: {gauss_data.num_gaussians}")
-    print(f"Initial grid long side cap: {args.init_grid_long_side}")
+    if init_voxel_size is None:
+        print(f"Initialization: sparse COLMAP points3D ({len(points3d)} points)")
+    else:
+        print(f"Initial bbox voxel size (m): {init_voxel_size}")
     print(f"Max resolution: {args.max_resolution or 'original'}")
     print(f"Output directory: {output_dir}")
     print(f"Viser: http://localhost:{args.viser_port}")
@@ -1208,7 +1299,7 @@ def main():
                 frame, device=device, max_resolution=schedule_max_res
             )
 
-        optimizer.zero_grad()
+        zero_optimizers(optimizers)
         rendered = gauss_data.render(
             intrinsics=intrinsics,
             camera_to_world=frame.camera_to_world,
@@ -1216,15 +1307,60 @@ def main():
             width=width,
         )
 
-        # MSE loss (directly optimizes PSNR)
-        loss = F.mse_loss(rendered, target)
+        # Combined photometric loss: (1-lambda)*MSE + lambda*(1-SSIM).
+        mse_loss = F.mse_loss(rendered, target)
+        ssim_loss = 1.0 - _compute_ssim(
+            rendered.permute(2, 0, 1).unsqueeze(0),
+            target.permute(2, 0, 1).unsqueeze(0),
+            data_range=1.0,
+            size_average=True,
+        )
+        loss = (1.0 - args.ssim_lambda) * mse_loss + args.ssim_lambda * ssim_loss
+
+        info = get_last_render_info()
+        if strategy is not None and isinstance(info, dict):
+            strategy.step_pre_backward(strategy_params, optimizers, strategy_state, step + 1, info)
 
         loss.backward()
-        grad_norms = gauss_data.means.grad.detach().norm(dim=1)
-        optimizer.step()
+
+        prev_n = gauss_data.num_gaussians
+        if strategy is not None and isinstance(info, dict):
+            strategy.step_post_backward(strategy_params, optimizers, strategy_state, step + 1, info, packed=False)
+            gauss_data.sync_from_strategy_params(strategy_params)
+
+        step_optimizers(optimizers)
+
+        if gauss_data.num_gaussians > args.max_gaussians:
+            keep = args.max_gaussians
+            idx = torch.randperm(gauss_data.num_gaussians, device=gauss_data.device)[:keep]
+            strategy_params["means"] = torch.nn.Parameter(strategy_params["means"].detach()[idx].contiguous(), requires_grad=True)
+            strategy_params["scales"] = torch.nn.Parameter(strategy_params["scales"].detach()[idx].contiguous(), requires_grad=True)
+            strategy_params["quats"] = torch.nn.Parameter(strategy_params["quats"].detach()[idx].contiguous(), requires_grad=True)
+            strategy_params["colors"] = torch.nn.Parameter(strategy_params["colors"].detach()[idx].contiguous(), requires_grad=True)
+            strategy_params["opacities"] = torch.nn.Parameter(strategy_params["opacities"].detach()[idx].contiguous(), requires_grad=True)
+            gauss_data.sync_from_strategy_params(strategy_params)
+            optimizers = build_optimizers(gauss_data, args.lr)
+            if strategy is not None:
+                strategy_state = strategy.initialize_state(scene_scale=1.0)
+            print(f"Capped gaussians at step {step + 1}: {gauss_data.num_gaussians} -> {keep}")
+
+        if gauss_data.num_gaussians != prev_n:
+            print(f"Densified at step {step + 1}: {gauss_data.num_gaussians} gaussians")
+            with torch.no_grad():
+                snap = gauss_data.snapshot_for_visualizer()
+                visualizer.update_gaussians(
+                    snap["means"],
+                    snap["colors"],
+                    snap["opacities"],
+                    snap["covariances"],
+                )
+            visualizer.update_gaussian_stats(gauss_data.num_gaussians)
+            visualizer.update_status(
+                f"**Status:** training live at http://localhost:{args.viser_port} (densified/pruned)"
+            )
 
         last_loss = loss.detach()
-        psnr = -10.0 * torch.log10(last_loss + 1e-10)
+        psnr = -10.0 * torch.log10(mse_loss.detach() + 1e-10)
 
         ssim_val = 0.0
         if _HAS_SSIM:
@@ -1255,46 +1391,7 @@ def main():
                 )
             visualizer.update_gaussian_stats(gauss_data.num_gaussians)
 
-        if (
-            args.densify_every
-            and (step + 1) % args.densify_every == 0
-            and args.densify_from <= (step + 1)
-            and (args.densify_until < 0 or (step + 1) <= args.densify_until)
-        ):
-            changed = densify_and_prune(
-                data=gauss_data,
-                grad_norms=grad_norms,
-                grad_thresh=args.densify_grad_thresh,
-                prune_opacity_thresh=args.prune_opacity_thresh,
-                max_gaussians=args.max_gaussians,
-                split_scale_shrink=args.split_scale_shrink,
-                cull_screen_size=args.cull_screen_size,
-                split_screen_size=args.split_screen_size,
-                intrinsics=intrinsics,
-                camera_to_world=frame.camera_to_world,
-                height=height,
-                width=width,
-            )
-            if changed:
-                print(f"Densified at step {step + 1}: {gauss_data.num_gaussians} gaussians")
-                optimizer = rebuild_optimizer(gauss_data, args.lr)
-                with torch.no_grad():
-                    snap = gauss_data.snapshot_for_visualizer()
-                    visualizer.update_gaussians(
-                        snap["means"],
-                        snap["colors"],
-                        snap["opacities"],
-                        snap["covariances"],
-                    )
-                visualizer.update_gaussian_stats(gauss_data.num_gaussians)
-                visualizer.update_status(
-                    f"**Status:** training live at http://localhost:{args.viser_port} (densified/pruned)"
-                )
-
-        if args.reset_opacity_every > 0 and (step + 1) % args.reset_opacity_every == 0 and step > 0:
-            reset_opacities(gauss_data)
-            if args.densify_every:
-                print(f"Reset opacities at step {step + 1}")
+        # Densify/prune/reset are handled by gsplat.DefaultStrategy in step_post_backward.
         if visualizer.should_render_selected_frame(step + 1, effective_viser_update_every):
             selected_idx = min(visualizer.selected_frame_idx, len(frames) - 1)
             if prepared_frames is not None:
