@@ -9,6 +9,12 @@ import torch
 
 from .common import Backend3DOps
 
+LAST_RENDER_INFO = None
+
+
+def get_last_render_info():
+    return LAST_RENDER_INFO
+
 
 def _import_gsplat_rasterization():
     try:
@@ -148,8 +154,10 @@ def _call_gsplat(
 
     if isinstance(out, tuple):
         # gsplat commonly returns (render, alpha, meta)
-        return out[0]
-    return out
+        if len(out) >= 3:
+            return out[0], out[2]
+        return out[0], {}
+    return out, {}
 
 
 def render_cuda_3d(
@@ -164,6 +172,8 @@ def render_cuda_3d(
     near_plane: float,
     min_covariance: float,
     sigma_radius: float,
+    scales: torch.Tensor | None = None,
+    quats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del min_covariance, sigma_radius
 
@@ -177,11 +187,17 @@ def render_cuda_3d(
     intrinsics = intrinsics.to(device)
     camera_to_world = camera_to_world.to(device)
 
-    scales, quats = _covariance_to_scales_quats(covariances)
+    if scales is None or quats is None:
+        scales, quats = _covariance_to_scales_quats(covariances)
+    else:
+        scales = scales.to(device)
+        quats = quats.to(device)
+        quats = quats / torch.clamp(torch.linalg.norm(quats, dim=-1, keepdim=True), min=1e-12)
     viewmats = _build_viewmat(camera_to_world).unsqueeze(0)
     Ks = intrinsics.unsqueeze(0)
 
-    render = _call_gsplat(
+    global LAST_RENDER_INFO
+    render, meta = _call_gsplat(
         rasterization=rasterization,
         means=means,
         scales=scales,
@@ -194,6 +210,16 @@ def render_cuda_3d(
         height=height,
         near_plane=near_plane,
     )
+
+    # Save gsplat meta for training strategy (e.g., means2d grads/radii/ids).
+    info = {
+        "width": width,
+        "height": height,
+        "n_cameras": 1,
+    }
+    if isinstance(meta, dict):
+        info.update(meta)
+    LAST_RENDER_INFO = info
 
     # Normalize possible output layouts to (H, W, C)
     if render.ndim == 4:

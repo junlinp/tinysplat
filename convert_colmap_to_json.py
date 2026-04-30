@@ -104,6 +104,52 @@ def read_images_binary(path: Path) -> Dict[int, ImageRecord]:
     return images
 
 
+def read_points3d_binary(path: Path) -> List[Dict[str, object]]:
+    points: List[Dict[str, object]] = []
+    with path.open("rb") as fid:
+        num_points = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_points):
+            point3d_id = read_next_bytes(fid, 8, "Q")[0]
+            x, y, z = read_next_bytes(fid, 24, "ddd")
+            r, g, b = read_next_bytes(fid, 3, "BBB")
+            error = read_next_bytes(fid, 8, "d")[0]
+            track_len = read_next_bytes(fid, 8, "Q")[0]
+            fid.seek(track_len * 8, 1)  # (image_id, point2D_idx) pairs
+            points.append(
+                {
+                    "id": int(point3d_id),
+                    "xyz": [float(x), float(y), float(z)],
+                    "rgb": [int(r), int(g), int(b)],
+                    "error": float(error),
+                }
+            )
+    return points
+
+
+def read_points3d_text(path: Path) -> List[Dict[str, object]]:
+    points: List[Dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        point3d_id = int(parts[0])
+        x, y, z = map(float, parts[1:4])
+        r, g, b = map(int, parts[4:7])
+        error = float(parts[7])
+        points.append(
+            {
+                "id": point3d_id,
+                "xyz": [x, y, z],
+                "rgb": [r, g, b],
+                "error": error,
+            }
+        )
+    return points
+
+
 def qvec_to_rotmat(qvec: Tuple[float, float, float, float]) -> List[List[float]]:
     qw, qx, qy, qz = qvec
     return [
@@ -190,6 +236,15 @@ def build_dataset_json(
     cameras = read_cameras_binary(sparse_dir / "cameras.bin")
     images = read_images_binary(sparse_dir / "images.bin")
 
+    points_bin = sparse_dir / "points3D.bin"
+    points_txt = sparse_dir / "points3D.txt"
+    if points_bin.exists():
+        points3d = read_points3d_binary(points_bin)
+    elif points_txt.exists():
+        points3d = read_points3d_text(points_txt)
+    else:
+        points3d = []
+
     frames = []
     for image in sorted(images.values(), key=lambda item: item.name):
         camera = cameras[image.camera_id]
@@ -221,6 +276,8 @@ def build_dataset_json(
         "images_dir": str(images_dir.relative_to(scene_dir)),
         "sparse_dir": str(sparse_dir.relative_to(scene_dir)),
         "num_frames": len(frames),
+        "num_points3d": len(points3d),
+        "points3d": points3d,
         "frames": frames,
     }
 
