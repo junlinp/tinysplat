@@ -1,0 +1,20 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "render_2d",
+    srcs = ["render_2d.cc"],
+    deps = ["//src/tinysplat"],
+)
+
+cc_binary(
+    name = "render_2d_cuda",
+    srcs = ["render_2d.cc"],
+    local_defines = ["TINYSPLAT_CUDA"],
+    deps = [
+        "//cuda:gaussian_2d_cuda",
+        "//cuda:gaussian_2d_cuda_headers",
+        "//src/tinysplat",
+    ],
+    linkopts = ["-lcudart"],
+    tags = ["cuda"],
+)
