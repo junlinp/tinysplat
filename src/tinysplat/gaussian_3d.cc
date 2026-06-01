@@ -1,4 +1,6 @@
 #include "tinysplat/gaussian_3d.h"
+#include "tinysplat/gaussian_2d.h"
+#include "gaussian_3d_cuda_bridge.h"
 
 #include <algorithm>
 #include <cmath>
@@ -98,15 +100,15 @@ std::vector<ProjectedGaussian3D> project_gaussians_3d_internal(
       float t21 = rwc20 * wc.m[0][1] + rwc21 * wc.m[1][1] + rwc22 * wc.m[2][1];
       float t22 = rwc20 * wc.m[0][2] + rwc21 * wc.m[1][2] + rwc22 * wc.m[2][2];
 
-      float ccov00 = t00 * rwc00 + t01 * rwc01 + t02 * rwc02;
-      float ccov01 = t00 * rwc10 + t01 * rwc11 + t02 * rwc12;
-      float ccov02 = t00 * rwc20 + t01 * rwc21 + t02 * rwc22;
-      float ccov10 = t10 * rwc00 + t11 * rwc01 + t12 * rwc02;
-      float ccov11 = t10 * rwc10 + t11 * rwc11 + t12 * rwc12;
-      float ccov12 = t10 * rwc20 + t11 * rwc21 + t12 * rwc22;
-      float ccov20 = t20 * rwc00 + t21 * rwc01 + t22 * rwc02;
-      float ccov21 = t20 * rwc10 + t21 * rwc11 + t22 * rwc12;
-      float ccov22 = t20 * rwc20 + t21 * rwc21 + t22 * rwc22;
+      const float ccov00 = t00 * rwc00 + t01 * rwc01 + t02 * rwc02;
+      const float ccov01 = t00 * rwc10 + t01 * rwc11 + t02 * rwc12;
+      const float ccov02 = t00 * rwc20 + t01 * rwc21 + t02 * rwc22;
+      const float ccov10 = t10 * rwc00 + t11 * rwc01 + t12 * rwc02;
+      const float ccov11 = t10 * rwc10 + t11 * rwc11 + t12 * rwc12;
+      const float ccov12 = t10 * rwc20 + t11 * rwc21 + t12 * rwc22;
+      const float ccov20 = t20 * rwc00 + t21 * rwc01 + t22 * rwc02;
+      const float ccov21 = t20 * rwc10 + t21 * rwc11 + t22 * rwc12;
+      const float ccov22 = t20 * rwc20 + t21 * rwc21 + t22 * rwc22;
 
       const float proj_x = fx * cam_x / cam_z + cx;
       const float proj_y = fy * cam_y / cam_z + cy;
@@ -118,8 +120,8 @@ std::vector<ProjectedGaussian3D> project_gaussians_3d_internal(
 
       float s00 = j00 * (ccov00 * j00 + ccov02 * j02) + j02 * (ccov20 * j00 + ccov22 * j02);
       float s01 = j00 * (ccov01 * j11 + ccov02 * j12) + j02 * (ccov21 * j11 + ccov22 * j12);
-      float s10 = j11 * (ccov01 * j00 + ccov02 * j02) + j12 * (ccov21 * j00 + ccov22 * j02);
-      float s11 = j11 * (ccov01 * j11 + ccov02 * j12) + j12 * (ccov21 * j11 + ccov22 * j12);
+      float s10 = j11 * (ccov10 * j00 + ccov12 * j02) + j12 * (ccov21 * j00 + ccov22 * j02);
+      float s11 = j11 * (ccov11 * j11 + ccov12 * j12) + j12 * (ccov21 * j11 + ccov22 * j12);
 
       s00 += opts.min_covariance;
       s11 += opts.min_covariance;
@@ -218,11 +220,173 @@ std::vector<RasterGaussian2D> precompute_raster_gaussians_2d(const ProjectedGaus
   return out;
 }
 
+constexpr int64_t kTileSize = 16;
+
+std::vector<std::vector<int64_t>> build_alpha_tile_bins(
+    const std::vector<ProjectedGaussian3D>& projected, int64_t tiles_x, int64_t tiles_y) {
+  const int64_t n = static_cast<int64_t>(projected.size());
+  std::vector<std::vector<int64_t>> tile_bins(static_cast<std::size_t>(tiles_x * tiles_y));
+
+  for (int64_t i = 0; i < n; ++i) {
+    const auto& pg = projected[static_cast<std::size_t>(i)];
+    if (pg.max_x < pg.min_x || pg.max_y < pg.min_y) {
+      continue;
+    }
+    const int64_t tile_min_x = std::max<int64_t>(0, pg.min_x / kTileSize);
+    const int64_t tile_max_x = std::min<int64_t>(tiles_x - 1, pg.max_x / kTileSize);
+    const int64_t tile_min_y = std::max<int64_t>(0, pg.min_y / kTileSize);
+    const int64_t tile_max_y = std::min<int64_t>(tiles_y - 1, pg.max_y / kTileSize);
+    for (int64_t ty = tile_min_y; ty <= tile_max_y; ++ty) {
+      for (int64_t tx = tile_min_x; tx <= tile_max_x; ++tx) {
+        tile_bins[static_cast<std::size_t>(ty * tiles_x + tx)].push_back(i);
+      }
+    }
+  }
+  return tile_bins;
+}
+
+void alpha_composite_tiled(const std::vector<ProjectedGaussian3D>& projected,
+                           const std::vector<std::vector<int64_t>>& tile_bins,
+                           const Gaussians3D& gaussians, Image& image,
+                           std::vector<float>& transmittance, int64_t tiles_x, int64_t tiles_y,
+                           int num_channels, int height, int width) {
+  parallel_for(0, tiles_x * tiles_y, [&](int64_t begin, int64_t end) {
+    for (int64_t tile_idx = begin; tile_idx < end; ++tile_idx) {
+      const int64_t tile_y = tile_idx / tiles_x;
+      const int64_t tile_x = tile_idx % tiles_x;
+      const int64_t start_x = tile_x * kTileSize;
+      const int64_t end_x = std::min(start_x + kTileSize, static_cast<int64_t>(width));
+      const int64_t start_y = tile_y * kTileSize;
+      const int64_t end_y = std::min(start_y + kTileSize, static_cast<int64_t>(height));
+      const auto& ids = tile_bins[static_cast<std::size_t>(tile_idx)];
+
+      for (int64_t y = start_y; y < end_y; ++y) {
+        for (int64_t x = start_x; x < end_x; ++x) {
+          const std::size_t pix = static_cast<std::size_t>(y * width + x);
+          float t = transmittance[pix];
+          for (const int64_t i : ids) {
+            const auto& pg = projected[static_cast<std::size_t>(i)];
+            if (x < pg.min_x || x > pg.max_x || y < pg.min_y || y > pg.max_y) {
+              continue;
+            }
+            const float dx = static_cast<float>(x) - pg.mean_x;
+            const float dy = static_cast<float>(y) - pg.mean_y;
+            const float quad = dx * (pg.inv_xx * dx + pg.inv_xy * dy) +
+                               dy * (pg.inv_yx * dx + pg.inv_yy * dy);
+            const float gaussian = std::exp(-0.5f * quad);
+            float alpha = gaussians.opacities[pg.source_index] * gaussian;
+            alpha = std::clamp(alpha, 0.0f, 0.999f);
+
+            const int64_t src = pg.source_index;
+            for (int c = 0; c < num_channels; ++c) {
+              image.at(static_cast<int>(y), static_cast<int>(x), c) +=
+                  t * alpha * gaussians.colors[src][c];
+            }
+            t *= (1.0f - alpha);
+          }
+          transmittance[pix] = t;
+        }
+      }
+    }
+  });
+}
+
+std::vector<std::vector<int64_t>> build_projected_alpha_tile_bins(
+    const std::vector<RasterGaussian2D>& raster, int64_t tiles_x, int64_t tiles_y) {
+  const int64_t n = static_cast<int64_t>(raster.size());
+  std::vector<std::vector<int64_t>> tile_bins(static_cast<std::size_t>(tiles_x * tiles_y));
+
+  for (int64_t g = 0; g < n; ++g) {
+    const auto& rg = raster[static_cast<std::size_t>(g)];
+    if (rg.max_x < rg.min_x || rg.max_y < rg.min_y) {
+      continue;
+    }
+    const int64_t tile_min_x = std::max<int64_t>(0, rg.min_x / kTileSize);
+    const int64_t tile_max_x = std::min<int64_t>(tiles_x - 1, rg.max_x / kTileSize);
+    const int64_t tile_min_y = std::max<int64_t>(0, rg.min_y / kTileSize);
+    const int64_t tile_max_y = std::min<int64_t>(tiles_y - 1, rg.max_y / kTileSize);
+    for (int64_t ty = tile_min_y; ty <= tile_max_y; ++ty) {
+      for (int64_t tx = tile_min_x; tx <= tile_max_x; ++tx) {
+        tile_bins[static_cast<std::size_t>(ty * tiles_x + tx)].push_back(g);
+      }
+    }
+  }
+  return tile_bins;
+}
+
+void projected_alpha_composite_tiled(const ProjectedGaussians2D& gaussians,
+                                     const std::vector<RasterGaussian2D>& raster,
+                                     const std::vector<std::vector<int64_t>>& tile_bins,
+                                     Image& image, std::vector<float>& transmittance,
+                                     int64_t tiles_x, int64_t tiles_y, int num_channels,
+                                     int height, int width) {
+  parallel_for(0, tiles_x * tiles_y, [&](int64_t begin, int64_t end) {
+    for (int64_t tile_idx = begin; tile_idx < end; ++tile_idx) {
+      const int64_t tile_y = tile_idx / tiles_x;
+      const int64_t tile_x = tile_idx % tiles_x;
+      const int64_t start_x = tile_x * kTileSize;
+      const int64_t end_x = std::min(start_x + kTileSize, static_cast<int64_t>(width));
+      const int64_t start_y = tile_y * kTileSize;
+      const int64_t end_y = std::min(start_y + kTileSize, static_cast<int64_t>(height));
+      const auto& ids = tile_bins[static_cast<std::size_t>(tile_idx)];
+
+      for (int64_t y = start_y; y < end_y; ++y) {
+        for (int64_t x = start_x; x < end_x; ++x) {
+          const std::size_t pix = static_cast<std::size_t>(y * width + x);
+          float t = transmittance[pix];
+          for (const int64_t g : ids) {
+            const auto& rg = raster[static_cast<std::size_t>(g)];
+            if (x < rg.min_x || x > rg.max_x || y < rg.min_y || y > rg.max_y) {
+              continue;
+            }
+            const float dx = static_cast<float>(x) - rg.mean_x;
+            const float dy = static_cast<float>(y) - rg.mean_y;
+            const float quad = dx * (rg.inv_xx * dx + rg.inv_xy * dy) +
+                               dy * (rg.inv_yx * dx + rg.inv_yy * dy);
+            const float gaussian = std::exp(-0.5f * quad);
+            float alpha = gaussians.opacities[g] * gaussian;
+            alpha = std::clamp(alpha, 0.0f, 0.999f);
+
+            for (int c = 0; c < num_channels; ++c) {
+              image.at(static_cast<int>(y), static_cast<int>(x), c) +=
+                  t * alpha * gaussians.colors[g][c];
+            }
+            t *= (1.0f - alpha);
+          }
+          transmittance[pix] = t;
+        }
+      }
+    }
+  });
+}
+
 }  // namespace
+
+#ifdef TINYSPLAT_CUDA
+bool cuda_device_available();
+#endif
+
+bool cuda_raster_available() {
+#ifdef TINYSPLAT_CUDA
+  return cuda_device_available();
+#else
+  return false;
+#endif
+}
 
 Image gaussian_splat_3d_forward(const Gaussians3D& gaussians, const CameraIntrinsics& intrinsics,
                                 const Mat4& camera_to_world, int height, int width,
                                 const Splat3DOptions& opts) {
+#ifdef TINYSPLAT_CUDA
+  if (opts.use_cuda && cuda_raster_available()) {
+    Image cuda_image =
+        gaussian_splat_3d_forward_cuda_impl(gaussians, intrinsics, camera_to_world, height, width,
+                                            opts);
+    if (cuda_image.width() > 0) {
+      return cuda_image;
+    }
+  }
+#endif
   const int num_channels =
       gaussians.colors.empty() ? 3 : static_cast<int>(gaussians.colors[0].size());
   Image image(height, width, num_channels);
@@ -230,34 +394,11 @@ Image gaussian_splat_3d_forward(const Gaussians3D& gaussians, const CameraIntrin
 
   const auto projected =
       project_gaussians_3d_internal(gaussians, intrinsics, camera_to_world, height, width, opts);
-
-  for (const auto& pg : projected) {
-    const int64_t x0 = std::max<int64_t>(0, pg.min_x);
-    const int64_t x1 = std::min<int64_t>(width - 1, pg.max_x);
-    const int64_t y0 = std::max<int64_t>(0, pg.min_y);
-    const int64_t y1 = std::min<int64_t>(height - 1, pg.max_y);
-    const int64_t src = pg.source_index;
-
-    for (int64_t y = y0; y <= y1; ++y) {
-      for (int64_t x = x0; x <= x1; ++x) {
-        const float dx = static_cast<float>(x) - pg.mean_x;
-        const float dy = static_cast<float>(y) - pg.mean_y;
-        const float quad = dx * (pg.inv_xx * dx + pg.inv_xy * dy) +
-                           dy * (pg.inv_yx * dx + pg.inv_yy * dy);
-        const float gaussian = std::exp(-0.5f * quad);
-        float alpha = gaussians.opacities[src] * gaussian;
-        alpha = std::clamp(alpha, 0.0f, 0.999f);
-
-        const std::size_t idx = static_cast<std::size_t>(y * width + x);
-        const float t = transmittance[idx];
-        for (int c = 0; c < num_channels; ++c) {
-          image.at(static_cast<int>(y), static_cast<int>(x), c) +=
-              t * alpha * gaussians.colors[src][c];
-        }
-        transmittance[idx] = t * (1.0f - alpha);
-      }
-    }
-  }
+  const int64_t tiles_x = (width + kTileSize - 1) / kTileSize;
+  const int64_t tiles_y = (height + kTileSize - 1) / kTileSize;
+  const auto tile_bins = build_alpha_tile_bins(projected, tiles_x, tiles_y);
+  alpha_composite_tiled(projected, tile_bins, gaussians, image, transmittance, tiles_x, tiles_y,
+                        num_channels, height, width);
 
   return image;
 }
@@ -270,38 +411,11 @@ Image gaussian_splat_3d_projected_forward(const ProjectedGaussians2D& gaussians,
   std::vector<float> transmittance(static_cast<std::size_t>(height * width), 1.0f);
 
   const auto raster = precompute_raster_gaussians_2d(gaussians, height, width, opts);
-  const int64_t n = static_cast<int64_t>(raster.size());
-
-  for (int64_t g = 0; g < n; ++g) {
-    const auto& rg = raster[static_cast<std::size_t>(g)];
-    if (rg.max_x < rg.min_x || rg.max_y < rg.min_y) {
-      continue;
-    }
-    const int64_t x0 = std::max<int64_t>(0, rg.min_x);
-    const int64_t x1 = std::min<int64_t>(width - 1, rg.max_x);
-    const int64_t y0 = std::max<int64_t>(0, rg.min_y);
-    const int64_t y1 = std::min<int64_t>(height - 1, rg.max_y);
-
-    for (int64_t y = y0; y <= y1; ++y) {
-      for (int64_t x = x0; x <= x1; ++x) {
-        const float dx = static_cast<float>(x) - rg.mean_x;
-        const float dy = static_cast<float>(y) - rg.mean_y;
-        const float quad = dx * (rg.inv_xx * dx + rg.inv_xy * dy) +
-                           dy * (rg.inv_yx * dx + rg.inv_yy * dy);
-        const float gaussian = std::exp(-0.5f * quad);
-        float alpha = gaussians.opacities[g] * gaussian;
-        alpha = std::clamp(alpha, 0.0f, 0.999f);
-
-        const std::size_t idx = static_cast<std::size_t>(y * width + x);
-        const float t = transmittance[idx];
-        for (int c = 0; c < num_channels; ++c) {
-          image.at(static_cast<int>(y), static_cast<int>(x), c) +=
-              t * alpha * gaussians.colors[g][c];
-        }
-        transmittance[idx] = t * (1.0f - alpha);
-      }
-    }
-  }
+  const int64_t tiles_x = (width + kTileSize - 1) / kTileSize;
+  const int64_t tiles_y = (height + kTileSize - 1) / kTileSize;
+  const auto tile_bins = build_projected_alpha_tile_bins(raster, tiles_x, tiles_y);
+  projected_alpha_composite_tiled(gaussians, raster, tile_bins, image, transmittance, tiles_x,
+                                  tiles_y, num_channels, height, width);
 
   return image;
 }
@@ -337,6 +451,30 @@ ProjectedGaussians2D project_gaussians_3d_to_2d(const Gaussians3D& gaussians,
     out.opacities.push_back(gaussians.opacities[pg.source_index]);
   }
 
+  return out;
+}
+
+GradientsProjected2D gaussian_splat_3d_projected_backward(const Image& grad_output,
+                                                        const ProjectedGaussians2D& gaussians,
+                                                        int height, int width,
+                                                        const Splat3DOptions& opts) {
+#ifdef TINYSPLAT_CUDA
+  if (opts.use_cuda && cuda_raster_available()) {
+    return gaussian_splat_3d_projected_backward_cuda_impl(grad_output, gaussians, height, width);
+  }
+#endif
+  (void)opts;
+  Gaussians2D g2;
+  g2.means = gaussians.means;
+  g2.covariances = gaussians.covariances;
+  g2.colors = gaussians.colors;
+  g2.opacities = gaussians.opacities;
+  const Gradients2D g2_grads = gaussian_splat_2d_backward(grad_output, g2, height, width);
+  GradientsProjected2D out;
+  out.grad_means = g2_grads.grad_means;
+  out.grad_covariances = g2_grads.grad_covariances;
+  out.grad_colors = g2_grads.grad_colors;
+  out.grad_opacities = g2_grads.grad_opacities;
   return out;
 }
 

@@ -1,5 +1,12 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
+package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "cuda_build",
+    define_values = {"cuda": "1"},
+)
+
 cc_library(
     name = "tinysplat",
     srcs = [
@@ -7,22 +14,33 @@ cc_library(
         "gaussian_3d.cc",
         "image.cc",
         "parallel.cc",
-    ],
+    ] + select({
+        ":cuda_build": ["gaussian_3d_cuda_bridge.cc"],
+        "//conditions:default": [],
+    }),
     hdrs = [
         "include/tinysplat/gaussian_2d.h",
         "include/tinysplat/gaussian_3d.h",
         "include/tinysplat/image.h",
         "include/tinysplat/parallel.h",
         "include/tinysplat/types.h",
+        "gaussian_3d_cuda_bridge.h",
     ],
     includes = ["include"],
     copts = select({
-        "@bazel_tools//src/conditions:host_windows": [],
+        ":cuda_build": ["-DTINYSPLAT_CUDA", "-fopenmp"],
         "//conditions:default": ["-fopenmp"],
     }),
     linkopts = select({
-        "@bazel_tools//src/conditions:host_windows": [],
+        ":cuda_build": ["-fopenmp", "-lcudart"],
         "//conditions:default": ["-fopenmp"],
     }),
-    visibility = ["//visibility:public"],
+    deps = select({
+        ":cuda_build": [
+            "//cuda:tinysplat_cuda",
+            "//cuda:gaussian_2d_cuda_headers",
+            "//cuda:gaussian_3d_cuda_headers",
+        ],
+        "//conditions:default": [],
+    }),
 )
