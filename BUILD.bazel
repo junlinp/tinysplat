@@ -1,0 +1,11 @@
+alias(
+    name = "tinysplat",
+    actual = "//src/tinysplat",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "render_2d",
+    actual = "//examples:render_2d",
+    visibility = ["//visibility:public"],
+)

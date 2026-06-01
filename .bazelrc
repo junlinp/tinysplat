@@ -1,0 +1,13 @@
+common --cxxopt=-std=c++17
+common --host_cxxopt=-std=c++17
+
+build --compilation_mode=opt
+build -c opt
+
+build:cuda --define=with_cuda=true
+build:cuda --@rules_cuda//cuda:enable=True
+
+build:dbg --compilation_mode=dbg
+build:dbg -c dbg
+
+test --test_output=errors

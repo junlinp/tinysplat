@@ -1,0 +1,28 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "tinysplat",
+    srcs = [
+        "gaussian_2d.cc",
+        "gaussian_3d.cc",
+        "image.cc",
+        "parallel.cc",
+    ],
+    hdrs = [
+        "include/tinysplat/gaussian_2d.h",
+        "include/tinysplat/gaussian_3d.h",
+        "include/tinysplat/image.h",
+        "include/tinysplat/parallel.h",
+        "include/tinysplat/types.h",
+    ],
+    includes = ["include"],
+    copts = select({
+        "@bazel_tools//src/conditions:host_windows": [],
+        "//conditions:default": ["-fopenmp"],
+    }),
+    linkopts = select({
+        "@bazel_tools//src/conditions:host_windows": [],
+        "//conditions:default": ["-fopenmp"],
+    }),
+    visibility = ["//visibility:public"],
+)
