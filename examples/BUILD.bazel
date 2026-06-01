@@ -7,6 +7,19 @@ cc_binary(
 )
 
 cc_binary(
+    name = "bench_3d",
+    srcs = ["bench_3d.cc"],
+    deps = ["//src/tinysplat"],
+)
+
+cc_binary(
+    name = "bench_3d_cuda",
+    srcs = ["bench_3d.cc"],
+    deps = ["//src/tinysplat"],
+    tags = ["cuda"],
+)
+
+cc_binary(
     name = "render_2d_cuda",
     srcs = ["render_2d.cc"],
     local_defines = ["TINYSPLAT_CUDA"],

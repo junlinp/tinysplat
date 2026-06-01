@@ -6,7 +6,7 @@ A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and bu
 
 - **2D Gaussian splatting** — tiled CPU forward and backward (weight-normalized compositing)
 - **3D Gaussian splatting** — world-space projection + front-to-back alpha compositing
-- **CUDA 2D forward** — optional GPU path via `nvcc` (`//examples:render_2d_cuda`)
+- **CUDA 2D/3D** — tiled GPU rasterizer (`--define=cuda=1`): weight-normalized 2D, alpha 3DGS-style 3D
 - **OpenMP** — parallel CPU kernels when `-fopenmp` is available
 - **No PyTorch** — standalone C++ library suitable for embedding in games, vision pipelines, or custom trainers
 
@@ -26,8 +26,32 @@ bazel test //tests:gaussian_2d_test
 bazel run //examples:render_2d
 
 # GPU render (when CUDA is installed)
-bazel build //examples:render_2d_cuda
-bazel run //examples:render_2d_cuda -- --cuda
+bazel build --define=cuda=1 //examples:render_2d_cuda
+bazel run --define=cuda=1 //examples:render_2d_cuda -- --cuda
+
+# 3D benchmark (CPU vs CUDA)
+bazel run --define=cuda=1 //examples:bench_3d_cuda -- --n 100000 --h 1080 --w 1920
+```
+
+### Compositing modes
+
+| API | Compositing |
+|-----|-------------|
+| `gaussian_splat_2d_*` | Weight-normalized: `Σ wᵢ cᵢ / Σ wᵢ` |
+| `gaussian_splat_3d_*` | Front-to-back alpha + transmittance (3DGS-style) |
+
+CUDA 2D supports `CompositingMode::Weighted` (default) and `Alpha` (used internally for projected 3D splats).
+
+### CUDA build flag
+
+Enable GPU code paths with Bazel:
+
+```bash
+bazel build --define=cuda=1 //src/tinysplat:tinysplat
+bazel test --define=cuda=1 //tests:...
+```
+
+Requires `nvcc` and a visible CUDA device for GPU tests and benchmarks.
 ```
 
 ## API overview
@@ -75,9 +99,18 @@ tinysplat/
 |--------|-------------|
 | `//src/tinysplat` | Core library |
 | `//tests:gaussian_2d_test` | CPU tests |
+| `//tests:gaussian_2d_cuda_test` | CPU vs CUDA diff (`--define=cuda=1`) |
 | `//examples:render_2d` | CPU demo → `render_2d.ppm` |
-| `//examples:render_2d_cuda` | CUDA demo (`--cuda`) |
-| `//cuda:gaussian_2d_cuda` | Static CUDA library |
+| `//examples:render_2d_cuda` | CUDA demo (`--cuda`, `--define=cuda=1`) |
+| `//examples:bench_3d` | 3D forward timing (CPU) |
+| `//examples:bench_3d_cuda` | 3D forward timing (CPU + CUDA, `--define=cuda=1`) |
+| `//cuda:tinysplat_cuda` | Static CUDA library |
+
+### Known limits (C++ core)
+
+- No spherical harmonics, densification, or COLMAP loader in C++
+- 3D CUDA backward is in **projected 2D space** only (full 3D Jacobian chain not implemented)
+- Python training remains in `train_3d_gaussians_json.py` (gsplat backend)
 
 ## Legacy Python version
 

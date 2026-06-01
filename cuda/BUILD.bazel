@@ -3,32 +3,70 @@ load("@rules_cc//cc:defs.bzl", "cc_import", "cc_library")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "tinysplat_cuda_headers",
+    hdrs = [
+        "include/tinysplat/cuda_common.cuh",
+        "include/tinysplat/cuda_gaussian2d.cuh",
+        "include/tinysplat/gaussian_2d_cuda.h",
+        "include/tinysplat/gaussian_3d_cuda.h",
+    ],
+    includes = ["include"],
+)
+
+cc_library(
     name = "gaussian_2d_cuda_headers",
     hdrs = ["include/tinysplat/gaussian_2d_cuda.h"],
     includes = ["include"],
 )
 
-# CUDA kernels built with nvcc (no rules_cuda — compatible with Bazel 9).
+cc_library(
+    name = "gaussian_3d_cuda_headers",
+    hdrs = ["include/tinysplat/gaussian_3d_cuda.h"],
+    includes = ["include"],
+    deps = [":gaussian_2d_cuda_headers"],
+)
+
+# CUDA kernels built with nvcc (compatible with Bazel 9).
 genrule(
-    name = "libgaussian_2d_cuda",
+    name = "libtinysplat_cuda",
     srcs = [
+        "cuda_gaussian2d_kernels.cu",
         "gaussian_2d_cuda.cu",
+        "gaussian_3d_cuda.cu",
+        "include/tinysplat/cuda_common.cuh",
+        "include/tinysplat/cuda_gaussian2d.cuh",
         "include/tinysplat/gaussian_2d_cuda.h",
+        "include/tinysplat/gaussian_3d_cuda.h",
     ],
-    outs = ["libgaussian_2d_cuda.a"],
+    outs = ["libtinysplat_cuda.a"],
     cmd = """
         set -e
+        NVCC=$${NVCC:-/usr/local/cuda/bin/nvcc}
+        if [ ! -x "$$NVCC" ]; then NVCC=$$(command -v nvcc); fi
+        INC=$$(dirname $(location gaussian_2d_cuda.cu))/include
         TMP=$$(mktemp -d)
-        nvcc -std=c++17 -O3 -Xcompiler -fPIC -Xcompiler -std=c++17 \
-          -I$$(dirname $(location gaussian_2d_cuda.cu))/include \
-          -c $(location gaussian_2d_cuda.cu) -o $$TMP/gaussian_2d_cuda.o
-        ar rcs $@ $$TMP/gaussian_2d_cuda.o
+        NVCC_ARCH="-gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_86,code=sm_86"
+        $$NVCC -std=c++17 -O3 $$NVCC_ARCH -Xcompiler -fPIC -Xcompiler -std=c++17 \
+          -I$$INC \
+          -c $(location cuda_gaussian2d_kernels.cu) -o $$TMP/kernels.o
+        $$NVCC -std=c++17 -O3 $$NVCC_ARCH -Xcompiler -fPIC -Xcompiler -std=c++17 \
+          -I$$INC \
+          -c $(location gaussian_2d_cuda.cu) -o $$TMP/2d.o
+        $$NVCC -std=c++17 -O3 $$NVCC_ARCH -Xcompiler -fPIC -Xcompiler -std=c++17 \
+          -I$$INC \
+          -c $(location gaussian_3d_cuda.cu) -o $$TMP/3d.o
+        ar rcs $@ $$TMP/kernels.o $$TMP/2d.o $$TMP/3d.o
         rm -rf $$TMP
     """,
     tags = ["cuda"],
 )
 
 cc_import(
+    name = "tinysplat_cuda",
+    static_library = ":libtinysplat_cuda",
+)
+
+alias(
     name = "gaussian_2d_cuda",
-    static_library = ":libgaussian_2d_cuda",
+    actual = ":tinysplat_cuda",
 )
