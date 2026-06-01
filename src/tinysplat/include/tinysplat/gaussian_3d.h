@@ -9,6 +9,15 @@ struct Splat3DOptions {
   float near_plane = 1e-4f;
   float min_covariance = 1e-4f;
   float sigma_radius = 4.0f;
+  /// When true and CUDA is available, use the GPU rasterizer.
+  bool use_cuda = false;
+};
+
+struct GradientsProjected2D {
+  std::vector<Vec2> grad_means;
+  std::vector<Mat2> grad_covariances;
+  std::vector<std::vector<float>> grad_colors;
+  std::vector<float> grad_opacities;
 };
 
 /// Project 3D Gaussians and alpha-composite front-to-back (3DGS-style).
@@ -25,5 +34,12 @@ ProjectedGaussians2D project_gaussians_3d_to_2d(const Gaussians3D& gaussians,
                                                 const CameraIntrinsics& intrinsics,
                                                 const Mat4& camera_to_world, int height,
                                                 int width, const Splat3DOptions& opts = {});
+
+GradientsProjected2D gaussian_splat_3d_projected_backward(
+    const Image& grad_output, const ProjectedGaussians2D& gaussians, int height, int width,
+    const Splat3DOptions& opts = {});
+
+/// Returns true if a CUDA device is available for tinysplat CUDA kernels.
+bool cuda_raster_available();
 
 }  // namespace tinysplat
