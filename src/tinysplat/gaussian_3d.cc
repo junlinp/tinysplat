@@ -1,6 +1,8 @@
 #include "tinysplat/gaussian_3d.h"
 #include "tinysplat/gaussian_2d.h"
+#include "tinysplat/sh.h"
 #include "gaussian_3d_cuda_bridge.h"
+#include "gaussian_3d_metal_bridge.h"
 
 #include <algorithm>
 #include <cmath>
@@ -138,7 +140,10 @@ std::vector<ProjectedGaussian3D> project_gaussians_3d_internal(
       const float trace = s00 + s11;
       const float disc = std::sqrt(std::max(0.0f, (s00 - s11) * (s00 - s11) + 4.0f * s01 * s10));
       const float lambda_max = std::max((trace + disc) * 0.5f, opts.min_covariance);
-      const float radius = opts.sigma_radius * std::sqrt(lambda_max);
+      float radius = opts.sigma_radius * std::sqrt(lambda_max);
+      if (opts.use_compact_box) {
+        radius = std::min(opts.sigma_radius, opts.compact_box_beta) * std::sqrt(lambda_max);
+      }
 
       const int64_t min_x = static_cast<int64_t>(std::floor(proj_x - radius));
       const int64_t max_x = static_cast<int64_t>(std::ceil(proj_x + radius));
@@ -189,7 +194,10 @@ std::vector<RasterGaussian2D> precompute_raster_gaussians_2d(const ProjectedGaus
       const float disc =
           std::sqrt(std::max(0.0f, (s00 - s11) * (s00 - s11) + 4.0f * s01 * s10));
       const float lambda_max = std::max((trace + disc) * 0.5f, opts.min_covariance);
-      const float radius = opts.sigma_radius * std::sqrt(lambda_max);
+      float radius = opts.sigma_radius * std::sqrt(lambda_max);
+      if (opts.use_compact_box) {
+        radius = std::min(opts.sigma_radius, opts.compact_box_beta) * std::sqrt(lambda_max);
+      }
 
       int64_t min_x = static_cast<int64_t>(std::floor(gaussians.means[g].x - radius));
       int64_t max_x = static_cast<int64_t>(std::ceil(gaussians.means[g].x + radius));
@@ -365,6 +373,9 @@ void projected_alpha_composite_tiled(const ProjectedGaussians2D& gaussians,
 #ifdef TINYSPLAT_CUDA
 bool cuda_device_available();
 #endif
+#ifdef TINYSPLAT_METAL
+bool metal_device_available();
+#endif
 
 bool cuda_raster_available() {
 #ifdef TINYSPLAT_CUDA
@@ -374,13 +385,34 @@ bool cuda_raster_available() {
 #endif
 }
 
+bool metal_raster_available() {
+#ifdef TINYSPLAT_METAL
+  return metal_device_available();
+#else
+  return false;
+#endif
+}
+
 Image gaussian_splat_3d_forward(const Gaussians3D& gaussians, const CameraIntrinsics& intrinsics,
                                 const Mat4& camera_to_world, int height, int width,
                                 const Splat3DOptions& opts) {
+  Gaussians3D g_eval = gaussians;
+  if (!g_eval.sh_coeffs.empty()) {
+    fill_colors_from_sh(g_eval, camera_to_world);
+  }
+#ifdef TINYSPLAT_METAL
+  if (opts.use_metal && metal_raster_available()) {
+    Image metal_image = gaussian_splat_3d_forward_metal_impl(g_eval, intrinsics, camera_to_world,
+                                                             height, width, opts);
+    if (metal_image.width() > 0) {
+      return metal_image;
+    }
+  }
+#endif
 #ifdef TINYSPLAT_CUDA
   if (opts.use_cuda && cuda_raster_available()) {
     Image cuda_image =
-        gaussian_splat_3d_forward_cuda_impl(gaussians, intrinsics, camera_to_world, height, width,
+        gaussian_splat_3d_forward_cuda_impl(g_eval, intrinsics, camera_to_world, height, width,
                                             opts);
     if (cuda_image.width() > 0) {
       return cuda_image;
@@ -388,16 +420,16 @@ Image gaussian_splat_3d_forward(const Gaussians3D& gaussians, const CameraIntrin
   }
 #endif
   const int num_channels =
-      gaussians.colors.empty() ? 3 : static_cast<int>(gaussians.colors[0].size());
+      g_eval.colors.empty() ? 3 : static_cast<int>(g_eval.colors[0].size());
   Image image(height, width, num_channels);
   std::vector<float> transmittance(static_cast<std::size_t>(height * width), 1.0f);
 
   const auto projected =
-      project_gaussians_3d_internal(gaussians, intrinsics, camera_to_world, height, width, opts);
+      project_gaussians_3d_internal(g_eval, intrinsics, camera_to_world, height, width, opts);
   const int64_t tiles_x = (width + kTileSize - 1) / kTileSize;
   const int64_t tiles_y = (height + kTileSize - 1) / kTileSize;
   const auto tile_bins = build_alpha_tile_bins(projected, tiles_x, tiles_y);
-  alpha_composite_tiled(projected, tile_bins, gaussians, image, transmittance, tiles_x, tiles_y,
+  alpha_composite_tiled(projected, tile_bins, g_eval, image, transmittance, tiles_x, tiles_y,
                         num_channels, height, width);
 
   return image;

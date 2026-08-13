@@ -755,9 +755,8 @@ class GaussianData:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        return gaussian_splat_3d(
+        kwargs = dict(
             means=self.means,
-            covariances=self.covariance_matrices(),
             colors=self.visible_colors(),
             opacities=self.visible_opacities(),
             intrinsics=intrinsics,
@@ -766,6 +765,20 @@ class GaussianData:
             width=width,
             device=self._device.type,
         )
+        use_metal_qs = False
+        if self._device.type == "mps":
+            try:
+                from tinysplat.metal_backend import metal_available as _metal_ok
+
+                use_metal_qs = bool(_metal_ok())
+            except ImportError:
+                use_metal_qs = False
+        if use_metal_qs:
+            kwargs["log_scales"] = self.log_scales
+            kwargs["rotations"] = self.rotations
+        else:
+            kwargs["covariances"] = self.covariance_matrices()
+        return gaussian_splat_3d(**kwargs)
 
     def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
         return {

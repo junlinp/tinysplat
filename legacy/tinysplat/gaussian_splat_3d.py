@@ -23,36 +23,45 @@ def _auto_device() -> str:
 
 def gaussian_splat_3d(
     means: torch.Tensor,
-    covariances: torch.Tensor,
-    colors: torch.Tensor,
-    opacities: torch.Tensor,
-    intrinsics: torch.Tensor,
-    camera_to_world: torch.Tensor,
-    height: int,
-    width: int,
+    covariances: Optional[torch.Tensor] = None,
+    colors: torch.Tensor = None,
+    opacities: torch.Tensor = None,
+    intrinsics: torch.Tensor = None,
+    camera_to_world: torch.Tensor = None,
+    height: int = 0,
+    width: int = 0,
     device: Optional[str] = None,
     near_plane: float = 1e-4,
     min_covariance: float = 1e-4,
     sigma_radius: float = 3.0,
+    log_scales: Optional[torch.Tensor] = None,
+    rotations: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Render 3D Gaussians using camera intrinsics and a camera-to-world pose.
+
+    On Metal, pass log_scales (N,3) and raw wxyz rotations (N,4) to fuse
+    world covariance into the rasterizer (skips building (N,3,3) on MPS).
     """
     if device is None:
         device = _auto_device()
     device_obj = torch.device(device)
 
     means = means.to(device_obj)
-    covariances = covariances.to(device_obj)
     colors = colors.to(device_obj)
     opacities = opacities.to(device_obj)
     intrinsics = intrinsics.to(device_obj)
     camera_to_world = camera_to_world.to(device_obj)
+    if covariances is not None:
+        covariances = covariances.to(device_obj)
+    if log_scales is not None:
+        log_scales = log_scales.to(device_obj)
+    if rotations is not None:
+        rotations = rotations.to(device_obj)
 
     backend = get_backend_3d(device_obj.type)
-    return backend.render(
+    render_kwargs = dict(
         means=means,
-        covariances=covariances,
         colors=colors,
         opacities=opacities,
         intrinsics=intrinsics,
@@ -63,6 +72,16 @@ def gaussian_splat_3d(
         min_covariance=min_covariance,
         sigma_radius=sigma_radius,
     )
+    if getattr(backend, "name", "") == "metal" and log_scales is not None and rotations is not None:
+        render_kwargs["log_scales"] = log_scales
+        render_kwargs["rotations"] = rotations
+        if covariances is not None:
+            render_kwargs["covariances"] = covariances
+    else:
+        if covariances is None:
+            raise ValueError("gaussian_splat_3d requires covariances unless Metal log_scales+rotations are provided")
+        render_kwargs["covariances"] = covariances
+    return backend.render(**render_kwargs)
 
 
 class GaussianSplat3D(nn.Module):
