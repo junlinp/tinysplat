@@ -21,7 +21,13 @@ from tqdm.auto import tqdm
 
 from tinysplat import gaussian_splat_3d
 from tinysplat.gaussian_splat_3d_core import project_gaussians_3d_to_2d
-from tinysplat.backends_3d.cuda import get_last_render_info
+
+try:
+    from tinysplat.backends_3d.cuda import get_last_render_info
+except ImportError:
+
+    def get_last_render_info():
+        return None
 
 try:
     from gsplat.strategy.default import DefaultStrategy
@@ -36,6 +42,14 @@ try:
     _HAS_SSIM = True
 except ImportError:
     _HAS_SSIM = False
+
+try:
+    import lpips as _lpips_pkg
+
+    _HAS_LPIPS = True
+except ImportError:
+    _lpips_pkg = None
+    _HAS_LPIPS = False
 
 
 @dataclass
@@ -364,6 +378,18 @@ def parse_args():
         action="store_true",
         help="Preload and cache original-resolution training images in memory for faster CPU training.",
     )
+    parser.add_argument(
+        "--eval-hold",
+        type=int,
+        default=0,
+        help="Hold every N-th frame (by sorted index) for evaluation. "
+        "3DGS / LLFF protocol uses 8. Use 0 to disable (train on all frames).",
+    )
+    parser.add_argument(
+        "--no-viser",
+        action="store_true",
+        help="Disable the viser UI (recommended for headless benchmarks).",
+    )
     return parser.parse_args()
 
 
@@ -678,6 +704,126 @@ def prepare_dataset_frames(
     return prepared
 
 
+def split_train_eval(
+    frames: List[FrameSample],
+    eval_hold: int,
+) -> Tuple[List[FrameSample], List[FrameSample]]:
+    """LLFF / 3DGS split: every eval_hold-th frame (0-based) is held out."""
+    if eval_hold <= 0:
+        return list(frames), []
+    train_frames: List[FrameSample] = []
+    eval_frames: List[FrameSample] = []
+    for idx, frame in enumerate(frames):
+        if idx % eval_hold == 0:
+            eval_frames.append(frame)
+        else:
+            train_frames.append(frame)
+    if not train_frames:
+        raise ValueError(
+            f"eval_hold={eval_hold} left zero training frames "
+            f"(dataset has {len(frames)} frames)."
+        )
+    return train_frames, eval_frames
+
+
+def _psnr(mse: torch.Tensor) -> torch.Tensor:
+    return -10.0 * torch.log10(mse.clamp_min(1e-10))
+
+
+@torch.no_grad()
+def evaluate_heldout(
+    gauss_data: "GaussianData",
+    frames: List[FrameSample],
+    device: str,
+    max_resolution: int = 0,
+) -> Dict[str, float]:
+    """Mean PSNR / SSIM / LPIPS over held-out views."""
+    if not frames:
+        return {"psnr": float("nan"), "ssim": float("nan"), "lpips": float("nan"), "num_views": 0}
+
+    if not _HAS_SSIM:
+        raise RuntimeError("pytorch_msssim is required for eval: pip install pytorch-msssim")
+
+    lpips_fn = None
+    if _HAS_LPIPS:
+        # Official 3DGS metrics use AlexNet LPIPS.
+        lpips_fn = _lpips_pkg.LPIPS(net="alex").to(device)
+        lpips_fn.eval()
+    else:
+        print("Warning: lpips not installed; LPIPS will be reported as NaN. pip install lpips")
+
+    psnrs: List[float] = []
+    ssims: List[float] = []
+    lpipses: List[float] = []
+
+    for frame in tqdm(frames, desc="Eval", unit="view", leave=False):
+        target, intrinsics, height, width = load_frame_image(
+            frame, device=device, max_resolution=max_resolution
+        )
+        rendered = gauss_data.render(
+            intrinsics=intrinsics,
+            camera_to_world=frame.camera_to_world,
+            height=height,
+            width=width,
+        )
+        mse = F.mse_loss(rendered, target)
+        psnrs.append(float(_psnr(mse).item()))
+        ssims.append(
+            float(
+                _compute_ssim(
+                    rendered.permute(2, 0, 1).unsqueeze(0),
+                    target.permute(2, 0, 1).unsqueeze(0),
+                    data_range=1.0,
+                    size_average=True,
+                ).item()
+            )
+        )
+        if lpips_fn is not None:
+            # LPIPS expects NCHW in [-1, 1]
+            pred_n = rendered.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
+            tgt_n = target.permute(2, 0, 1).unsqueeze(0) * 2.0 - 1.0
+            lpipses.append(float(lpips_fn(pred_n, tgt_n).mean().item()))
+
+    return {
+        "psnr": sum(psnrs) / len(psnrs),
+        "ssim": sum(ssims) / len(ssims),
+        "lpips": (sum(lpipses) / len(lpipses)) if lpipses else float("nan"),
+        "num_views": float(len(frames)),
+    }
+
+
+class _NullVisualizer:
+    """No-op stand-in when --no-viser is set."""
+
+    selected_frame_idx = 0
+    paused = False
+    render_requested = False
+
+    def update_status(self, text: str):
+        pass
+
+    def update_step(self, step: int, loss: float, psnr: float, frame_id: int):
+        pass
+
+    def update_gaussian_stats(self, n: int):
+        pass
+
+    def set_cameras(self, frames):
+        pass
+
+    def update_gaussians(self, *args, **kwargs):
+        pass
+
+    def update_frame_preview(self, *args, **kwargs):
+        pass
+
+    def wait_if_paused(self):
+        pass
+
+    def should_render_selected_frame(self, step: int, update_every: int) -> bool:
+        return False
+
+
 class GaussianData:
     """Central manager for 3D Gaussian Splatting parameters.
 
@@ -758,7 +904,7 @@ class GaussianData:
         height: int,
         width: int,
     ) -> torch.Tensor:
-        return gaussian_splat_3d(
+        kwargs = dict(
             means=self.means,
             covariances=self.covariance_matrices(),
             colors=self.visible_colors(),
@@ -768,9 +914,19 @@ class GaussianData:
             height=height,
             width=width,
             device=self._device.type,
-            scales=torch.exp(self.log_scales),
-            quats=F.normalize(self.rotations, dim=-1),
         )
+        # Optional gsplat-style args (ignored by legacy backends).
+        try:
+            import inspect
+
+            params = inspect.signature(gaussian_splat_3d).parameters
+            if "scales" in params:
+                kwargs["scales"] = torch.exp(self.log_scales)
+            if "quats" in params:
+                kwargs["quats"] = F.normalize(self.rotations, dim=-1)
+        except (TypeError, ValueError):
+            pass
+        return gaussian_splat_3d(**kwargs)
 
     def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
         return {
@@ -1139,11 +1295,13 @@ def main():
     if device == "mps" and effective_viser_update_every == 10:
         effective_viser_update_every = 100
 
-    scene_dir, frames, points3d = load_dataset_frames(args.dataset_json.resolve(), device)
-    if not frames:
+    scene_dir, all_frames, points3d = load_dataset_frames(args.dataset_json.resolve(), device)
+    if not all_frames:
         raise ValueError("Dataset does not contain any frames.")
     if args.limit_frames > 0:
-        frames = frames[: args.limit_frames]
+        all_frames = all_frames[: args.limit_frames]
+
+    frames, eval_frames = split_train_eval(all_frames, args.eval_hold)
 
     output_dir = args.output_dir
     if output_dir is None:
@@ -1152,8 +1310,11 @@ def main():
         )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    visualizer = ViserVisualizer(port=args.viser_port)
-    visualizer.update_status("**Status:** server started, initializing gaussians")
+    if args.no_viser:
+        visualizer = _NullVisualizer()
+    else:
+        visualizer = ViserVisualizer(port=args.viser_port)
+        visualizer.update_status("**Status:** server started, initializing gaussians")
 
     prepared_frames: Optional[List[PreparedFrame]] = None
     if args.cache_images:
@@ -1224,6 +1385,10 @@ def main():
         strategy.check_sanity(strategy_params, optimizers)
         strategy_state = strategy.initialize_state(scene_scale=1.0)
 
+    # Fallback densify stats when gsplat.DefaultStrategy is unavailable.
+    grad_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
+    vis_count = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
+
     visualizer.set_cameras(frames)
     with torch.no_grad():
         initial_render = gauss_data.render(
@@ -1249,7 +1414,8 @@ def main():
     print(f"Using device: {device}")
     print(f"Dataset: {args.dataset_json.resolve()}")
     print(f"Scene dir: {scene_dir}")
-    print(f"Frames: {len(frames)}")
+    print(f"Train frames: {len(frames)}")
+    print(f"Eval frames: {len(eval_frames)} (eval_hold={args.eval_hold})")
     print(f"Resolution: {first_width}x{first_height}")
     print(f"Initial gaussians: {gauss_data.num_gaussians}")
     if init_voxel_size is None:
@@ -1258,7 +1424,10 @@ def main():
         print(f"Initial bbox voxel size (m): {init_voxel_size}")
     print(f"Max resolution: {args.max_resolution or 'original'}")
     print(f"Output directory: {output_dir}")
-    print(f"Viser: http://localhost:{args.viser_port}")
+    if not args.no_viser:
+        print(f"Viser: http://localhost:{args.viser_port}")
+    else:
+        print("Viser: disabled")
     print(f"Torch threads: {torch.get_num_threads()}")
     print(f"Cache images: {args.cache_images}")
     print(f"Viser update every: {effective_viser_update_every}")
@@ -1327,10 +1496,52 @@ def main():
         if strategy is not None and isinstance(info, dict):
             strategy.step_post_backward(strategy_params, optimizers, strategy_state, step + 1, info, packed=False)
             gauss_data.sync_from_strategy_params(strategy_params)
+        elif strategy is None and args.densify_every > 0:
+            if gauss_data.means.grad is not None:
+                n = gauss_data.num_gaussians
+                if grad_accum.numel() != n:
+                    grad_accum = torch.zeros(n, device=gauss_data.device)
+                    vis_count = torch.zeros(n, device=gauss_data.device)
+                grad_accum += gauss_data.means.grad.detach().norm(dim=-1)
+                vis_count += 1.0
 
         step_optimizers(optimizers)
 
-        if gauss_data.num_gaussians > args.max_gaussians:
+        if strategy is None and args.densify_every > 0:
+            step_idx = step + 1
+            if (
+                step_idx >= args.densify_from
+                and (args.densify_until <= 0 or step_idx <= args.densify_until)
+                and step_idx % args.densify_every == 0
+            ):
+                changed = densify_and_prune(
+                    gauss_data,
+                    grad_accum=grad_accum,
+                    vis_count=vis_count,
+                    grad_thresh=args.densify_grad_thresh,
+                    prune_opacity_thresh=args.prune_opacity_thresh,
+                    max_gaussians=args.max_gaussians,
+                    split_scale_shrink=args.split_scale_shrink,
+                    cull_screen_size=args.cull_screen_size,
+                    split_screen_size=args.split_screen_size,
+                    intrinsics=intrinsics,
+                    camera_to_world=frame.camera_to_world,
+                    height=height,
+                    width=width,
+                )
+                if changed:
+                    optimizers = build_optimizers(gauss_data, args.lr)
+                n = gauss_data.num_gaussians
+                grad_accum = torch.zeros(n, device=gauss_data.device)
+                vis_count = torch.zeros(n, device=gauss_data.device)
+            if (
+                args.reset_opacity_every > 0
+                and step_idx >= args.densify_from
+                and step_idx % args.reset_opacity_every == 0
+            ):
+                reset_opacities(gauss_data, value=0.01)
+
+        if strategy is not None and gauss_data.num_gaussians > args.max_gaussians:
             keep = args.max_gaussians
             idx = torch.randperm(gauss_data.num_gaussians, device=gauss_data.device)[:keep]
             strategy_params["means"] = torch.nn.Parameter(strategy_params["means"].detach()[idx].contiguous(), requires_grad=True)
@@ -1447,6 +1658,22 @@ def main():
     save_checkpoint(gauss_data, output_dir / "gaussians.pt")
     save_ply(gauss_data, output_dir / "point_cloud.ply")
     print(f"Exported PLY: {output_dir / 'point_cloud.ply'} ({gauss_data.num_gaussians} gaussians)")
+
+    if eval_frames:
+        metrics = evaluate_heldout(
+            gauss_data,
+            eval_frames,
+            device=device,
+            max_resolution=args.max_resolution,
+        )
+        metrics_path = output_dir / "metrics.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+        print(
+            f"Held-out ({int(metrics['num_views'])} views): "
+            f"PSNR={metrics['psnr']:.3f}  SSIM={metrics['ssim']:.4f}  "
+            f"LPIPS={metrics['lpips']:.4f}"
+        )
+        print(f"Wrote {metrics_path}")
 
     with torch.no_grad():
         snap = gauss_data.snapshot_for_visualizer()
