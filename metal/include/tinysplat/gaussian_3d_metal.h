@@ -15,6 +15,8 @@ struct Splat3DMetalOptions {
   bool use_compact_box = true;
   /// Force host backward (numeric tests).
   bool force_cpu = false;
+  /// Active SH degree for fused eval (0..3). -1 means RGB colors are provided.
+  int sh_degree = -1;
 };
 
 /// Returns true if a Metal device is available (macOS Apple Silicon / Metal GPU).
@@ -37,6 +39,13 @@ bool gaussian_splat_3d_forward_qs(const float* means, const float* log_scales, c
                                   const float* camera_to_world, int height, int width,
                                   float* output_host, const Splat3DMetalOptions& opts = {});
 
+/// qs forward that evaluates view-dependent RGB from SH (N,16,3) on GPU.
+bool gaussian_splat_3d_forward_qs_sh(const float* means, const float* log_scales, const float* quats,
+                                     const float* sh, const float* opacities, int num_gaussians,
+                                     int num_channels, const float* intrinsics,
+                                     const float* camera_to_world, int height, int width,
+                                     float* output_host, const Splat3DMetalOptions& opts = {});
+
 /// Backward that reuses GPU buffers from the last gaussian_splat_3d_forward
 /// in this process (same N, C, H, W). Writes dL/dmean3d (N,3), dL/dcov3d (N,9),
 /// plus color and opacity grads.
@@ -50,6 +59,13 @@ bool gaussian_splat_3d_session_backward(
 bool gaussian_splat_3d_session_backward_qs(
     const float* grad_output, int num_gaussians, int num_channels, int height, int width,
     float* grad_means3d, float* grad_log_scales, float* grad_quats, float* grad_colors,
+    float* grad_opacities, const Splat3DMetalOptions& opts = {});
+
+/// Backward for a qs+SH forward session. Writes dL/dmean3d, dL/dlog_scales,
+/// dL/dquat_raw, dL/dsh (N,16,3 = N*48), and opacity grads.
+bool gaussian_splat_3d_session_backward_qs_sh(
+    const float* grad_output, int num_gaussians, int num_channels, int height, int width,
+    float* grad_means3d, float* grad_log_scales, float* grad_quats, float* grad_sh,
     float* grad_opacities, const Splat3DMetalOptions& opts = {});
 /// Backward in projected 2D space (tiled Metal; CPU fallback).
 /// depths: optional camera-Z per Gaussian (N). When non-null, tile compositing

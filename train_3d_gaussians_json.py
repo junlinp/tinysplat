@@ -978,9 +978,10 @@ class GaussianData:
         height: int,
         width: int,
     ) -> torch.Tensor:
+        use_metal_qs = self._device.type == "mps" and metal_available()
+        use_metal_sh = use_metal_qs and self.sh_coeffs is not None
         kwargs = dict(
             means=self.means,
-            colors=self.visible_colors(camera_to_world),
             opacities=self.visible_opacities(),
             intrinsics=intrinsics,
             camera_to_world=camera_to_world,
@@ -988,22 +989,31 @@ class GaussianData:
             width=width,
             device=self._device.type,
         )
-        use_metal_qs = self._device.type == "mps" and metal_available()
-        if use_metal_qs:
+        if use_metal_sh:
+            kwargs["colors"] = torch.zeros(
+                self.means.shape[0], 3, device=self._device, dtype=self.means.dtype
+            )
+            kwargs["sh_coeffs"] = self.sh_coeffs
+            kwargs["sh_degree"] = int(self.active_sh_degree)
             kwargs["log_scales"] = self.log_scales
             kwargs["rotations"] = self.rotations
         else:
-            kwargs["covariances"] = self.covariance_matrices()
-            try:
-                import inspect
+            kwargs["colors"] = self.visible_colors(camera_to_world)
+            if use_metal_qs:
+                kwargs["log_scales"] = self.log_scales
+                kwargs["rotations"] = self.rotations
+            else:
+                kwargs["covariances"] = self.covariance_matrices()
+                try:
+                    import inspect
 
-                params = inspect.signature(gaussian_splat_3d).parameters
-                if "scales" in params:
-                    kwargs["scales"] = torch.exp(self.log_scales)
-                if "quats" in params:
-                    kwargs["quats"] = F.normalize(self.rotations, dim=-1)
-            except (TypeError, ValueError):
-                pass
+                    params = inspect.signature(gaussian_splat_3d).parameters
+                    if "scales" in params:
+                        kwargs["scales"] = torch.exp(self.log_scales)
+                    if "quats" in params:
+                        kwargs["quats"] = F.normalize(self.rotations, dim=-1)
+                except (TypeError, ValueError):
+                    pass
         return gaussian_splat_3d(**kwargs)
 
     def snapshot_for_visualizer(self) -> Dict[str, torch.Tensor]:
@@ -1095,16 +1105,17 @@ def save_ply(
 
 
 def build_optimizers(data: GaussianData, lr: float):
+    adam_kw = {"foreach": True}
     opts = {
-        "means": torch.optim.Adam([data.means], lr=lr * 0.1),
-        "scales": torch.optim.Adam([data.log_scales], lr=lr),
-        "quats": torch.optim.Adam([data.rotations], lr=lr),
-        "opacities": torch.optim.Adam([data.opacities], lr=lr),
+        "means": torch.optim.Adam([data.means], lr=lr * 0.1, **adam_kw),
+        "scales": torch.optim.Adam([data.log_scales], lr=lr, **adam_kw),
+        "quats": torch.optim.Adam([data.rotations], lr=lr, **adam_kw),
+        "opacities": torch.optim.Adam([data.opacities], lr=lr, **adam_kw),
     }
     if data.sh_coeffs is not None:
-        opts["sh"] = torch.optim.Adam([data.sh_coeffs], lr=lr)
+        opts["sh"] = torch.optim.Adam([data.sh_coeffs], lr=lr, **adam_kw)
     else:
-        opts["colors"] = torch.optim.Adam([data.colors], lr=lr)
+        opts["colors"] = torch.optim.Adam([data.colors], lr=lr, **adam_kw)
     return opts
 
 

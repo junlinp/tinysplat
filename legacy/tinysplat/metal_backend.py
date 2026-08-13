@@ -151,6 +151,45 @@ def _load_lib():
         ctypes.c_int,
     ]
     lib.tinysplat_metal_session_backward_qs.restype = ctypes.c_int
+    lib.tinysplat_metal_forward_qs_sh.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.tinysplat_metal_forward_qs_sh.restype = ctypes.c_int
+    lib.tinysplat_metal_session_backward_qs_sh.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.tinysplat_metal_session_backward_qs_sh.restype = ctypes.c_int
     _lib = lib
     return _lib
 
@@ -446,6 +485,109 @@ def session_backward_qs(
     return gm.view(n, 3), gls.view(n, 3), gq.view(n, 4), gcol.view(n, c), gopa
 
 
+def forward_3d_qs_sh(
+    means: torch.Tensor,
+    log_scales: torch.Tensor,
+    rotations: torch.Tensor,
+    sh_coeffs: torch.Tensor,
+    opacities: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    height: int,
+    width: int,
+    sh_degree: int,
+    near_plane: float = 1e-4,
+    min_covariance: float = 1e-4,
+    sigma_radius: float = 4.0,
+    compact_box_beta: float = 3.0,
+    use_compact_box: bool = True,
+) -> Optional[torch.Tensor]:
+    """Rasterize with Metal, evaluating SH RGB on GPU."""
+    lib = _load_lib()
+    if lib is None or not lib.tinysplat_metal_available():
+        return None
+
+    means_h = _host_f32(means).view(-1)
+    scales_h = _host_f32(log_scales).view(-1)
+    quats_h = _host_f32(rotations).view(-1)
+    sh_h = _host_f32(sh_coeffs).reshape(-1)
+    opa_h = _host_f32(opacities).view(-1)
+    n = int(means.shape[0])
+    c = 3
+    intr = _host_f32(intrinsics).view(-1).contiguous()
+    c2w = _host_f32(camera_to_world).view(-1).contiguous()
+    out = torch.zeros(height * width * c, dtype=torch.float32)
+
+    ok = lib.tinysplat_metal_forward_qs_sh(
+        _f32_ptr(means_h),
+        _f32_ptr(scales_h),
+        _f32_ptr(quats_h),
+        _f32_ptr(sh_h),
+        _f32_ptr(opa_h),
+        n,
+        c,
+        _f32_ptr(intr),
+        _f32_ptr(c2w),
+        height,
+        width,
+        _f32_ptr(out),
+        ctypes.c_float(near_plane),
+        ctypes.c_float(min_covariance),
+        ctypes.c_float(sigma_radius),
+        ctypes.c_float(compact_box_beta),
+        ctypes.c_int(1 if use_compact_box else 0),
+        ctypes.c_int(int(sh_degree)),
+    )
+    if not ok:
+        return None
+    return out.view(height, width, c)
+
+
+def session_backward_qs_sh(
+    grad_output: torch.Tensor,
+    num_gaussians: int,
+    height: int,
+    width: int,
+    min_covariance: float = 1e-4,
+    sigma_radius: float = 4.0,
+    compact_box_beta: float = 3.0,
+    use_compact_box: bool = True,
+    force_cpu: bool = False,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Reuse GPU tiles from the last forward_3d_qs_sh. Returns mean/log_scale/quat/sh/opacity grads."""
+    lib = _load_lib()
+    if lib is None:
+        return None
+    n = int(num_gaussians)
+    c = 3
+    go = _host_f32(grad_output).view(-1)
+    gm = torch.zeros(n * 3, dtype=torch.float32)
+    gls = torch.zeros(n * 3, dtype=torch.float32)
+    gq = torch.zeros(n * 4, dtype=torch.float32)
+    gsh = torch.zeros(n * 48, dtype=torch.float32)
+    gopa = torch.zeros(n, dtype=torch.float32)
+    ok = lib.tinysplat_metal_session_backward_qs_sh(
+        _f32_ptr(go),
+        n,
+        c,
+        height,
+        width,
+        _f32_ptr(gm),
+        _f32_ptr(gls),
+        _f32_ptr(gq),
+        _f32_ptr(gsh),
+        _f32_ptr(gopa),
+        ctypes.c_float(min_covariance),
+        ctypes.c_float(sigma_radius),
+        ctypes.c_float(compact_box_beta),
+        ctypes.c_int(1 if use_compact_box else 0),
+        ctypes.c_int(1 if force_cpu else 0),
+    )
+    if not ok:
+        return None
+    return gm.view(n, 3), gls.view(n, 3), gq.view(n, 4), gsh.view(n, 16, 3), gopa
+
+
 def count_footprint_hits(
     proj_means: torch.Tensor,
     proj_covs: torch.Tensor,
@@ -675,6 +817,101 @@ class _MetalSplat3DQsFn(torch.autograd.Function):
         )
 
 
+class _MetalSplat3DQsShFn(torch.autograd.Function):
+    """Metal tiled forward with fused quat+log-scale covariance and SH color."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means,
+        log_scales,
+        rotations,
+        sh_coeffs,
+        opacities,
+        intrinsics,
+        camera_to_world,
+        height,
+        width,
+        sh_degree,
+        near_plane,
+        min_covariance,
+        sigma_radius,
+        compact_box_beta,
+        use_compact_box,
+    ):
+        device = means.device
+        dtype = means.dtype
+        img = forward_3d_qs_sh(
+            means.detach(),
+            log_scales.detach(),
+            rotations.detach(),
+            sh_coeffs.detach(),
+            opacities.detach(),
+            intrinsics.detach(),
+            camera_to_world.detach(),
+            int(height),
+            int(width),
+            int(sh_degree),
+            near_plane=float(near_plane),
+            min_covariance=float(min_covariance),
+            sigma_radius=float(sigma_radius),
+            compact_box_beta=float(compact_box_beta),
+            use_compact_box=bool(use_compact_box),
+        )
+        if img is None:
+            raise RuntimeError("Metal qs+SH forward failed")
+
+        ctx.num_gaussians = int(means.shape[0])
+        ctx.height = int(height)
+        ctx.width = int(width)
+        ctx.min_covariance = float(min_covariance)
+        ctx.sigma_radius = float(sigma_radius)
+        ctx.compact_box_beta = float(compact_box_beta)
+        ctx.use_compact_box = bool(use_compact_box)
+        ctx.device = device
+        ctx.dtype = dtype
+        ctx.mean_shape = tuple(means.shape)
+        ctx.scale_shape = tuple(log_scales.shape)
+        ctx.quat_shape = tuple(rotations.shape)
+        ctx.sh_shape = tuple(sh_coeffs.shape)
+        return img.to(device=device, dtype=dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grads = session_backward_qs_sh(
+            grad_output.detach(),
+            ctx.num_gaussians,
+            ctx.height,
+            ctx.width,
+            min_covariance=ctx.min_covariance,
+            sigma_radius=ctx.sigma_radius,
+            compact_box_beta=ctx.compact_box_beta,
+            use_compact_box=ctx.use_compact_box,
+        )
+        if grads is None:
+            raise RuntimeError("Metal qs+SH session backward failed")
+        g_mean, g_ls, g_q, g_sh, g_opa = grads
+        device = ctx.device
+        dtype = ctx.dtype
+        return (
+            g_mean.to(device=device, dtype=dtype).view(ctx.mean_shape),
+            g_ls.to(device=device, dtype=dtype).view(ctx.scale_shape),
+            g_q.to(device=device, dtype=dtype).view(ctx.quat_shape),
+            g_sh.to(device=device, dtype=dtype).view(ctx.sh_shape),
+            g_opa.to(device=device, dtype=dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def render_metal_3d(
     means: torch.Tensor,
     covariances: Optional[torch.Tensor] = None,
@@ -691,6 +928,8 @@ def render_metal_3d(
     use_compact_box: bool = True,
     log_scales: Optional[torch.Tensor] = None,
     rotations: Optional[torch.Tensor] = None,
+    sh_coeffs: Optional[torch.Tensor] = None,
+    sh_degree: int = 0,
     **_kwargs,
 ) -> torch.Tensor:
     if not metal_available():
@@ -702,6 +941,24 @@ def render_metal_3d(
         compact_box_beta=compact_box_beta,
         use_compact_box=use_compact_box,
     )
+    if log_scales is not None and rotations is not None and sh_coeffs is not None:
+        return _MetalSplat3DQsShFn.apply(
+            means,
+            log_scales,
+            rotations,
+            sh_coeffs,
+            opacities,
+            intrinsics,
+            camera_to_world,
+            height,
+            width,
+            int(sh_degree),
+            opts["near_plane"],
+            opts["min_covariance"],
+            opts["sigma_radius"],
+            opts["compact_box_beta"],
+            opts["use_compact_box"],
+        )
     if log_scales is not None and rotations is not None:
         return _MetalSplat3DQsFn.apply(
             means,
