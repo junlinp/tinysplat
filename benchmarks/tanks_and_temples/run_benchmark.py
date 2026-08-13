@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 DEFAULT_SCENES = ("train", "truck")
 
@@ -40,9 +40,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run(cmd: List[str], env: Dict[str, str]) -> None:
+def _run(cmd: List[str], env: Dict[str, str], cwd: Optional[Path] = None) -> None:
     print("+", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True, env=env)
+    subprocess.run(cmd, check=True, env=env, cwd=str(cwd) if cwd else None)
 
 
 def main() -> int:
@@ -55,13 +55,17 @@ def main() -> int:
     )
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Prefer complete legacy package when importing tinysplat.
+    # Prefer complete legacy package. Avoid repo-root cwd shadowing `tinysplat/`.
     env = os.environ.copy()
     legacy = str(repo_root / "legacy")
-    env["PYTHONPATH"] = legacy + os.pathsep + str(repo_root) + os.pathsep + env.get(
-        "PYTHONPATH", ""
+    env["PYTHONPATH"] = legacy + os.pathsep + env.get("PYTHONPATH", "")
+    env.setdefault(
+        "TINYSPLAT_METAL_LIB",
+        str(repo_root / "metal" / "build" / "libtinysplat_metal_py.dylib"),
     )
     py = sys.executable
+    # Run subprocesses from a neutral cwd so `./tinysplat` is not imported.
+    run_cwd = Path("/tmp")
 
     if not args.skip_download:
         _run(
@@ -74,6 +78,7 @@ def main() -> int:
                 *args.scenes,
             ],
             env,
+            cwd=run_cwd,
         )
 
     if not args.skip_prepare:
@@ -87,6 +92,7 @@ def main() -> int:
                 *args.scenes,
             ],
             env,
+            cwd=run_cwd,
         )
 
     summary: Dict[str, object] = {"scenes": {}, "protocol": {
@@ -94,6 +100,7 @@ def main() -> int:
         "iterations": args.iterations,
         "dataset": "Tanks & Temples (train, truck) via Hugging Face",
         "metrics": ["psnr", "ssim", "lpips"],
+        "fastgs": True,
     }}
 
     for scene in args.scenes:
@@ -119,15 +126,25 @@ def main() -> int:
                 "--output-dir",
                 str(scene_out),
                 "--no-viser",
+                "--cache-images",
                 # T&T images are ~1MP; avoid aggressive resolution curriculum.
                 "--num-downscales",
                 "0",
+                "--fastgs",
+                "--sh-degree",
+                "3",
+                "--densify-every",
+                "500",
+                "--densify-from",
+                "500",
+                "--densify-until",
+                "15000",
             ]
             extra = args.extra_train_args
             if extra and extra[0] == "--":
                 extra = extra[1:]
             train_cmd.extend(extra)
-            _run(train_cmd, env)
+            _run(train_cmd, env, cwd=run_cwd)
 
         if not ckpt.is_file():
             print(f"Missing checkpoint for {scene}: {ckpt}", file=sys.stderr)
@@ -150,6 +167,7 @@ def main() -> int:
                 str(metrics_path),
             ],
             env,
+            cwd=run_cwd,
         )
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         summary["scenes"][scene] = metrics

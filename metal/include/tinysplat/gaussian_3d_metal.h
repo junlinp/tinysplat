@@ -1,0 +1,70 @@
+#pragma once
+
+#include <cstdint>
+
+namespace tinysplat {
+namespace metal {
+
+struct Splat3DMetalOptions {
+  float near_plane = 1e-4f;
+  float min_covariance = 1e-4f;
+  float sigma_radius = 4.0f;
+  /// Compact-box Mahalanobis scale (FastGS CB). Smaller = tighter footprint.
+  float compact_box_beta = 3.0f;
+  /// When true, use compact-box radius instead of plain 3-sigma AABB.
+  bool use_compact_box = true;
+  /// Force host backward (numeric tests).
+  bool force_cpu = false;
+};
+
+/// Returns true if a Metal device is available (macOS Apple Silicon / Metal GPU).
+bool metal_available();
+
+/// 3DGS-style tiled forward on Metal. Buffer layouts match the CUDA API:
+/// means (N,3), covs row-major (N,9), colors (N,C) RGB or SH DC, opacities (N).
+/// intrinsics: 3x3 row-major, camera_to_world: 4x4 row-major. output: (H,W,C).
+bool gaussian_splat_3d_forward(const float* means, const float* covs, const float* colors,
+                               const float* opacities, int num_gaussians, int num_channels,
+                               const float* intrinsics, const float* camera_to_world, int height,
+                               int width, float* output_host,
+                               const Splat3DMetalOptions& opts = {});
+
+/// Same raster as gaussian_splat_3d_forward, but builds world covariance from
+/// log-scales (N,3) and raw wxyz quaternions (N,4) on GPU (matches GaussianData.covariance_matrices).
+bool gaussian_splat_3d_forward_qs(const float* means, const float* log_scales, const float* quats,
+                                  const float* colors, const float* opacities, int num_gaussians,
+                                  int num_channels, const float* intrinsics,
+                                  const float* camera_to_world, int height, int width,
+                                  float* output_host, const Splat3DMetalOptions& opts = {});
+
+/// Backward that reuses GPU buffers from the last gaussian_splat_3d_forward
+/// in this process (same N, C, H, W). Writes dL/dmean3d (N,3), dL/dcov3d (N,9),
+/// plus color and opacity grads.
+bool gaussian_splat_3d_session_backward(
+    const float* grad_output, int num_gaussians, int num_channels, int height, int width,
+    float* grad_means3d, float* grad_covs3d, float* grad_colors, float* grad_opacities,
+    const Splat3DMetalOptions& opts = {});
+
+/// Backward for a qs forward session. Writes dL/dmean3d (N,3), dL/dlog_scales (N,3),
+/// dL/dquat_raw (N,4), plus color and opacity grads.
+bool gaussian_splat_3d_session_backward_qs(
+    const float* grad_output, int num_gaussians, int num_channels, int height, int width,
+    float* grad_means3d, float* grad_log_scales, float* grad_quats, float* grad_colors,
+    float* grad_opacities, const Splat3DMetalOptions& opts = {});
+/// Backward in projected 2D space (tiled Metal; CPU fallback).
+/// depths: optional camera-Z per Gaussian (N). When non-null, tile compositing
+/// is sorted front-to-back by depth (matches 3D forward).
+bool gaussian_splat_3d_projected_backward(
+    const float* grad_output, const float* proj_means, const float* proj_covs,
+    const float* colors, const float* opacities, int num_gaussians, int num_channels, int height,
+    int width, float* grad_proj_means, float* grad_proj_covs, float* grad_colors,
+    float* grad_opacities, const Splat3DMetalOptions& opts = {}, const float* depths = nullptr);
+
+/// Count high-error pixels in each Gaussian footprint across one view (FastGS VCD/VCP).
+/// error_mask: H*W uint8 (1 = high error). Writes counts[N].
+bool count_footprint_hits(const float* proj_means, const float* proj_covs, const float* opacities,
+                          int num_gaussians, int height, int width, const uint8_t* error_mask,
+                          int* counts, const Splat3DMetalOptions& opts = {});
+
+}  // namespace metal
+}  // namespace tinysplat

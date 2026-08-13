@@ -5,6 +5,11 @@ config_setting(
     define_values = {"cuda": "1"},
 )
 
+config_setting(
+    name = "metal_build",
+    define_values = {"metal": "1"},
+)
+
 cc_test(
     name = "gaussian_2d_test",
     srcs = ["gaussian_2d_test.cc"],
@@ -21,3 +26,11 @@ cc_test(
     deps = ["//src/tinysplat"],
     tags = ["cuda"],
 )
+
+cc_test(
+    name = "gaussian_3d_metal_test",
+    srcs = ["gaussian_3d_metal_test.cc"],
+    deps = ["//src/tinysplat"],
+    tags = ["metal"],
+)
+

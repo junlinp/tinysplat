@@ -12,20 +12,25 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-# Prefer complete legacy package over incomplete root tinysplat/.
+# Prefer complete legacy package for `tinysplat`. Load the repo-root trainer by path
+# so `legacy/train_3d_gaussians_json.py` cannot shadow it.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LEGACY = _REPO_ROOT / "legacy"
-sys.path.insert(0, str(_REPO_ROOT))
 if _LEGACY.is_dir():
     sys.path.insert(0, str(_LEGACY))
 
-from train_3d_gaussians_json import (  # noqa: E402
-    GaussianData,
-    evaluate_heldout,
-    load_dataset_frames,
-    resolve_device,
-    split_train_eval,
-)
+import importlib.util
+
+_TRAIN_PATH = _REPO_ROOT / "train_3d_gaussians_json.py"
+_spec = importlib.util.spec_from_file_location("train_3d_gaussians_json", _TRAIN_PATH)
+_train = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_train)
+GaussianData = _train.GaussianData
+evaluate_heldout = _train.evaluate_heldout
+load_dataset_frames = _train.load_dataset_frames
+resolve_device = _train.resolve_device
+split_train_eval = _train.split_train_eval
 
 
 def parse_args() -> argparse.Namespace:

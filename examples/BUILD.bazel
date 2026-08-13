@@ -31,3 +31,11 @@ cc_binary(
     linkopts = ["-lcudart"],
     tags = ["cuda"],
 )
+
+cc_binary(
+    name = "render_3d_metal",
+    srcs = ["render_3d_metal.cc"],
+    deps = ["//src/tinysplat"],
+    tags = ["metal"],
+)
+

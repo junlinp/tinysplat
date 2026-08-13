@@ -7,6 +7,11 @@ config_setting(
     define_values = {"cuda": "1"},
 )
 
+config_setting(
+    name = "metal_build",
+    define_values = {"metal": "1"},
+)
+
 cc_library(
     name = "tinysplat",
     srcs = [
@@ -17,29 +22,51 @@ cc_library(
     ] + select({
         ":cuda_build": ["gaussian_3d_cuda_bridge.cc"],
         "//conditions:default": [],
+    }) + select({
+        ":metal_build": ["gaussian_3d_metal_bridge.cc"],
+        "//conditions:default": [],
     }),
     hdrs = [
         "include/tinysplat/gaussian_2d.h",
         "include/tinysplat/gaussian_3d.h",
         "include/tinysplat/image.h",
         "include/tinysplat/parallel.h",
+        "include/tinysplat/sh.h",
         "include/tinysplat/types.h",
         "gaussian_3d_cuda_bridge.h",
+        "gaussian_3d_metal_bridge.h",
     ],
     includes = ["include"],
-    copts = select({
-        ":cuda_build": ["-DTINYSPLAT_CUDA", "-fopenmp"],
-        "//conditions:default": ["-fopenmp"],
+    copts = ["-fopenmp"] + select({
+        ":cuda_build": ["-DTINYSPLAT_CUDA"],
+        "//conditions:default": [],
+    }) + select({
+        ":metal_build": ["-DTINYSPLAT_METAL"],
+        "//conditions:default": [],
     }),
-    linkopts = select({
-        ":cuda_build": ["-fopenmp", "-lcudart"],
-        "//conditions:default": ["-fopenmp"],
+    linkopts = ["-fopenmp"] + select({
+        ":cuda_build": ["-lcudart"],
+        "//conditions:default": [],
+    }) + select({
+        ":metal_build": [
+            "-framework",
+            "Metal",
+            "-framework",
+            "Foundation",
+        ],
+        "//conditions:default": [],
     }),
     deps = select({
         ":cuda_build": [
             "//cuda:tinysplat_cuda",
             "//cuda:gaussian_2d_cuda_headers",
             "//cuda:gaussian_3d_cuda_headers",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        ":metal_build": [
+            "//metal:tinysplat_metal",
+            "//metal:gaussian_3d_metal_headers",
         ],
         "//conditions:default": [],
     }),

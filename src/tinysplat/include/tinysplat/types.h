@@ -51,6 +51,13 @@ struct Gaussians3D {
   std::vector<Mat3> covariances;
   std::vector<std::vector<float>> colors;
   std::vector<float> opacities;
+  /// Optional anisotropic scale (N,3) and unit quaternion wxyz (N,4).
+  std::vector<Vec3> scales;
+  std::vector<std::array<float, 4>> rotations;
+  /// Optional SH coeffs: N vectors of size 16*3 (degree-3 RGB interleaved as
+  /// [dc_r,dc_g,dc_b, rest...]). When non-empty, Metal/CUDA may evaluate view-dependent color.
+  std::vector<std::vector<float>> sh_coeffs;
+  int sh_degree = 0;
 };
 
 struct CameraIntrinsics {
