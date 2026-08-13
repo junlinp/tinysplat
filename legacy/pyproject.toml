@@ -44,6 +44,11 @@ dev = [
     "matplotlib>=3.5.0",
     "pillow>=9.0.0",
 ]
+benchmark = [
+    "huggingface_hub>=0.20.0",
+    "lpips>=0.1.4",
+    "gsplat>=1.0.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["tinysplat*"]
