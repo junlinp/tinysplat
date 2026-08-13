@@ -11,6 +11,11 @@ struct Splat3DOptions {
   float sigma_radius = 4.0f;
   /// When true and CUDA is available, use the GPU rasterizer.
   bool use_cuda = false;
+  /// When true and Metal is available, use the Metal tiled rasterizer (preferred on macOS).
+  bool use_metal = false;
+  /// FastGS compact-box Mahalanobis scale (smaller = tighter tile footprint).
+  float compact_box_beta = 3.0f;
+  bool use_compact_box = true;
 };
 
 struct GradientsProjected2D {
@@ -41,5 +46,8 @@ GradientsProjected2D gaussian_splat_3d_projected_backward(
 
 /// Returns true if a CUDA device is available for tinysplat CUDA kernels.
 bool cuda_raster_available();
+
+/// Returns true if a Metal device is available for tinysplat Metal kernels.
+bool metal_raster_available();
 
 }  // namespace tinysplat

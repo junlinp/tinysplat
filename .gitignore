@@ -10,3 +10,4 @@ legacy/**/.ninja_log
 /data/
 /outputs/
 /logs/
+/metal/build/
