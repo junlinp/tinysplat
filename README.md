@@ -116,6 +116,20 @@ tinysplat/
 
 The original package (PyTorch autograd, JIT C++/CUDA extensions, training scripts) is preserved in `legacy/` for reference. It is **not** built by Bazel.
 
+### Tanks & Temples quality benchmark
+
+Novel-view PSNR / SSIM / LPIPS on the standard **train** / **truck** scenes (Hugging Face download, every-8th holdout):
+
+```bash
+pip install -e legacy
+pip install gsplat huggingface_hub lpips pytorch-msssim
+
+python benchmarks/tanks_and_temples/run_benchmark.py --device cuda
+# smoke: add --iterations 200
+```
+
+See [`benchmarks/tanks_and_temples/README.md`](benchmarks/tanks_and_temples/README.md).
+
 ## License
 
 MIT

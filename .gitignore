@@ -7,3 +7,6 @@ __pycache__/
 legacy/**/__pycache__/
 legacy/**/build/
 legacy/**/.ninja_log
+/data/
+/outputs/
+/logs/
