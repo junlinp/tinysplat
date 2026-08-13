@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -72,6 +73,10 @@ struct CameraParams {
   uint32_t width;
   uint32_t n;
   uint32_t has_depths;
+  float cam_pos0;
+  float cam_pos1;
+  float cam_pos2;
+  uint32_t sh_degree;
 };
 
 // Embedded Metal shaders: GPU project/tiles + tiled forward/backward with cooperative load.
@@ -130,6 +135,10 @@ struct CameraParams {
   uint width;
   uint n;
   uint has_depths;
+  float cam_pos0;
+  float cam_pos1;
+  float cam_pos2;
+  uint sh_degree;
 };
 
 inline float compact_radius_m(float s00, float s01, float s11, float min_covariance,
@@ -295,6 +304,96 @@ inline void dsigma_to_quat_logscale(float qw, float qx, float qy, float qz, floa
   dquat[1] = (dx - qx * qdot) * inv_n;
   dquat[2] = (dy - qy * qdot) * inv_n;
   dquat[3] = (dz - qz * qdot) * inv_n;
+}
+
+constant float kShC0 = 0.28209479177387814;
+constant float kShC1 = 0.4886025119029199;
+constant float kShC2_0 = 1.0925484305920792;
+constant float kShC2_1 = -1.0925484305920792;
+constant float kShC2_2 = 0.31539156525252005;
+constant float kShC2_3 = -1.0925484305920792;
+constant float kShC2_4 = 0.5462742152960396;
+constant float kShC3_0 = -0.5900435899266435;
+constant float kShC3_1 = 2.890611442640554;
+constant float kShC3_2 = -0.4570457994644658;
+constant float kShC3_3 = 0.3731763325901154;
+constant float kShC3_4 = -0.4570457994644658;
+constant float kShC3_5 = 1.445305721320277;
+constant float kShC3_6 = -0.5900435899266435;
+
+inline int sh_num_bases(uint degree) {
+  const int d = int(degree);
+  return (d + 1) * (d + 1);
+}
+
+inline void sh_basis(float x, float y, float z, int degree, thread float* b) {
+  b[0] = kShC0;
+  if (degree < 1) return;
+  b[1] = -kShC1 * y;
+  b[2] = kShC1 * z;
+  b[3] = -kShC1 * x;
+  if (degree < 2) return;
+  const float xx = x * x, yy = y * y, zz = z * z;
+  const float xy = x * y, yz = y * z, xz = x * z;
+  b[4] = kShC2_0 * xy;
+  b[5] = kShC2_1 * yz;
+  b[6] = kShC2_2 * (2.0f * zz - xx - yy);
+  b[7] = kShC2_3 * xz;
+  b[8] = kShC2_4 * (xx - yy);
+  if (degree < 3) return;
+  b[9] = kShC3_0 * (y * (3.0f * xx - yy));
+  b[10] = kShC3_1 * (xy * z);
+  b[11] = kShC3_2 * (y * (4.0f * zz - xx - yy));
+  b[12] = kShC3_3 * (z * (2.0f * zz - 3.0f * xx - 3.0f * yy));
+  b[13] = kShC3_4 * (x * (4.0f * zz - xx - yy));
+  b[14] = kShC3_5 * (z * (xx - yy));
+  b[15] = kShC3_6 * (x * (xx - 3.0f * yy));
+}
+
+inline void sh_basis_grad(float x, float y, float z, int degree, thread float* dx, thread float* dy,
+                          thread float* dz) {
+  for (int i = 0; i < 16; ++i) {
+    dx[i] = 0.0f;
+    dy[i] = 0.0f;
+    dz[i] = 0.0f;
+  }
+  if (degree < 1) return;
+  dy[1] = -kShC1;
+  dz[2] = kShC1;
+  dx[3] = -kShC1;
+  if (degree < 2) return;
+  dx[4] = kShC2_0 * y;
+  dy[4] = kShC2_0 * x;
+  dy[5] = kShC2_1 * z;
+  dz[5] = kShC2_1 * y;
+  dx[6] = -2.0f * kShC2_2 * x;
+  dy[6] = -2.0f * kShC2_2 * y;
+  dz[6] = 4.0f * kShC2_2 * z;
+  dx[7] = kShC2_3 * z;
+  dz[7] = kShC2_3 * x;
+  dx[8] = 2.0f * kShC2_4 * x;
+  dy[8] = -2.0f * kShC2_4 * y;
+  if (degree < 3) return;
+  const float xx = x * x, yy = y * y, zz = z * z;
+  dx[9] = kShC3_0 * (6.0f * x * y);
+  dy[9] = kShC3_0 * (3.0f * xx - 3.0f * yy);
+  dx[10] = kShC3_1 * (y * z);
+  dy[10] = kShC3_1 * (x * z);
+  dz[10] = kShC3_1 * (x * y);
+  dx[11] = kShC3_2 * (-2.0f * x * y);
+  dy[11] = kShC3_2 * (4.0f * zz - xx - 3.0f * yy);
+  dz[11] = kShC3_2 * (8.0f * y * z);
+  dx[12] = kShC3_3 * (-6.0f * x * z);
+  dy[12] = kShC3_3 * (-6.0f * y * z);
+  dz[12] = kShC3_3 * (6.0f * zz - 3.0f * xx - 3.0f * yy);
+  dx[13] = kShC3_4 * (4.0f * zz - 3.0f * xx - yy);
+  dy[13] = kShC3_4 * (-2.0f * x * y);
+  dz[13] = kShC3_4 * (8.0f * x * z);
+  dx[14] = kShC3_5 * (2.0f * x * z);
+  dy[14] = kShC3_5 * (-2.0f * y * z);
+  dz[14] = kShC3_5 * (xx - yy);
+  dx[15] = kShC3_6 * (3.0f * xx - 3.0f * yy);
+  dy[15] = kShC3_6 * (-6.0f * x * y);
 }
 
 inline ProjectedGaussian invalid_projected(uint gid) {
@@ -1196,6 +1295,114 @@ kernel void project_3d_vjp_qs(
   dquats[gid * 4 + 2] = dq[2];
   dquats[gid * 4 + 3] = dq[3];
 }
+
+kernel void eval_sh_colors(device const float* means [[buffer(0)]],
+                           device const float* sh [[buffer(1)]],
+                           constant CameraParams& cam [[buffer(2)]],
+                           device float* colors [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+  if (gid >= cam.n) {
+    return;
+  }
+  const float vx = means[gid * 3 + 0] - cam.cam_pos0;
+  const float vy = means[gid * 3 + 1] - cam.cam_pos1;
+  const float vz = means[gid * 3 + 2] - cam.cam_pos2;
+  const float nrm = sqrt(vx * vx + vy * vy + vz * vz);
+  const float inv = 1.0f / max(nrm, 1.0e-8f);
+  const float x = vx * inv;
+  const float y = vy * inv;
+  const float z = vz * inv;
+  const int degree = int(cam.sh_degree);
+  const int K = sh_num_bases(cam.sh_degree);
+  float b[16];
+  for (int i = 0; i < 16; ++i) {
+    b[i] = 0.0f;
+  }
+  sh_basis(x, y, z, degree, b);
+  const uint base = gid * 48u;
+  for (int c = 0; c < 3; ++c) {
+    float acc = 0.5f;
+    for (int k = 0; k < K; ++k) {
+      acc += b[k] * sh[base + uint(k * 3 + c)];
+    }
+    colors[gid * 3 + c] = clamp(acc, 0.0f, 1.0f);
+  }
+}
+
+kernel void eval_sh_vjp(device const float* means [[buffer(0)]], device const float* sh [[buffer(1)]],
+                        constant CameraParams& cam [[buffer(2)]],
+                        device const float* dcolors [[buffer(3)]], device float* dmeans [[buffer(4)]],
+                        device float* dsh [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
+  if (gid >= cam.n) {
+    return;
+  }
+  const float vx = means[gid * 3 + 0] - cam.cam_pos0;
+  const float vy = means[gid * 3 + 1] - cam.cam_pos1;
+  const float vz = means[gid * 3 + 2] - cam.cam_pos2;
+  const float nrm = sqrt(vx * vx + vy * vy + vz * vz);
+  const float inv = 1.0f / max(nrm, 1.0e-8f);
+  const float x = vx * inv;
+  const float y = vy * inv;
+  const float z = vz * inv;
+  const int degree = int(cam.sh_degree);
+  const int K = sh_num_bases(cam.sh_degree);
+  float b[16];
+  for (int i = 0; i < 16; ++i) {
+    b[i] = 0.0f;
+  }
+  sh_basis(x, y, z, degree, b);
+  const uint base = gid * 48u;
+  float dpre[3];
+  for (int c = 0; c < 3; ++c) {
+    float acc = 0.5f;
+    for (int k = 0; k < K; ++k) {
+      acc += b[k] * sh[base + uint(k * 3 + c)];
+    }
+    const float dc = dcolors[gid * 3 + c];
+    dpre[c] = (acc >= 0.0f && acc <= 1.0f) ? dc : 0.0f;
+  }
+  float db[16];
+  for (int k = 0; k < 16; ++k) {
+    db[k] = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+      const uint idx = base + uint(k * 3 + c);
+      if (k < K) {
+        dsh[idx] = b[k] * dpre[c];
+        db[k] += sh[idx] * dpre[c];
+      } else {
+        dsh[idx] = 0.0f;
+      }
+    }
+  }
+  float bx[16];
+  float by[16];
+  float bz[16];
+  sh_basis_grad(x, y, z, degree, bx, by, bz);
+  float ddirx = 0.0f;
+  float ddiry = 0.0f;
+  float ddirz = 0.0f;
+  for (int k = 0; k < K; ++k) {
+    ddirx += db[k] * bx[k];
+    ddiry += db[k] * by[k];
+    ddirz += db[k] * bz[k];
+  }
+  float dvx;
+  float dvy;
+  float dvz;
+  if (nrm >= 1.0e-8f) {
+    const float ddot = x * ddirx + y * ddiry + z * ddirz;
+    dvx = (ddirx - x * ddot) / nrm;
+    dvy = (ddiry - y * ddot) / nrm;
+    dvz = (ddirz - z * ddot) / nrm;
+  } else {
+    dvx = ddirx / 1.0e-8f;
+    dvy = ddiry / 1.0e-8f;
+    dvz = ddirz / 1.0e-8f;
+  }
+  dmeans[gid * 3 + 0] += dvx;
+  dmeans[gid * 3 + 1] += dvy;
+  dmeans[gid * 3 + 2] += dvz;
+}
 )METAL";
 
 struct GrowBuf {
@@ -1224,10 +1431,14 @@ class MetalContext {
   id<MTLComputePipelineState> project_2d_pipeline() const { return project_2d_pipeline_; }
   id<MTLComputePipelineState> vjp_pipeline() const { return vjp_pipeline_; }
   id<MTLComputePipelineState> vjp_qs_pipeline() const { return vjp_qs_pipeline_; }
+  id<MTLComputePipelineState> eval_sh_pipeline() const { return eval_sh_pipeline_; }
+  id<MTLComputePipelineState> sh_vjp_pipeline() const { return sh_vjp_pipeline_; }
   bool qs_ok() const { return project_3d_qs_pipeline_ != nil && vjp_qs_pipeline_ != nil; }
+  bool sh_ok() const { return eval_sh_pipeline_ != nil && sh_vjp_pipeline_ != nil; }
 
   bool session_valid = false;
   bool session_qs = false;
+  bool session_sh = false;
   int session_n = 0;
   int session_c = 0;
   int session_h = 0;
@@ -1246,8 +1457,20 @@ class MetalContext {
   }
 
   GrowBuf means, covs, scales, quats, colors, opa, proj, offsets, ids, output, go;
-  GrowBuf gm, gcov, gcol, gopa, gm3, gcov3, gls, gq, camera, params;
+  GrowBuf gm, gcov, gcol, gopa, gm3, gcov3, gls, gq, sh, dsh, camera, params;
   GrowBuf mask, hitcounts, proj_means, proj_covs, depths;
+
+  struct BinRec {
+    float depth;
+    int idx;
+    int16_t tx0;
+    int16_t tx1;
+    int16_t ty0;
+    int16_t ty1;
+  };
+  std::vector<BinRec> tile_bins;
+  std::vector<int> tile_local;
+  std::vector<int> tile_scatter;
 
  private:
   MetalContext() {
@@ -1311,6 +1534,8 @@ class MetalContext {
     project_2d_pipeline_ = make_pipe(@"project_gaussians_2d");
     vjp_pipeline_ = make_pipe(@"project_3d_vjp");
     vjp_qs_pipeline_ = make_pipe(@"project_3d_vjp_qs");
+    eval_sh_pipeline_ = make_pipe(@"eval_sh_colors");
+    sh_vjp_pipeline_ = make_pipe(@"eval_sh_vjp");
   }
 
   std::mutex mutex_;
@@ -1324,6 +1549,8 @@ class MetalContext {
   id<MTLComputePipelineState> project_2d_pipeline_ = nil;
   id<MTLComputePipelineState> vjp_pipeline_ = nil;
   id<MTLComputePipelineState> vjp_qs_pipeline_ = nil;
+  id<MTLComputePipelineState> eval_sh_pipeline_ = nil;
+  id<MTLComputePipelineState> sh_vjp_pipeline_ = nil;
 };
 
 void blit_in(id<MTLBuffer> buf, const void* src, size_t n) {
@@ -1376,6 +1603,9 @@ CameraParams make_camera(const float* intrinsics, const float* c2w, int n, int h
     cam.twc0 = -(cam.rwc00 * tx + cam.rwc01 * ty + cam.rwc02 * tz);
     cam.twc1 = -(cam.rwc10 * tx + cam.rwc11 * ty + cam.rwc12 * tz);
     cam.twc2 = -(cam.rwc20 * tx + cam.rwc21 * ty + cam.rwc22 * tz);
+    cam.cam_pos0 = tx;
+    cam.cam_pos1 = ty;
+    cam.cam_pos2 = tz;
   }
   cam.near_plane = opts.near_plane;
   cam.min_covariance = opts.min_covariance;
@@ -1386,6 +1616,7 @@ CameraParams make_camera(const float* intrinsics, const float* c2w, int n, int h
   cam.width = static_cast<uint32_t>(w);
   cam.n = static_cast<uint32_t>(n);
   cam.has_depths = has_depths ? 1u : 0u;
+  cam.sh_degree = opts.sh_degree < 0 ? 0u : static_cast<uint32_t>(std::min(opts.sh_degree, 3));
   return cam;
 }
 
@@ -1915,17 +2146,120 @@ struct TileBufs {
 };
 
 TileBufs fast_cpu_tiles(MetalContext& ctx, id<MTLBuffer> proj_buf, int n, int h, int w) {
-  std::vector<int> offsets;
-  std::vector<int> ids;
-  build_tile_lists_from_ptr(static_cast<const ProjectedGaussian*>([proj_buf contents]), n, h, w,
-                            offsets, ids);
-  TileBufs out;
-  out.offsets = ctx.acquire(ctx.offsets, offsets.size() * sizeof(int));
-  out.ids = ctx.acquire(ctx.ids, std::max<size_t>(ids.size(), 1) * sizeof(int));
-  blit_in(out.offsets, offsets.data(), offsets.size() * sizeof(int));
-  if (!ids.empty()) {
-    blit_in(out.ids, ids.data(), ids.size() * sizeof(int));
+  auto* projected = static_cast<ProjectedGaussian*>([proj_buf contents]);
+  const int tiles_x = (w + kTileSize - 1) / kTileSize;
+  const int tiles_y = (h + kTileSize - 1) / kTileSize;
+  const int num_tiles = tiles_x * tiles_y;
+
+  auto& bins = ctx.tile_bins;
+  if (bins.capacity() < static_cast<size_t>(n)) {
+    bins.reserve(static_cast<size_t>(n));
   }
+  bins.clear();
+  for (int i = 0; i < n; ++i) {
+    const auto& pg = projected[i];
+    if (pg.max_x < pg.min_x || pg.max_y < pg.min_y) {
+      continue;
+    }
+    const int tx0 = std::max(0, pg.min_x / kTileSize);
+    const int tx1 = std::min(tiles_x - 1, pg.max_x / kTileSize);
+    const int ty0 = std::max(0, pg.min_y / kTileSize);
+    const int ty1 = std::min(tiles_y - 1, pg.max_y / kTileSize);
+    if (tx1 < tx0 || ty1 < ty0) {
+      continue;
+    }
+    MetalContext::BinRec rec;
+    rec.depth = pg.depth;
+    rec.idx = i;
+    rec.tx0 = static_cast<int16_t>(tx0);
+    rec.tx1 = static_cast<int16_t>(tx1);
+    rec.ty0 = static_cast<int16_t>(ty0);
+    rec.ty1 = static_cast<int16_t>(ty1);
+    bins.push_back(rec);
+  }
+
+  std::sort(bins.begin(), bins.end(), [](const MetalContext::BinRec& a, const MetalContext::BinRec& b) {
+    if (a.depth != b.depth) {
+      return a.depth < b.depth;
+    }
+    return a.idx < b.idx;
+  });
+
+  const int nv = static_cast<int>(bins.size());
+  int nthreads = 8;
+  if (nv < 4096) {
+    nthreads = 1;
+  }
+  nthreads = std::min(nthreads, std::max(nv, 1));
+  auto& local = ctx.tile_local;
+  local.assign(static_cast<size_t>(nthreads) * static_cast<size_t>(num_tiles), 0);
+  const MetalContext::BinRec* bin_ptr = bins.data();
+  int* local_ptr = local.data();
+  if (nv > 0) {
+    dispatch_apply(static_cast<size_t>(nthreads),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t t) {
+                     int* hist = local_ptr + static_cast<size_t>(t) * static_cast<size_t>(num_tiles);
+                     const int begin = (nv * static_cast<int>(t)) / nthreads;
+                     const int end = (nv * (static_cast<int>(t) + 1)) / nthreads;
+                     for (int i = begin; i < end; ++i) {
+                       const MetalContext::BinRec b = bin_ptr[i];
+                       for (int ty = b.ty0; ty <= b.ty1; ++ty) {
+                         const int row = ty * tiles_x;
+                         for (int tx = b.tx0; tx <= b.tx1; ++tx) {
+                           hist[row + tx]++;
+                         }
+                       }
+                     }
+                   });
+  }
+
+  id<MTLBuffer> off_buf =
+      ctx.acquire(ctx.offsets, static_cast<NSUInteger>(num_tiles + 1) * sizeof(int));
+  int* offsets = static_cast<int*>([off_buf contents]);
+  offsets[0] = 0;
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    int sum = 0;
+    for (int t = 0; t < nthreads; ++t) {
+      sum += local_ptr[static_cast<size_t>(t) * static_cast<size_t>(num_tiles) + static_cast<size_t>(tile)];
+    }
+    offsets[tile + 1] = offsets[tile] + sum;
+  }
+  const int nid = offsets[num_tiles];
+  id<MTLBuffer> id_buf =
+      ctx.acquire(ctx.ids, static_cast<NSUInteger>(std::max(nid, 1)) * sizeof(int));
+  int* ids = static_cast<int*>([id_buf contents]);
+  if (nid > 0 && nv > 0) {
+    auto& scatter = ctx.tile_scatter;
+    scatter.resize(static_cast<size_t>(nthreads) * static_cast<size_t>(num_tiles));
+    int* scatter_ptr = scatter.data();
+    for (int tile = 0; tile < num_tiles; ++tile) {
+      int run = offsets[tile];
+      for (int t = 0; t < nthreads; ++t) {
+        scatter_ptr[static_cast<size_t>(t) * static_cast<size_t>(num_tiles) + static_cast<size_t>(tile)] =
+            run;
+        run += local_ptr[static_cast<size_t>(t) * static_cast<size_t>(num_tiles) + static_cast<size_t>(tile)];
+      }
+    }
+    dispatch_apply(static_cast<size_t>(nthreads),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t t) {
+                     int* cursor = scatter_ptr + static_cast<size_t>(t) * static_cast<size_t>(num_tiles);
+                     const int begin = (nv * static_cast<int>(t)) / nthreads;
+                     const int end = (nv * (static_cast<int>(t) + 1)) / nthreads;
+                     for (int i = begin; i < end; ++i) {
+                       const MetalContext::BinRec b = bin_ptr[i];
+                       for (int ty = b.ty0; ty <= b.ty1; ++ty) {
+                         const int row = ty * tiles_x;
+                         for (int tx = b.tx0; tx <= b.tx1; ++tx) {
+                           ids[cursor[row + tx]++] = b.idx;
+                         }
+                       }
+                     }
+                   });
+  }
+
+  TileBufs out;
+  out.offsets = off_buf;
+  out.ids = id_buf;
   return out;
 }
 
@@ -1935,6 +2269,7 @@ bool gpu_forward(const float* means, const float* covs, const float* colors, con
   auto& ctx = MetalContext::instance();
   ctx.session_valid = false;
   ctx.session_qs = false;
+  ctx.session_sh = false;
   if (!ctx.ok() || !ctx.prep_ok()) {
     return false;
   }
@@ -1969,7 +2304,6 @@ bool gpu_forward(const float* means, const float* covs, const float* colors, con
     [cmdp waitUntilCompleted];
     const auto t2 = std::chrono::steady_clock::now();
 
-    sort_projected_by_depth(proj_buf, n);
     TileBufs tiles = fast_cpu_tiles(ctx, proj_buf, n, h, w);
     const RasterParams params = make_raster_params(h, w, c, n);
     id<MTLBuffer> param_buf = ctx.acquire(ctx.params, sizeof(RasterParams));
@@ -1992,6 +2326,7 @@ bool gpu_forward(const float* means, const float* covs, const float* colors, con
 
     ctx.session_valid = true;
     ctx.session_qs = false;
+    ctx.session_sh = false;
     ctx.session_n = n;
     ctx.session_c = c;
     ctx.session_h = h;
@@ -2010,11 +2345,19 @@ bool gpu_forward(const float* means, const float* covs, const float* colors, con
 bool gpu_forward_qs(const float* means, const float* log_scales, const float* quats,
                     const float* colors, const float* opacities, int n, int c,
                     const float* intrinsics, const float* c2w, int h, int w, float* output,
-                    const Splat3DMetalOptions& opts) {
+                    const Splat3DMetalOptions& opts, const float* sh) {
   auto& ctx = MetalContext::instance();
   ctx.session_valid = false;
   ctx.session_qs = false;
+  ctx.session_sh = false;
+  const bool use_sh = sh != nullptr && opts.sh_degree >= 0;
   if (!ctx.ok() || !ctx.qs_ok()) {
+    return false;
+  }
+  if (use_sh && (!ctx.sh_ok() || c != 3)) {
+    return false;
+  }
+  if (!use_sh && colors == nullptr) {
     return false;
   }
   const bool profile = std::getenv("TINYSPLAT_METAL_PROFILE") != nullptr;
@@ -2034,7 +2377,12 @@ bool gpu_forward_qs(const float* means, const float* log_scales, const float* qu
     blit_in(means_buf, means, static_cast<size_t>(n) * 3 * sizeof(float));
     blit_in(scales_buf, log_scales, static_cast<size_t>(n) * 3 * sizeof(float));
     blit_in(quats_buf, quats, static_cast<size_t>(n) * 4 * sizeof(float));
-    blit_in(color_buf, colors, static_cast<size_t>(n) * c * sizeof(float));
+    if (use_sh) {
+      id<MTLBuffer> sh_buf = ctx.acquire(ctx.sh, static_cast<NSUInteger>(n) * 48 * sizeof(float));
+      blit_in(sh_buf, sh, static_cast<size_t>(n) * 48 * sizeof(float));
+    } else {
+      blit_in(color_buf, colors, static_cast<size_t>(n) * c * sizeof(float));
+    }
     blit_in(opa_buf, opacities, static_cast<size_t>(n) * sizeof(float));
     blit_in(cam_buf, &cam, sizeof(CameraParams));
     const auto t1 = std::chrono::steady_clock::now();
@@ -2048,11 +2396,19 @@ bool gpu_forward_qs(const float* means, const float* log_scales, const float* qu
     [encp setBuffer:proj_buf offset:0 atIndex:4];
     dispatch_1d(encp, ctx.project_3d_qs_pipeline(), static_cast<NSUInteger>(n));
     [encp endEncoding];
+    if (use_sh) {
+      id<MTLComputeCommandEncoder> encs = [cmdp computeCommandEncoder];
+      [encs setBuffer:means_buf offset:0 atIndex:0];
+      [encs setBuffer:ctx.sh.buf offset:0 atIndex:1];
+      [encs setBuffer:cam_buf offset:0 atIndex:2];
+      [encs setBuffer:color_buf offset:0 atIndex:3];
+      dispatch_1d(encs, ctx.eval_sh_pipeline(), static_cast<NSUInteger>(n));
+      [encs endEncoding];
+    }
     [cmdp commit];
     [cmdp waitUntilCompleted];
     const auto t2 = std::chrono::steady_clock::now();
 
-    sort_projected_by_depth(proj_buf, n);
     TileBufs tiles = fast_cpu_tiles(ctx, proj_buf, n, h, w);
     const RasterParams params = make_raster_params(h, w, c, n);
     id<MTLBuffer> param_buf = ctx.acquire(ctx.params, sizeof(RasterParams));
@@ -2075,6 +2431,7 @@ bool gpu_forward_qs(const float* means, const float* log_scales, const float* qu
 
     ctx.session_valid = true;
     ctx.session_qs = true;
+    ctx.session_sh = use_sh;
     ctx.session_n = n;
     ctx.session_c = c;
     ctx.session_h = h;
@@ -2084,9 +2441,10 @@ bool gpu_forward_qs(const float* means, const float* log_scales, const float* qu
         return std::chrono::duration<double, std::milli>(b - a).count();
       };
       std::fprintf(stderr,
-                   "[tinysplat-metal] fwd_qs N=%d %dx%d blit=%.1fms project=%.1fms tiles=%.1fms "
+                   "[tinysplat-metal] fwd_qs%s N=%d %dx%d blit=%.1fms project+sh=%.1fms tiles=%.1fms "
                    "kernel=%.1fms total=%.1fms\n",
-                   n, w, h, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t0, t4));
+                   use_sh ? "_sh" : "", n, w, h, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4),
+                   ms(t0, t4));
     }
   }
   return true;
@@ -2099,6 +2457,7 @@ bool gpu_backward(const float* grad_output, const float* proj_means, const float
   auto& ctx = MetalContext::instance();
   ctx.session_valid = false;
   ctx.session_qs = false;
+  ctx.session_sh = false;
   if (ctx.backward_pipeline() == nil || ctx.project_2d_pipeline() == nil) {
     return false;
   }
@@ -2135,7 +2494,6 @@ bool gpu_backward(const float* grad_output, const float* proj_means, const float
     [encp endEncoding];
     [cmdp commit];
     [cmdp waitUntilCompleted];
-    sort_projected_by_depth(proj_buf, n);
 
     TileBufs tiles = fast_cpu_tiles(ctx, proj_buf, n, h, w);
 
@@ -2248,6 +2606,7 @@ bool gpu_session_backward(const float* grad_output, int n, int c, int h, int w,
     std::memcpy(grad_opacities, [gopa_buf contents], gopa_bytes);
     ctx.session_valid = false;
     ctx.session_qs = false;
+    ctx.session_sh = false;
     if (profile) {
       auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
       std::fprintf(stderr,
@@ -2261,12 +2620,20 @@ bool gpu_session_backward(const float* grad_output, int n, int c, int h, int w,
 
 bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int w,
                              float* grad_means3d, float* grad_log_scales, float* grad_quats,
-                             float* grad_colors, float* grad_opacities,
+                             float* grad_colors, float* grad_opacities, float* grad_sh,
                              const Splat3DMetalOptions& opts) {
   auto& ctx = MetalContext::instance();
   if (opts.force_cpu || !ctx.session_valid || !ctx.session_qs || ctx.session_n != n ||
       ctx.session_c != c || ctx.session_h != h || ctx.session_w != w ||
       ctx.backward_pipeline() == nil || ctx.vjp_qs_pipeline() == nil) {
+    return false;
+  }
+  const bool use_sh = ctx.session_sh;
+  if (use_sh) {
+    if (grad_sh == nullptr || !ctx.sh_ok() || ctx.sh.buf == nil) {
+      return false;
+    }
+  } else if (grad_colors == nullptr) {
     return false;
   }
   const bool profile = std::getenv("TINYSPLAT_METAL_PROFILE") != nullptr;
@@ -2284,6 +2651,7 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     const NSUInteger gm3_bytes = static_cast<NSUInteger>(n) * 3 * sizeof(float);
     const NSUInteger gls_bytes = static_cast<NSUInteger>(n) * 3 * sizeof(float);
     const NSUInteger gq_bytes = static_cast<NSUInteger>(n) * 4 * sizeof(float);
+    const NSUInteger dsh_bytes = static_cast<NSUInteger>(n) * 48 * sizeof(float);
     id<MTLBuffer> gm_buf = ctx.acquire(ctx.gm, gm_bytes);
     id<MTLBuffer> gcov_buf = ctx.acquire(ctx.gcov, gc_bytes);
     id<MTLBuffer> gcol_buf = ctx.acquire(ctx.gcol, gcol_bytes);
@@ -2291,11 +2659,15 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     id<MTLBuffer> gm3_buf = ctx.acquire(ctx.gm3, gm3_bytes);
     id<MTLBuffer> gls_buf = ctx.acquire(ctx.gls, gls_bytes);
     id<MTLBuffer> gq_buf = ctx.acquire(ctx.gq, gq_bytes);
+    id<MTLBuffer> dsh_buf = use_sh ? ctx.acquire(ctx.dsh, dsh_bytes) : nil;
     blit_in(go_buf, grad_output, static_cast<size_t>(h) * w * c * sizeof(float));
     std::memset([gm_buf contents], 0, gm_bytes);
     std::memset([gcov_buf contents], 0, gc_bytes);
     std::memset([gcol_buf contents], 0, gcol_bytes);
     std::memset([gopa_buf contents], 0, gopa_bytes);
+    if (use_sh) {
+      std::memset([dsh_buf contents], 0, dsh_bytes);
+    }
     const auto t1 = std::chrono::steady_clock::now();
 
     id<MTLCommandBuffer> cmd = [ctx.queue() commandBuffer];
@@ -2322,6 +2694,17 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     [encv setBuffer:gq_buf offset:0 atIndex:8];
     dispatch_1d(encv, ctx.vjp_qs_pipeline(), static_cast<NSUInteger>(n));
     [encv endEncoding];
+    if (use_sh) {
+      id<MTLComputeCommandEncoder> encs = [cmd computeCommandEncoder];
+      [encs setBuffer:ctx.means.buf offset:0 atIndex:0];
+      [encs setBuffer:ctx.sh.buf offset:0 atIndex:1];
+      [encs setBuffer:ctx.camera.buf offset:0 atIndex:2];
+      [encs setBuffer:gcol_buf offset:0 atIndex:3];
+      [encs setBuffer:gm3_buf offset:0 atIndex:4];
+      [encs setBuffer:dsh_buf offset:0 atIndex:5];
+      dispatch_1d(encs, ctx.sh_vjp_pipeline(), static_cast<NSUInteger>(n));
+      [encs endEncoding];
+    }
     [cmd commit];
     [cmd waitUntilCompleted];
     const auto t2 = std::chrono::steady_clock::now();
@@ -2329,18 +2712,23 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     std::memcpy(grad_means3d, [gm3_buf contents], gm3_bytes);
     std::memcpy(grad_log_scales, [gls_buf contents], gls_bytes);
     std::memcpy(grad_quats, [gq_buf contents], gq_bytes);
-    std::memcpy(grad_colors, [gcol_buf contents], gcol_bytes);
     std::memcpy(grad_opacities, [gopa_buf contents], gopa_bytes);
+    if (use_sh) {
+      std::memcpy(grad_sh, [dsh_buf contents], dsh_bytes);
+    } else {
+      std::memcpy(grad_colors, [gcol_buf contents], gcol_bytes);
+    }
     ctx.session_valid = false;
     ctx.session_qs = false;
+    ctx.session_sh = false;
     if (profile) {
       auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
       };
       std::fprintf(stderr,
-                   "[tinysplat-metal] bwd_session_qs N=%d %dx%d blit=%.1fms kernel+vjp=%.1fms "
+                   "[tinysplat-metal] bwd_session_qs%s N=%d %dx%d blit=%.1fms kernel+vjp=%.1fms "
                    "total=%.1fms\n",
-                   n, w, h, ms(t0, t1), ms(t1, t2), ms(t0, t2));
+                   use_sh ? "_sh" : "", n, w, h, ms(t0, t1), ms(t1, t2), ms(t0, t2));
     }
   }
   return true;
@@ -2403,7 +2791,28 @@ bool gaussian_splat_3d_forward_qs(const float* means, const float* log_scales, c
   if (metal_available()) {
     std::lock_guard<std::mutex> lock(ctx.mutex());
     if (gpu_forward_qs(means, log_scales, quats, colors, opacities, num_gaussians, num_channels,
-                       intrinsics, camera_to_world, height, width, output_host, opts)) {
+                       intrinsics, camera_to_world, height, width, output_host, opts, nullptr)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool gaussian_splat_3d_forward_qs_sh(const float* means, const float* log_scales, const float* quats,
+                                     const float* sh, const float* opacities, int num_gaussians,
+                                     int num_channels, const float* intrinsics,
+                                     const float* camera_to_world, int height, int width,
+                                     float* output_host, const Splat3DMetalOptions& opts) {
+  if (num_gaussians <= 0 || height <= 0 || width <= 0 || num_channels != 3 ||
+      output_host == nullptr || means == nullptr || log_scales == nullptr || quats == nullptr ||
+      sh == nullptr || opacities == nullptr || opts.sh_degree < 0) {
+    return false;
+  }
+  auto& ctx = MetalContext::instance();
+  if (metal_available()) {
+    std::lock_guard<std::mutex> lock(ctx.mutex());
+    if (gpu_forward_qs(means, log_scales, quats, nullptr, opacities, num_gaussians, num_channels,
+                       intrinsics, camera_to_world, height, width, output_host, opts, sh)) {
       return true;
     }
   }
@@ -2509,7 +2918,23 @@ bool gaussian_splat_3d_session_backward_qs(const float* grad_output, int num_gau
   std::lock_guard<std::mutex> lock(ctx.mutex());
   return gpu_session_backward_qs(grad_output, num_gaussians, num_channels, height, width,
                                  grad_means3d, grad_log_scales, grad_quats, grad_colors,
-                                 grad_opacities, opts);
+                                 grad_opacities, nullptr, opts);
+}
+
+bool gaussian_splat_3d_session_backward_qs_sh(
+    const float* grad_output, int num_gaussians, int num_channels, int height, int width,
+    float* grad_means3d, float* grad_log_scales, float* grad_quats, float* grad_sh,
+    float* grad_opacities, const Splat3DMetalOptions& opts) {
+  if (num_gaussians <= 0 || height <= 0 || width <= 0 || num_channels <= 0 ||
+      grad_output == nullptr || grad_means3d == nullptr || grad_log_scales == nullptr ||
+      grad_quats == nullptr || grad_sh == nullptr || grad_opacities == nullptr) {
+    return false;
+  }
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return gpu_session_backward_qs(grad_output, num_gaussians, num_channels, height, width,
+                                 grad_means3d, grad_log_scales, grad_quats, nullptr,
+                                 grad_opacities, grad_sh, opts);
 }
 
 bool count_footprint_hits(const float* proj_means, const float* proj_covs, const float* opacities,
@@ -2524,6 +2949,7 @@ bool count_footprint_hits(const float* proj_means, const float* proj_covs, const
     std::lock_guard<std::mutex> lock(ctx.mutex());
     ctx.session_valid = false;
     ctx.session_qs = false;
+    ctx.session_sh = false;
     @autoreleasepool {
       CameraParams cam =
           make_camera(nullptr, nullptr, num_gaussians, height, width, opts, false);

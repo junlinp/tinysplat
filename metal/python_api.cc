@@ -39,6 +39,24 @@ int tinysplat_metal_forward_qs(const float* means, const float* log_scales, cons
              : 0;
 }
 
+int tinysplat_metal_forward_qs_sh(const float* means, const float* log_scales, const float* quats,
+                                  const float* sh, const float* opacities, int n, int c,
+                                  const float* intrinsics, const float* c2w, int h, int w,
+                                  float* out, float near_plane, float min_cov, float sigma,
+                                  float beta, int use_cb, int sh_degree) {
+  tinysplat::metal::Splat3DMetalOptions opts;
+  opts.near_plane = near_plane;
+  opts.min_covariance = min_cov;
+  opts.sigma_radius = sigma;
+  opts.compact_box_beta = beta;
+  opts.use_compact_box = use_cb != 0;
+  opts.sh_degree = sh_degree;
+  return tinysplat::metal::gaussian_splat_3d_forward_qs_sh(means, log_scales, quats, sh, opacities,
+                                                           n, c, intrinsics, c2w, h, w, out, opts)
+             ? 1
+             : 0;
+}
+
 int tinysplat_metal_count_hits(const float* proj_means, const float* proj_covs,
                                const float* opacities, int n, int h, int w,
                                const uint8_t* error_mask, int* counts, float min_cov, float sigma,
@@ -104,6 +122,24 @@ int tinysplat_metal_session_backward_qs(const float* grad_output, int n, int c, 
   opts.force_cpu = force_cpu != 0;
   return tinysplat::metal::gaussian_splat_3d_session_backward_qs(
              grad_output, n, c, h, w, grad_means3d, grad_log_scales, grad_quats, grad_colors,
+             grad_opacities, opts)
+             ? 1
+             : 0;
+}
+
+int tinysplat_metal_session_backward_qs_sh(const float* grad_output, int n, int c, int h, int w,
+                                           float* grad_means3d, float* grad_log_scales,
+                                           float* grad_quats, float* grad_sh,
+                                           float* grad_opacities, float min_cov, float sigma,
+                                           float beta, int use_cb, int force_cpu) {
+  tinysplat::metal::Splat3DMetalOptions opts;
+  opts.min_covariance = min_cov;
+  opts.sigma_radius = sigma;
+  opts.compact_box_beta = beta;
+  opts.use_compact_box = use_cb != 0;
+  opts.force_cpu = force_cpu != 0;
+  return tinysplat::metal::gaussian_splat_3d_session_backward_qs_sh(
+             grad_output, n, c, h, w, grad_means3d, grad_log_scales, grad_quats, grad_sh,
              grad_opacities, opts)
              ? 1
              : 0;
