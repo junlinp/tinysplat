@@ -95,10 +95,11 @@ def test_densify_prune_low_opacity_with_budget():
     prune = prune_mask_fastgs_densify(
         opa, log_scales, scores, scene_scale=1.0, cfg=cfg, size_threshold=None
     )
-    # Official samples budget=1 from scored Gaussians, then ANDs with the low-opa set.
-    # The healthy Gaussian is never pruned; at most one low-opa row is removed.
-    assert int(prune.sum().item()) <= 1
+    # 3 low-opacity candidates, budget = int(0.5 * 3) = 1, sampled among the
+    # candidates -- so exactly one is removed, never the healthy Gaussian.
+    assert int(prune.sum().item()) == 1
     assert prune[-1].item() is False
+    assert bool((prune & (torch.sigmoid(opa) >= 0.005)).any().item()) is False
 
 
 def test_densify_prune_screen_and_scale_after_reset():
@@ -116,8 +117,9 @@ def test_densify_prune_screen_and_scale_after_reset():
         max_radii2d=radii,
         size_threshold=20.0,
     )
-    # 2 candidates (huge scale + 40px), budget = 1; official AND can drop the sample.
-    assert int(prune.sum().item()) <= 1
+    # 2 candidates (huge scale + 40px), budget = int(0.5 * 2) = 1, sampled among
+    # the candidates -- exactly one goes, and never the healthy small Gaussian.
+    assert int(prune.sum().item()) == 1
     assert prune[0].item() is False
 
 
@@ -134,6 +136,28 @@ def test_densify_prune_does_not_prefer_unscored_new_gaussians():
     assert prune[2].item() is False
     assert prune[3].item() is False
     assert int(prune[:2].sum().item()) == 2
+
+
+def test_densify_prune_hits_budget_when_candidates_are_a_small_minority():
+    """Budget must be sampled among candidates, not the whole population.
+
+    Drawing from all N and intersecting afterwards silently loses most of the
+    budget once candidates are a small fraction of the scene -- the regression
+    that let low-opacity Gaussians accumulate through training.
+    """
+    cfg = FastGSConfig(prune_opacity_early=0.005, vcp_subsample_frac=0.5)
+    torch.manual_seed(0)
+    n, n_low = 20_000, 1_600
+    opa = torch.full((n,), 0.3)
+    opa[:n_low] = 0.001
+    log_scales = torch.full((n, 3), math.log(0.02))
+    scores = torch.rand(n)
+    prune = prune_mask_fastgs_densify(
+        torch.logit(opa), log_scales, scores, scene_scale=1.0, cfg=cfg, size_threshold=None
+    )
+    assert int(prune.sum().item()) == n_low // 2
+    # Only ever the low-opacity set.
+    assert int(prune[n_low:].sum().item()) == 0
 
 
 def test_late_vcp_uses_opacity_and_score_threshold():

@@ -225,7 +225,8 @@ def prune_mask_fastgs_densify(
             prune = prune | (max_scale > cfg.prune_scale3d * scene_scale)
 
     n = prune.numel()
-    to_remove = int(prune.sum().item())
+    cand_idx = torch.nonzero(prune, as_tuple=False).reshape(-1)
+    to_remove = int(cand_idx.numel())
     budget = int(cfg.vcp_subsample_frac * to_remove)
     if budget <= 0:
         return torch.zeros_like(prune)
@@ -242,9 +243,19 @@ def prune_mask_fastgs_densify(
     if n_score > 0:
         weights[:n_score] = 1.0 / (1e-6 + scores[:n_score])
     weights = torch.clamp(weights, min=0.0)
-    if float(weights.sum().item()) <= 0:
+
+    # Sample the budget *among the prune candidates only*. Drawing from the full
+    # population and intersecting afterwards throws most of the budget away: with
+    # 8k candidates in 100k Gaussians it removed ~8% of the intended count, so
+    # low-opacity Gaussians accumulated instead of being cleaned up.
+    cand_weights = weights[cand_idx]
+    nonzero = int((cand_weights > 0).sum().item())
+    if nonzero <= 0:
         return torch.zeros_like(prune)
-    sampled_idx = torch.multinomial(weights, num_samples=min(budget, n), replacement=False)
-    sampled = torch.zeros_like(prune)
-    sampled[sampled_idx] = True
-    return prune & sampled
+    # multinomial without replacement only avoids zero-weight entries while the
+    # draw count stays within their number; clamp so unscored children survive.
+    num_samples = min(budget, nonzero)
+    sampled_local = torch.multinomial(cand_weights, num_samples=num_samples, replacement=False)
+    out = torch.zeros_like(prune)
+    out[cand_idx[sampled_local]] = True
+    return out
