@@ -76,11 +76,32 @@ bool gaussian_splat_3d_projected_backward(
     int width, float* grad_proj_means, float* grad_proj_covs, float* grad_colors,
     float* grad_opacities, const Splat3DMetalOptions& opts = {}, const float* depths = nullptr);
 
-/// Count high-error pixels in each Gaussian footprint across one view (FastGS VCD/VCP).
+/// Count high-error pixels in each Gaussian footprint across one view (legacy AABB walk).
 /// error_mask: H*W uint8 (1 = high error). Writes counts[N].
 bool count_footprint_hits(const float* proj_means, const float* proj_covs, const float* opacities,
                           int num_gaussians, int height, int width, const uint8_t* error_mask,
                           int* counts, const Splat3DMetalOptions& opts = {});
+
+/// FastGS metric pass: count Gaussians that composited into high-error pixels in the
+/// last forward session (same tile list / compact boxes as the render). Does not
+/// invalidate the session. error_mask: H*W uint8. Writes counts[N].
+bool count_session_metric_hits(const uint8_t* error_mask, int* counts, int num_gaussians,
+                               int height, int width);
+
+/// Number of Gaussians in the last 2D mean-grad snapshot (0 if none).
+int last_grad_means2d_count();
+
+/// Copy last 2D mean grads (N,2) from the most recent session backward into out.
+/// Returns N on success, 0 if none / max_n too small.
+int copy_last_grad_means2d(float* out, int max_n);
+
+/// AbsGS snapshot: per-pixel |dL/dmean2d| summed over the last backward (N,2).
+int last_grad_means2d_abs_count();
+int copy_last_grad_means2d_abs(float* out, int max_n);
+
+/// Compact-box radii (pixels) from the last forward session (N).
+int last_radii2d_count();
+int copy_last_radii2d(float* out, int max_n);
 
 }  // namespace metal
 }  // namespace tinysplat

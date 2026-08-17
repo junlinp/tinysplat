@@ -59,7 +59,17 @@ def main() -> int:
         return 1
 
     params = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    gauss_data = GaussianData(params, device)
+    sh_degree = 0
+    if "sh_degree" in params:
+        sh_val = params["sh_degree"]
+        sh_degree = int(sh_val.item() if hasattr(sh_val, "item") else sh_val)
+    elif params.get("sh_coeffs") is not None:
+        sh_degree = 3
+    gauss_data = GaussianData(params, device, sh_degree=sh_degree)
+    if gauss_data.sh_coeffs is not None:
+        gauss_data.active_sh_degree = (
+            sh_degree if sh_degree > 0 else gauss_data.max_sh_degree
+        )
     metrics = evaluate_heldout(
         gauss_data,
         eval_frames,

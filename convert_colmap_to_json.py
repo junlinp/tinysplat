@@ -196,6 +196,57 @@ def colmap_image_to_c2w(image: ImageRecord) -> List[List[float]]:
     ]
 
 
+def image_width_height(path: Path) -> Tuple[int, int]:
+    """Return (width, height) for JPEG/PNG without decoding pixels."""
+    with path.open("rb") as fid:
+        sig = fid.read(8)
+        if sig.startswith(b"\xff\xd8"):
+            fid.seek(2)
+            while True:
+                marker = fid.read(2)
+                if len(marker) < 2 or marker[0] != 0xFF:
+                    raise ValueError(f"Could not parse JPEG size: {path}")
+                code = marker[1]
+                if code in (0xD8, 0xD9) or 0xD0 <= code <= 0xD7:
+                    continue
+                seglen_bytes = fid.read(2)
+                if len(seglen_bytes) < 2:
+                    raise ValueError(f"Could not parse JPEG size: {path}")
+                seglen = struct.unpack(">H", seglen_bytes)[0]
+                if code in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    sof = fid.read(5)
+                    if len(sof) < 5:
+                        raise ValueError(f"Could not parse JPEG size: {path}")
+                    _prec, height, width = struct.unpack(">BHH", sof)
+                    return int(width), int(height)
+                fid.seek(seglen - 2, 1)
+        if sig == b"\x89PNG\r\n\x1a\n":
+            fid.seek(16)
+            wh = fid.read(8)
+            if len(wh) < 8:
+                raise ValueError(f"Could not parse PNG size: {path}")
+            width, height = struct.unpack(">II", wh)
+            return int(width), int(height)
+    raise ValueError(f"Unsupported image type for size probe: {path}")
+
+
+def scale_intrinsics_to_image(
+    intrinsics: Dict[str, object], cam_width: int, cam_height: int, img_width: int, img_height: int
+) -> Dict[str, object]:
+    if cam_width <= 0 or cam_height <= 0:
+        return intrinsics
+    if img_width == cam_width and img_height == cam_height:
+        return intrinsics
+    sx = img_width / float(cam_width)
+    sy = img_height / float(cam_height)
+    scaled = dict(intrinsics)
+    scaled["fx"] = float(intrinsics["fx"]) * sx
+    scaled["fy"] = float(intrinsics["fy"]) * sy
+    scaled["cx"] = float(intrinsics["cx"]) * sx
+    scaled["cy"] = float(intrinsics["cy"]) * sy
+    return scaled
+
+
 def parse_intrinsics(camera: Camera) -> Dict[str, object]:
     params = camera.params
     model = camera.model_name
@@ -245,6 +296,7 @@ def build_dataset_json(
     else:
         points3d = []
 
+    scaled_from = None
     frames = []
     for image in sorted(images.values(), key=lambda item: item.name):
         camera = cameras[image.camera_id]
@@ -252,6 +304,12 @@ def build_dataset_json(
         image_path = images_dir / image.name
         if not image_path.exists():
             raise FileNotFoundError(f"Referenced image does not exist: {image_path}")
+        img_w, img_h = image_width_height(image_path)
+        if img_w != camera.width or img_h != camera.height:
+            scaled_from = (camera.width, camera.height, img_w, img_h)
+        intrinsics = scale_intrinsics_to_image(
+            intrinsics, camera.width, camera.height, img_w, img_h
+        )
 
         frames.append(
             {
@@ -259,8 +317,8 @@ def build_dataset_json(
                 "camera_id": image.camera_id,
                 "file_path": str(image_path.relative_to(scene_dir)),
                 "camera_model": camera.model_name,
-                "width": camera.width,
-                "height": camera.height,
+                "width": img_w,
+                "height": img_h,
                 "intrinsics": intrinsics,
                 "transform_matrix": colmap_image_to_c2w(image),
                 "colmap": {
@@ -268,6 +326,12 @@ def build_dataset_json(
                     "tvec": list(image.tvec),
                 },
             }
+        )
+
+    if scaled_from is not None:
+        cam_w, cam_h, img_w, img_h = scaled_from
+        print(
+            f"Scaled COLMAP cameras {cam_w}x{cam_h} to JPEG size {img_w}x{img_h}"
         )
 
     return {

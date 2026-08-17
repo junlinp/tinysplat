@@ -190,6 +190,36 @@ def _load_lib():
         ctypes.c_int,
     ]
     lib.tinysplat_metal_session_backward_qs_sh.restype = ctypes.c_int
+    if hasattr(lib, "tinysplat_metal_last_grad_means2d"):
+        lib.tinysplat_metal_last_grad_means2d_n.restype = ctypes.c_int
+        lib.tinysplat_metal_last_grad_means2d.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+        ]
+        lib.tinysplat_metal_last_grad_means2d.restype = ctypes.c_int
+    if hasattr(lib, "tinysplat_metal_session_count_hits"):
+        lib.tinysplat_metal_session_count_hits.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        lib.tinysplat_metal_session_count_hits.restype = ctypes.c_int
+    if hasattr(lib, "tinysplat_metal_last_grad_means2d_abs"):
+        lib.tinysplat_metal_last_grad_means2d_abs_n.restype = ctypes.c_int
+        lib.tinysplat_metal_last_grad_means2d_abs.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+        ]
+        lib.tinysplat_metal_last_grad_means2d_abs.restype = ctypes.c_int
+    if hasattr(lib, "tinysplat_metal_last_radii2d"):
+        lib.tinysplat_metal_last_radii2d_n.restype = ctypes.c_int
+        lib.tinysplat_metal_last_radii2d.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int,
+        ]
+        lib.tinysplat_metal_last_radii2d.restype = ctypes.c_int
     _lib = lib
     return _lib
 
@@ -633,6 +663,81 @@ def count_footprint_hits(
     if not ok:
         return None
     return counts.to(dtype=torch.int64)
+
+
+def count_session_hits(
+    error_mask: torch.Tensor,
+    num_gaussians: int,
+    height: int,
+    width: int,
+) -> Optional[torch.Tensor]:
+    """FastGS compositor counts from the last Metal forward session, or None."""
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "tinysplat_metal_session_count_hits"):
+        return None
+    mask = error_mask.detach()
+    if mask.dtype != torch.uint8:
+        mask = mask.to(dtype=torch.uint8)
+    mask = mask.contiguous()
+    if mask.device.type != "cpu":
+        mask = mask.cpu().contiguous()
+    mask = mask.view(-1)
+    counts = torch.zeros(int(num_gaussians), dtype=torch.int32)
+    ok = lib.tinysplat_metal_session_count_hits(
+        _u8_ptr(mask),
+        _i32_ptr(counts),
+        int(num_gaussians),
+        int(height),
+        int(width),
+    )
+    if not ok:
+        return None
+    return counts.to(dtype=torch.int64)
+
+
+def last_grad_means2d() -> Optional[torch.Tensor]:
+    """Per-splat 2D mean grads (N,2) from the last Metal session backward, or None."""
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "tinysplat_metal_last_grad_means2d"):
+        return None
+    n = int(lib.tinysplat_metal_last_grad_means2d_n())
+    if n <= 0:
+        return None
+    out = torch.zeros(n * 2, dtype=torch.float32)
+    got = int(lib.tinysplat_metal_last_grad_means2d(_f32_ptr(out), n))
+    if got != n:
+        return None
+    return out.view(n, 2)
+
+
+def last_grad_means2d_abs() -> Optional[torch.Tensor]:
+    """AbsGS per-splat |dL/dmean2d| sums (N,2) from the last Metal backward, or None."""
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "tinysplat_metal_last_grad_means2d_abs"):
+        return None
+    n = int(lib.tinysplat_metal_last_grad_means2d_abs_n())
+    if n <= 0:
+        return None
+    out = torch.zeros(n * 2, dtype=torch.float32)
+    got = int(lib.tinysplat_metal_last_grad_means2d_abs(_f32_ptr(out), n))
+    if got != n:
+        return None
+    return out.view(n, 2)
+
+
+def last_radii2d() -> Optional[torch.Tensor]:
+    """Compact-box radii in pixels (N,) from the last Metal forward, or None."""
+    lib = _load_lib()
+    if lib is None or not hasattr(lib, "tinysplat_metal_last_radii2d"):
+        return None
+    n = int(lib.tinysplat_metal_last_radii2d_n())
+    if n <= 0:
+        return None
+    out = torch.zeros(n, dtype=torch.float32)
+    got = int(lib.tinysplat_metal_last_radii2d(_f32_ptr(out), n))
+    if got != n:
+        return None
+    return out
 
 
 class _MetalSplat3DFn(torch.autograd.Function):

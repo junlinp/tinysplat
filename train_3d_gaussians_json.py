@@ -37,10 +37,18 @@ try:
         densify_mask_vcd,
         high_error_mask,
         photometric_loss_value,
+        prune_mask_fastgs_densify,
         prune_mask_vcp,
         should_step_optimizer,
+        split_child_log_scales,
     )
-    from tinysplat.metal_backend import count_footprint_hits, metal_available
+    from tinysplat.metal_backend import (
+        count_session_hits,
+        last_grad_means2d,
+        last_grad_means2d_abs,
+        last_radii2d,
+        metal_available,
+    )
     from tinysplat.sh import colors_from_sh, init_sh_from_rgb, sh_degree_from_step
 
     _HAS_FASTGS = True
@@ -49,6 +57,28 @@ except ImportError:
 
     def metal_available():
         return False
+
+    def last_grad_means2d():
+        return None
+
+    def last_grad_means2d_abs():
+        return None
+
+    def last_radii2d():
+        return None
+
+    def count_session_hits(*args, **kwargs):
+        return None
+
+    def screen_frac_from_proj_covs(proj_covs, height, width):
+        return torch.zeros(proj_covs.shape[0], device=proj_covs.device)
+
+    def split_child_log_scales(log_scales: torch.Tensor, shrink: float) -> torch.Tensor:
+        scale = float(shrink)
+        if scale <= 0:
+            scale = 0.8
+        delta = math.log(scale) if scale < 1.0 else -math.log(scale)
+        return log_scales + delta
 
 try:
     from gsplat.strategy.default import DefaultStrategy
@@ -237,7 +267,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("dataset_json", type=Path, help="Path to the JSON dataset file.")
     parser.add_argument("--iterations", type=int, default=500, help="Number of optimization steps.")
-    parser.add_argument("--lr", type=float, default=5e-2, help="Adam learning rate.")
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1.0,
+        help="Global multiplier on 3DGS per-parameter Adam rates (default 1.0).",
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -332,8 +367,15 @@ def parse_args():
     parser.add_argument(
         "--densify-grad-thresh",
         type=float,
-        default=8e-4,
-        help="Split/duplicate gaussians whose mean gradient norm exceeds this value.",
+        default=None,
+        help="Split/duplicate gaussians whose mean gradient norm exceeds this value. "
+        "Default 8e-4 (nerfstudio) or 2e-4 with --fastgs.",
+    )
+    parser.add_argument(
+        "--densify-grad-abs-thresh",
+        type=float,
+        default=None,
+        help="FastGS AbsGS split threshold (official truck 0.0009, code default 0.0012).",
     )
     parser.add_argument(
         "--prune-opacity-thresh",
@@ -357,7 +399,8 @@ def parse_args():
         "--split-scale-shrink",
         type=float,
         default=0.8,
-        help="Scale shrink factor applied to split gaussians.",
+        help="Scale shrink for split children: <1 multiplies (nerfstudio 0.8), >=1 divides. "
+        "With --fastgs the 0.8 default is replaced by 3DGS /1.6.",
     )
     parser.add_argument(
         "--use-scale-regularization",
@@ -415,7 +458,7 @@ def parse_args():
     parser.add_argument(
         "--fastgs",
         action="store_true",
-        help="Enable FastGS VCD/VCP densify/prune + 3DGS-accel optimizer skip (Metal footprint counts).",
+        help="Enable FastGS VCD/VCP densify/prune (official compositor scoring + AbsGS split).",
     )
     parser.add_argument(
         "--sh-degree",
@@ -563,6 +606,15 @@ def _pose_centers_bbox(frames: List[FrameSample], dtype: torch.dtype, device: to
     return bbox_min - eps, bbox_max + eps
 
 
+def scene_scale_from_frames(frames: List[FrameSample]) -> float:
+    """3DGS cameras_extent: 1.1 × max camera distance from the camera centroid."""
+    if not frames:
+        return 1.0
+    centers = torch.stack([frame.camera_to_world[:3, 3] for frame in frames], dim=0)
+    radius = (centers - centers.mean(dim=0)).norm(dim=-1).max()
+    return max(float(radius.item()) * 1.1, 1e-3)
+
+
 def build_pose_bbox_gaussians_3d(
     target: torch.Tensor,
     frames: List[FrameSample],
@@ -633,20 +685,36 @@ def build_sparse_points_gaussians_3d(
 
     n = xyz.shape[0]
     if n < 2:
-        scales = torch.full((n, 3), 0.05, dtype=dtype, device=device)
+        scales = torch.full((n, 3), 0.01, dtype=dtype, device=device)
     else:
-        # Memory-safe nearest-neighbor distance estimate using sampled references.
-        ref_n = min(2048, n)
-        ref_idx = torch.randperm(n, device=device)[:ref_n]
-        refs = xyz[ref_idx]
-        nn = torch.full((n,), 1e9, dtype=dtype, device=device)
-        chunk = 8192
-        for st in range(0, n, chunk):
-            ed = min(st + chunk, n)
-            d = torch.cdist(xyz[st:ed], refs)
-            nn[st:ed] = d.min(dim=1).values
-        base = torch.clamp(nn, min=1e-3, max=1.0).unsqueeze(1)
-        scales = base.repeat(1, 3)
+        # 3DGS: log(sqrt(mean squared distance to 3 nearest neighbors)).
+        nn = None
+        try:
+            from scipy.spatial import cKDTree
+
+            pts = xyz.detach().cpu().numpy()
+            k = int(min(4, n))
+            dist, _ = cKDTree(pts).query(pts, k=k)
+            dist = np.asarray(dist, dtype=np.float64)
+            if dist.ndim == 1:
+                nn_np = dist
+            else:
+                nn_np = dist[:, 1:].mean(axis=1)
+            nn = torch.tensor(nn_np, dtype=dtype, device=device)
+        except Exception:
+            ref_n = min(4096, n)
+            ref_idx = torch.randperm(n, device=device)[:ref_n]
+            refs = xyz[ref_idx]
+            nn = torch.full((n,), 1e9, dtype=dtype, device=device)
+            chunk = 8192
+            for st in range(0, n, chunk):
+                ed = min(st + chunk, n)
+                nn[st:ed] = torch.cdist(xyz[st:ed], refs).min(dim=1).values
+        med = xyz.median(dim=0).values
+        radius = (xyz - med).norm(dim=-1)
+        max_init = max(float(torch.quantile(radius, 0.5).item()) * 0.02, 1e-3)
+        base = torch.clamp(nn, min=1e-7, max=max_init)
+        scales = base.unsqueeze(1).repeat(1, 3)
 
     log_scales = torch.log(scales)
     rotations = torch.zeros(n, 4, dtype=dtype, device=device)
@@ -711,6 +779,13 @@ def load_frame_image(
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     height, width = image_rgb.shape[:2]
     intrinsics = frame.intrinsics.clone()
+    if frame.width > 0 and frame.height > 0 and (width != frame.width or height != frame.height):
+        sx = width / float(frame.width)
+        sy = height / float(frame.height)
+        intrinsics[0, 0] *= sx
+        intrinsics[0, 2] *= sx
+        intrinsics[1, 1] *= sy
+        intrinsics[1, 2] *= sy
 
     if max_resolution > 0 and max(height, width) > max_resolution:
         scale = max_resolution / max(height, width)
@@ -1104,18 +1179,60 @@ def save_ply(
     PlyData([el], byte_order="<").write(str(output_path))
 
 
-def build_optimizers(data: GaussianData, lr: float):
+# 3DGS / FastGS per-parameter Adam rates (multiplied by --lr).
+_MEANS_LR_INIT = 1.6e-4
+_MEANS_LR_FINAL = 1.6e-6
+_SCALES_LR = 5e-3
+_QUATS_LR = 1e-3
+_OPACITY_LR = 5e-2
+_SH_LR = 2.5e-3
+_SH_REST_GRAD_SCALE = 0.05  # rest / 20 relative to DC
+
+
+def expon_lr(step: int, lr_init: float, lr_final: float, max_steps: int) -> float:
+    """3DGS log-linear decay from lr_init to lr_final over max_steps."""
+    if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+        return 0.0
+    t = min(max(float(step) / float(max(max_steps, 1)), 0.0), 1.0)
+    return math.exp(math.log(max(lr_init, 1e-16)) * (1.0 - t) + math.log(max(lr_final, 1e-16)) * t)
+
+
+def means_lr_at(step: int, scene_scale: float, max_steps: int, lr_scale: float = 1.0) -> float:
+    extent = max(float(scene_scale), 1e-3)
+    return expon_lr(
+        step,
+        _MEANS_LR_INIT * extent * lr_scale,
+        _MEANS_LR_FINAL * extent * lr_scale,
+        max_steps,
+    )
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def build_optimizers(
+    data: GaussianData,
+    scene_scale: float,
+    step: int = 0,
+    max_steps: int = 30000,
+    lr_scale: float = 1.0,
+):
     adam_kw = {"foreach": True}
+    scale = float(lr_scale)
     opts = {
-        "means": torch.optim.Adam([data.means], lr=lr * 0.1, **adam_kw),
-        "scales": torch.optim.Adam([data.log_scales], lr=lr, **adam_kw),
-        "quats": torch.optim.Adam([data.rotations], lr=lr, **adam_kw),
-        "opacities": torch.optim.Adam([data.opacities], lr=lr, **adam_kw),
+        "means": torch.optim.Adam(
+            [data.means], lr=means_lr_at(step, scene_scale, max_steps, scale), **adam_kw
+        ),
+        "scales": torch.optim.Adam([data.log_scales], lr=_SCALES_LR * scale, **adam_kw),
+        "quats": torch.optim.Adam([data.rotations], lr=_QUATS_LR * scale, **adam_kw),
+        "opacities": torch.optim.Adam([data.opacities], lr=_OPACITY_LR * scale, **adam_kw),
     }
     if data.sh_coeffs is not None:
-        opts["sh"] = torch.optim.Adam([data.sh_coeffs], lr=lr, **adam_kw)
+        opts["sh"] = torch.optim.Adam([data.sh_coeffs], lr=_SH_LR * scale, **adam_kw)
     else:
-        opts["colors"] = torch.optim.Adam([data.colors], lr=lr, **adam_kw)
+        opts["colors"] = torch.optim.Adam([data.colors], lr=_SH_LR * scale, **adam_kw)
     return opts
 
 
@@ -1124,9 +1241,103 @@ def zero_optimizers(optimizers):
         opt.zero_grad(set_to_none=True)
 
 
+def scale_sh_rest_grads(data: GaussianData) -> None:
+    """3DGS: higher-order SH steps 20× slower than DC without splitting the tensor."""
+    if data.sh_coeffs is not None and data.sh_coeffs.grad is not None:
+        data.sh_coeffs.grad[:, 1:, :] *= _SH_REST_GRAD_SCALE
+
+
 def step_optimizers(optimizers):
     for opt in optimizers.values():
         opt.step()
+
+
+@torch.no_grad()
+def sanitize_gaussians(data: GaussianData, scene_scale: float) -> None:
+    """Drop non-finite params, clamp scales, and renormalize quaternions."""
+    max_log = math.log(max(0.1 * float(scene_scale), 1e-4))
+    min_log = math.log(1e-6)
+    for tensor in data.parameters():
+        bad = ~torch.isfinite(tensor)
+        if bool(bad.any().item()):
+            tensor.data[bad] = 0.0
+    data.log_scales.clamp_(min=min_log, max=max_log)
+    data.rotations.copy_(F.normalize(data.rotations, dim=-1))
+
+
+def _tensor_pstats(x: torch.Tensor) -> Tuple[float, float, float]:
+    """Return (p50, p90, max) for a 1D tensor; zeros if empty. CPU quantile (MPS is NaN-prone)."""
+    x = x.detach().float().reshape(-1)
+    x = x[torch.isfinite(x)]
+    if x.numel() == 0:
+        return 0.0, 0.0, 0.0
+    x = x.cpu()
+    return (
+        float(torch.quantile(x, 0.5).item()),
+        float(torch.quantile(x, 0.9).item()),
+        float(x.max().item()),
+    )
+
+
+def remap_optimizers_after_densify(
+    old_optimizers,
+    data: "GaussianData",
+    keep_idx: torch.Tensor,
+    n_new: int,
+    step: int,
+    scene_scale: float,
+    max_steps: int,
+    lr_scale: float,
+):
+    """Rebuild Adam but copy exp_avg/exp_avg_sq for surviving rows; zeros for new Gaussians."""
+    new_opts = build_optimizers(
+        data, scene_scale=scene_scale, step=step, max_steps=max_steps, lr_scale=lr_scale
+    )
+    keep_idx = keep_idx.long()
+    n_keep = int(keep_idx.numel())
+    for name, new_opt in new_opts.items():
+        old_opt = old_optimizers.get(name)
+        if old_opt is None:
+            continue
+        old_p = old_opt.param_groups[0]["params"][0]
+        old_st = old_opt.state.get(old_p)
+        if not old_st:
+            continue
+        new_p = new_opt.param_groups[0]["params"][0]
+        if new_p.shape[0] != n_keep + n_new:
+            continue
+        new_st = new_opt.state[new_p]
+        for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            if key not in old_st:
+                continue
+            src = old_st[key]
+            dst = torch.zeros_like(new_p)
+            if n_keep > 0:
+                dst[:n_keep] = src[keep_idx]
+            new_st[key] = dst
+        if "step" in old_st:
+            new_st["step"] = old_st["step"]
+    return new_opts
+
+
+def reset_opacity_adam(optimizers) -> None:
+    """Zero Adam moments for opacity only (3DGS opacity reset)."""
+    opt = optimizers.get("opacities")
+    if opt is None:
+        return
+    p = opt.param_groups[0]["params"][0]
+    st = opt.state.get(p)
+    if not st:
+        return
+    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+        if key in st and torch.is_tensor(st[key]):
+            st[key].zero_()
+    if "step" in st:
+        step = st["step"]
+        if torch.is_tensor(step):
+            step.zero_()
+        else:
+            st["step"] = 0
 
 
 @torch.no_grad()
@@ -1140,29 +1351,51 @@ def densify_and_prune_fastgs(
     max_gaussians: int,
     max_resolution: int = 0,
     ssim_fn=None,
-) -> bool:
-    """FastGS VCD densify + VCP prune using Metal footprint hit counts."""
+    do_densify: bool = True,
+    do_prune: bool = True,
+    scene_scale: float = 1.0,
+    absgrad_accum: Optional[torch.Tensor] = None,
+    grad3d_accum: Optional[torch.Tensor] = None,
+    max_radii2d: Optional[torch.Tensor] = None,
+    size_threshold: Optional[float] = None,
+) -> Tuple[bool, torch.Tensor, int]:
+    """Official FastGS densify/prune: compositor VCD, AbsGS split, 20px/opacity prune."""
     if not _HAS_FASTGS:
         raise RuntimeError("FastGS helpers are not available")
     n = data.num_gaussians
+    device = data.device
+    orig_idx = torch.arange(n, device=device)
     means = data.means.detach().clone()
     log_scales = data.log_scales.detach().clone()
     rotations = data.rotations.detach().clone()
     colors = data.colors.detach().clone()
     opacities = data.opacities.detach().clone()
     sh_coeffs = data.sh_coeffs.detach().clone() if data.sh_coeffs is not None else None
-    grad_norms = grad_accum.detach() / torch.clamp(vis_count.detach(), min=1.0)
+    vis = torch.clamp(vis_count.detach(), min=1.0)
+    grad_norms = torch.nan_to_num(grad_accum.detach() / vis, nan=0.0, posinf=0.0, neginf=0.0)
     if grad_norms.numel() != n:
-        grad_norms = torch.zeros(n, device=data.device)
+        grad_norms = torch.zeros(n, device=device)
+    abs_grad_norms = None
+    if absgrad_accum is not None and absgrad_accum.numel() == n:
+        abs_grad_norms = torch.nan_to_num(
+            absgrad_accum.detach() / vis, nan=0.0, posinf=0.0, neginf=0.0
+        )
+    grad3d_norms = None
+    if grad3d_accum is not None and grad3d_accum.numel() == n:
+        grad3d_norms = torch.nan_to_num(grad3d_accum.detach() / vis, nan=0.0, posinf=0.0, neginf=0.0)
+    radii = torch.zeros(n, device=device)
+    if max_radii2d is not None and max_radii2d.numel() == n:
+        radii = max_radii2d.detach().to(device=device, dtype=means.dtype)
 
     k = min(cfg.k_views, len(frames))
     view_idx = torch.randperm(len(frames))[:k].tolist()
     counts_list = []
     photo_list = []
+    n_session_ok = 0
     for vi in view_idx:
         frame = frames[vi]
         target, intrinsics, height, width = load_frame_image(
-            frame, device=str(data.device), max_resolution=max_resolution
+            frame, device=str(device), max_resolution=max_resolution
         )
         rendered = data.render(
             intrinsics=intrinsics,
@@ -1171,24 +1404,12 @@ def densify_and_prune_fastgs(
             width=width,
         ).detach()
         mask = high_error_mask(rendered, target, cfg.error_tau)
-        covs = data.covariance_matrices().detach()
-        proj_means, proj_covs, _, vis = project_gaussians_3d_to_2d(
-            means, covs, intrinsics, frame.camera_to_world
-        )
-        opa = torch.sigmoid(opacities)
-        hits = count_footprint_hits(
-            proj_means.cpu(),
-            proj_covs.cpu(),
-            opa.cpu(),
-            height,
-            width,
-            mask.cpu(),
-        )
+        hits = count_session_hits(mask, n, height, width)
         if hits is None:
-            # Fallback: zero scores (skip densify this round)
             hits = torch.zeros(n, dtype=torch.int64)
-        hits = hits.to(data.device)
-        hits = hits * vis.to(hits.dtype)
+        else:
+            n_session_ok += 1
+            hits = hits.to(device)
         counts_list.append(hits)
         photo_list.append(
             photometric_loss_value(rendered, target, ssim_fn, cfg.ssim_lambda)
@@ -1196,35 +1417,62 @@ def densify_and_prune_fastgs(
 
     vcd = accumulate_vcd_scores(counts_list)
     vcp = accumulate_vcp_scores(counts_list, photo_list)
-    clone_mask, split_mask = densify_mask_vcd(vcd, grad_norms, log_scales, cfg)
-    prune = prune_mask_vcp(vcp, opacities, step, cfg)
+    clone_mask = torch.zeros(n, dtype=torch.bool, device=device)
+    split_mask = torch.zeros(n, dtype=torch.bool, device=device)
+    if do_densify:
+        clone_mask, split_mask = densify_mask_vcd(
+            vcd,
+            grad_norms,
+            log_scales,
+            cfg,
+            scene_scale=scene_scale,
+            abs_grad_norms=abs_grad_norms,
+        )
 
-    # Apply prune first
-    if prune.any() and not prune.all():
-        keep = ~prune
-        means, log_scales, rotations = means[keep], log_scales[keep], rotations[keep]
-        colors, opacities = colors[keep], opacities[keep]
-        if sh_coeffs is not None:
-            sh_coeffs = sh_coeffs[keep]
-        clone_mask, split_mask = clone_mask[keep], split_mask[keep]
-        grad_norms = grad_norms[keep]
+    opa_sig = torch.sigmoid(opacities)
+    max_scale = torch.exp(log_scales).max(dim=-1).values
+    n_clone = int(clone_mask.sum().item())
+    n_split = int(split_mask.sum().item())
+    vcd_p50, vcd_p90, vcd_max = _tensor_pstats(vcd)
+    vcd_frac = float((vcd > cfg.densify_score_thresh).float().mean().item())
+    g2d_p50, g2d_p90, g2d_max = _tensor_pstats(grad_norms)
+    abs_p50, abs_p90, abs_max = _tensor_pstats(
+        abs_grad_norms if abs_grad_norms is not None else torch.zeros(0, device=device)
+    )
+    g3d_p50, g3d_p90, g3d_max = _tensor_pstats(
+        grad3d_norms if grad3d_norms is not None else torch.zeros(0, device=device)
+    )
+    sc_p50, sc_p90, sc_max = _tensor_pstats(max_scale)
+    vis_mean = float(vis.mean().item())
+    vis_frac = float((vis_count.detach() > 0).float().mean().item())
+    tqdm.write(
+        f"[FastGS step={step}] N={n} VCD p50/p90/max={vcd_p50:.2f}/{vcd_p90:.2f}/{vcd_max:.1f} "
+        f"frac>τd={vcd_frac:.4f} session_hits={n_session_ok}/{len(view_idx)} "
+        f"grad2d p50/p90/max={g2d_p50:.4g}/{g2d_p90:.4g}/{g2d_max:.4g} "
+        f"absgrad p50/p90/max={abs_p50:.4g}/{abs_p90:.4g}/{abs_max:.4g} "
+        f"grad3d p50/p90/max={g3d_p50:.4g}/{g3d_p90:.4g}/{g3d_max:.4g} "
+        f"n_clone={n_clone} n_split={n_split} "
+        f"vis_mean={vis_mean:.1f} vis_frac={vis_frac:.3f} "
+        f"scale p50/p90/max={sc_p50:.4f}/{sc_p90:.4f}/{sc_max:.4f} "
+        f"split_shrink={cfg.split_scale_shrink:g} size_th={size_threshold} "
+        f"grow={cfg.grow_scale3d:g}*extent error_tau={cfg.error_tau:g}"
+    )
 
     n_before = means.shape[0]
     capacity = max(0, max_gaussians - n_before)
-    # Cap growth
-    if (clone_mask.sum() + split_mask.sum() * 2).item() > capacity and capacity > 0:
+    extra = int(clone_mask.sum().item()) + int(split_mask.sum().item())
+    if extra > capacity:
         scores = grad_norms
-        # Prefer splits then clones by score
         split_idx = torch.where(split_mask)[0]
         clone_idx = torch.where(clone_mask)[0]
         chosen_split = torch.zeros_like(split_mask)
         chosen_clone = torch.zeros_like(clone_mask)
         rem = capacity
-        if split_idx.numel() and rem >= 2:
-            ks = min(split_idx.numel(), rem // 2)
+        if split_idx.numel() and rem > 0:
+            ks = min(split_idx.numel(), rem)
             top = torch.topk(scores[split_idx], k=ks).indices
             chosen_split[split_idx[top]] = True
-            rem -= ks * 2
+            rem -= ks
         if clone_idx.numel() and rem > 0:
             kc = min(clone_idx.numel(), rem)
             top = torch.topk(scores[clone_idx], k=kc).indices
@@ -1232,6 +1480,8 @@ def densify_and_prune_fastgs(
         split_mask, clone_mask = chosen_split, chosen_clone
 
     new_means, new_log_scales, new_rots, new_colors, new_opa, new_sh = [], [], [], [], [], []
+    new_radii = []
+    n_new = 0
     if split_mask.any():
         n_split = int(split_mask.sum().item())
         sel_scales = torch.exp(log_scales[split_mask])
@@ -1249,35 +1499,116 @@ def densify_and_prune_fastgs(
         samples = torch.einsum("nij,nj,bnj->bni", rotmats, sel_scales, noise)
         new_means.append((means[split_mask].unsqueeze(0) + samples).reshape(-1, 3))
         new_log_scales.append(
-            torch.log(torch.exp(log_scales[split_mask]) / max(float(cfg.split_scale_shrink), 1.01)).repeat(2, 1)
+            split_child_log_scales(log_scales[split_mask], cfg.split_scale_shrink).repeat(2, 1)
         )
         new_rots.append(rotations[split_mask].repeat(2, 1))
         new_colors.append(colors[split_mask].repeat(2, 1))
         new_opa.append(opacities[split_mask].repeat(2))
+        new_radii.append(radii[split_mask].repeat(2))
         if sh_coeffs is not None:
             new_sh.append(sh_coeffs[split_mask].repeat(2, 1, 1))
+        n_new += 2 * n_split
 
     if clone_mask.any():
+        n_clone_kept = int(clone_mask.sum().item())
         new_means.append(means[clone_mask])
         new_log_scales.append(log_scales[clone_mask])
         new_rots.append(rotations[clone_mask])
         new_colors.append(colors[clone_mask])
         new_opa.append(opacities[clone_mask])
+        new_radii.append(radii[clone_mask])
         if sh_coeffs is not None:
             new_sh.append(sh_coeffs[clone_mask])
+        n_new += n_clone_kept
 
+    keep_src = ~split_mask
+    keep_idx = orig_idx[keep_src]
+    vcp_kept = vcp[keep_src]
+    radii_kept = radii[keep_src]
     if split_mask.any() or clone_mask.any():
-        keep_src = ~(split_mask | clone_mask)
         means = torch.cat([means[keep_src]] + new_means, dim=0)
         log_scales = torch.cat([log_scales[keep_src]] + new_log_scales, dim=0)
         rotations = F.normalize(torch.cat([rotations[keep_src]] + new_rots, dim=0), dim=-1)
         colors = torch.cat([colors[keep_src]] + new_colors, dim=0)
         opacities = torch.cat([opacities[keep_src]] + new_opa, dim=0)
+        radii_all = torch.cat([radii_kept] + new_radii, dim=0)
         if sh_coeffs is not None:
             sh_coeffs = torch.cat([sh_coeffs[keep_src]] + new_sh, dim=0)
+    else:
+        radii_all = radii_kept
 
-    changed = means.shape[0] != n
-    if changed or prune.any():
+    n_keep = int(keep_idx.numel())
+    prune = torch.zeros(means.shape[0], dtype=torch.bool, device=device)
+    if do_prune:
+        if do_densify:
+            # Official densification_postfix zeros max_radii2D before prune, so the
+            # 20px test never fires in the same densify call. Applying it on the
+            # accumulated radii deletes the splits we just added.
+            prune = prune_mask_fastgs_densify(
+                opacities,
+                log_scales,
+                vcp_kept,
+                scene_scale,
+                cfg,
+                max_radii2d=None,
+                size_threshold=size_threshold,
+            )
+        else:
+            prune = prune_mask_vcp(
+                vcp_kept if vcp_kept.numel() == means.shape[0] else torch.cat(
+                    [
+                        vcp_kept,
+                        torch.zeros(means.shape[0] - vcp_kept.numel(), device=device),
+                    ]
+                ),
+                opacities,
+                step,
+                cfg,
+                log_scales=log_scales,
+                scene_scale=scene_scale,
+            )
+            if prune.numel() != means.shape[0]:
+                pad = torch.zeros(means.shape[0], dtype=torch.bool, device=device)
+                pad[: prune.numel()] = prune
+                prune = pad
+    n_prune = int(prune.sum().item())
+    tqdm.write(
+        f"[FastGS step={step}] n_prune={n_prune} n_keep={n_keep} n_new={n_new} "
+        f"opa_p50={float(torch.quantile(opa_sig, 0.5)):.4f}"
+    )
+    if prune.any():
+        if prune.all():
+            prune[int(torch.argmax(torch.sigmoid(opacities)).item())] = False
+        surv = ~prune
+        orig_surv = surv[:n_keep]
+        new_surv = surv[n_keep:] if n_new > 0 else surv[:0]
+        means = torch.cat([means[:n_keep][orig_surv], means[n_keep:][new_surv]], dim=0)
+        log_scales = torch.cat(
+            [log_scales[:n_keep][orig_surv], log_scales[n_keep:][new_surv]], dim=0
+        )
+        rotations = torch.cat(
+            [rotations[:n_keep][orig_surv], rotations[n_keep:][new_surv]], dim=0
+        )
+        colors = torch.cat([colors[:n_keep][orig_surv], colors[n_keep:][new_surv]], dim=0)
+        opacities = torch.cat(
+            [opacities[:n_keep][orig_surv], opacities[n_keep:][new_surv]], dim=0
+        )
+        if sh_coeffs is not None:
+            sh_coeffs = torch.cat(
+                [sh_coeffs[:n_keep][orig_surv], sh_coeffs[n_keep:][new_surv]], dim=0
+            )
+        keep_idx = keep_idx[orig_surv]
+        n_new = int(new_surv.sum().item()) if new_surv.numel() else 0
+
+    # Official FastGS densify_and_prune_fastgs: cap opacity at 0.8 (inverse-sigmoid).
+    clamped_opacity = False
+    if do_densify:
+        opa_prob = torch.sigmoid(opacities)
+        opacities = torch.logit(torch.clamp(opa_prob, min=1e-6, max=0.8))
+        clamped_opacity = True
+
+    changed = means.shape[0] != n or n_new > 0 or bool(prune.any().item()) or clamped_opacity
+    if changed:
         payload = {
             "means": means,
             "log_scales": log_scales,
@@ -1288,8 +1619,8 @@ def densify_and_prune_fastgs(
         if sh_coeffs is not None:
             payload["sh_coeffs"] = sh_coeffs
         data.replace(payload)
-        return True
-    return False
+        return True, keep_idx, n_new
+    return False, orig_idx, 0
 
 
 def densify_and_prune(
@@ -1431,7 +1762,7 @@ def densify_and_prune(
         split_mask = is_grad_high & is_large
 
         capacity = max(0, max_gaussians - means.shape[0])
-        n_new = (dupli_mask.sum() * 1 + split_mask.sum() * 2).item()
+        n_new = (dupli_mask.sum() + split_mask.sum()).item()
         if n_new > capacity and n_new > 0:
             # Prefer high-gradient candidates under capacity constraints.
             split_idx_all = torch.where(split_mask)[0]
@@ -1443,13 +1774,13 @@ def densify_and_prune(
             chosen_split = torch.zeros_like(split_mask)
             chosen_dupli = torch.zeros_like(dupli_mask)
 
-            # Splits cost 2 slots, duplicates cost 1 slot.
+            # Each clone or split adds one extra Gaussian.
             remaining = int(capacity)
-            if split_idx_all.numel() > 0 and remaining >= 2:
-                max_splits = min(split_idx_all.numel(), remaining // 2)
+            if split_idx_all.numel() > 0 and remaining > 0:
+                max_splits = min(split_idx_all.numel(), remaining)
                 topk = torch.topk(split_scores, k=max_splits, largest=True).indices
                 chosen_split[split_idx_all[topk]] = True
-                remaining -= int(max_splits) * 2
+                remaining -= int(max_splits)
 
             if dupli_idx_all.numel() > 0 and remaining > 0:
                 max_duplis = min(dupli_idx_all.numel(), remaining)
@@ -1492,7 +1823,7 @@ def densify_and_prune(
             samples = torch.einsum("nij,nj,bnj->bni", rotmats, sel_scales, noise)
 
             new_means.append((means[split_mask].unsqueeze(0) + samples).reshape(-1, 3))
-            new_log_scales.append(torch.log(torch.exp(log_scales[split_mask]) / max(float(split_scale_shrink), 1.01)).repeat(2, 1))
+            new_log_scales.append(split_child_log_scales(log_scales[split_mask], split_scale_shrink).repeat(2, 1))
             new_rotations.append(rotations[split_mask].repeat(2, 1))
             new_colors.append(colors[split_mask].repeat(2, 1))
             new_opacities.append(opacities[split_mask].repeat(2))
@@ -1505,9 +1836,9 @@ def densify_and_prune(
             new_colors.append(colors[dupli_mask])
             new_opacities.append(opacities[dupli_mask])
 
-        # Remove split/dupli Gaussians, add all new ones
+        # Keep clone parents; replace split parents with two children.
         if n_split > 0 or n_dupli > 0:
-            keep_mask = ~(dupli_mask | split_mask)
+            keep_mask = ~split_mask
             means = torch.cat([means[keep_mask]] + new_means, dim=0)
             log_scales = torch.cat([log_scales[keep_mask]] + new_log_scales, dim=0)
             rotations = torch.cat([rotations[keep_mask]] + new_rotations, dim=0)
@@ -1543,6 +1874,14 @@ def reset_opacities(data: GaussianData, value: float = 0.01):
 
 def main():
     args = parse_args()
+    if args.densify_grad_thresh is None:
+        args.densify_grad_thresh = 0.0002 if args.fastgs else 8e-4
+    if args.densify_grad_abs_thresh is None:
+        args.densify_grad_abs_thresh = 0.0009
+    if args.fastgs and args.split_scale_shrink == 0.8:
+        args.split_scale_shrink = 1.6
+    if args.fastgs and args.densify_every == 100:
+        args.densify_every = 500
     if not _HAS_SSIM:
         raise RuntimeError("pytorch_msssim is required: pip install pytorch-msssim")
     device = resolve_device(args.device)
@@ -1561,6 +1900,7 @@ def main():
         all_frames = all_frames[: args.limit_frames]
 
     frames, eval_frames = split_train_eval(all_frames, args.eval_hold)
+    scene_scale = scene_scale_from_frames(frames)
 
     output_dir = args.output_dir
     if output_dir is None:
@@ -1611,7 +1951,32 @@ def main():
             voxel_size=init_voxel_size,
         )
     gauss_data = GaussianData(gaussians, device, sh_degree=args.sh_degree)
-    optimizers = build_optimizers(gauss_data, args.lr)
+    with torch.no_grad():
+        init_max_scale = torch.exp(gauss_data.log_scales).max(dim=-1).values
+        print(
+            f"Init Gaussians: N={gauss_data.num_gaussians} "
+            f"scale p50/p90/max="
+            f"{float(torch.quantile(init_max_scale, 0.5)):.4f}/"
+            f"{float(torch.quantile(init_max_scale, 0.9)):.4f}/"
+            f"{float(init_max_scale.max()):.4f}"
+        )
+
+    def make_optimizers(step: int):
+        return build_optimizers(
+            gauss_data,
+            scene_scale=scene_scale,
+            step=step,
+            max_steps=args.iterations,
+            lr_scale=args.lr,
+        )
+
+    optimizers = make_optimizers(0)
+    print(
+        f"3DGS LRs (x{args.lr:g}): means={means_lr_at(0, scene_scale, args.iterations, args.lr):.3e} "
+        f"-> {means_lr_at(args.iterations, scene_scale, args.iterations, args.lr):.3e}, "
+        f"scales={_SCALES_LR * args.lr:g}, quats={_QUATS_LR * args.lr:g}, "
+        f"opacity={_OPACITY_LR * args.lr:g}, sh={_SH_LR * args.lr:g}"
+    )
     strategy = None
     strategy_state = None
     strategy_params = None
@@ -1626,13 +1991,22 @@ def main():
             densify_every=args.densify_every if args.densify_every > 0 else 500,
             densify_until=args.densify_until if args.densify_until > 0 else 15000,
             grad_thresh=args.densify_grad_thresh,
+            grad_abs_thresh=args.densify_grad_abs_thresh,
+            split_scale_shrink=args.split_scale_shrink,
+            grow_scale3d=0.001,
+            error_tau=0.1,
+            cull_screen_size=0.0,
             ssim_lambda=args.ssim_lambda,
         )
         # FastGS replaces gsplat DefaultStrategy.
         strategy = None
         print(
             f"FastGS enabled: densify_every={fastgs_cfg.densify_every}, "
-            f"K={fastgs_cfg.k_views}, metal={metal_available()}, sh_degree={args.sh_degree}"
+            f"K={fastgs_cfg.k_views}, τ_d={fastgs_cfg.densify_score_thresh}, "
+            f"error_tau={fastgs_cfg.error_tau}, grow_scale3d={fastgs_cfg.grow_scale3d}, "
+            f"grad_thresh={fastgs_cfg.grad_thresh}, grad_abs_thresh={fastgs_cfg.grad_abs_thresh}, "
+            f"split_shrink={fastgs_cfg.split_scale_shrink}, "
+            f"scene_scale={scene_scale:.4f}, metal={metal_available()}, sh_degree={args.sh_degree}"
         )
     elif _HAS_GSPLAT_STRATEGY:
         strategy = DefaultStrategy(
@@ -1661,11 +2035,14 @@ def main():
             "opacities": gauss_data.opacities,
         }
         strategy.check_sanity(strategy_params, optimizers)
-        strategy_state = strategy.initialize_state(scene_scale=1.0)
+        strategy_state = strategy.initialize_state(scene_scale=scene_scale)
 
     # Fallback densify stats when gsplat.DefaultStrategy is unavailable.
     grad_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
+    absgrad_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
+    grad3d_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
     vis_count = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
+    max_radii2d = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
 
     visualizer.set_cameras(frames)
     with torch.no_grad():
@@ -1758,7 +2135,8 @@ def main():
             width=width,
         )
 
-        # Combined photometric loss: (1-lambda)*MSE + lambda*(1-SSIM).
+        # Combined photometric loss: (1-lambda)*L1 + lambda*(1-SSIM).
+        l1_loss = F.l1_loss(rendered, target)
         mse_loss = F.mse_loss(rendered, target)
         ssim_loss = 1.0 - _compute_ssim(
             rendered.permute(2, 0, 1).unsqueeze(0),
@@ -1766,7 +2144,7 @@ def main():
             data_range=1.0,
             size_average=True,
         )
-        loss = (1.0 - args.ssim_lambda) * mse_loss + args.ssim_lambda * ssim_loss
+        loss = (1.0 - args.ssim_lambda) * l1_loss + args.ssim_lambda * ssim_loss
 
         info = get_last_render_info()
         if strategy is not None and isinstance(info, dict):
@@ -1779,35 +2157,75 @@ def main():
             strategy.step_post_backward(strategy_params, optimizers, strategy_state, step + 1, info, packed=False)
             gauss_data.sync_from_strategy_params(strategy_params)
         elif strategy is None and (args.densify_every > 0 or use_fastgs):
+            n = gauss_data.num_gaussians
+            if grad_accum.numel() != n:
+                grad_accum = torch.zeros(n, device=gauss_data.device)
+                absgrad_accum = torch.zeros(n, device=gauss_data.device)
+                grad3d_accum = torch.zeros(n, device=gauss_data.device)
+                vis_count = torch.zeros(n, device=gauss_data.device)
+                max_radii2d = torch.zeros(n, device=gauss_data.device)
+            radii = last_radii2d() if use_fastgs else None
+            vis = None
+            if radii is not None and radii.shape[0] == n:
+                radii = radii.to(device=gauss_data.device, dtype=max_radii2d.dtype)
+                vis = radii > 0
+                max_radii2d = torch.where(
+                    vis, torch.maximum(max_radii2d, radii), max_radii2d
+                )
+            g2d = last_grad_means2d() if use_fastgs else None
+            g2d_abs = last_grad_means2d_abs() if use_fastgs else None
+            if g2d is not None and g2d.shape[0] == n:
+                g2d = g2d.to(device=gauss_data.device, dtype=gauss_data.means.dtype)
+                g2d = torch.nan_to_num(g2d, nan=0.0, posinf=0.0, neginf=0.0)
+                # Inria/FastGS store dL/dmean2D in NDC (pixel grad × 0.5*{W,H}).
+                ndc = g2d.new_tensor([0.5 * float(width), 0.5 * float(height)])
+                g2d = g2d * ndc
+                g_norm = g2d.norm(dim=-1)
+                if g2d_abs is not None and g2d_abs.shape[0] == n:
+                    g2d_abs = g2d_abs.to(device=gauss_data.device, dtype=gauss_data.means.dtype)
+                    g2d_abs = torch.nan_to_num(g2d_abs, nan=0.0, posinf=0.0, neginf=0.0)
+                    g_abs = (g2d_abs * ndc).norm(dim=-1)
+                else:
+                    g_abs = g2d.abs().sum(dim=-1)
+                # Official visibility_filter is radii>0, not "any nonzero grad".
+                if vis is None:
+                    vis = g_norm > 0
+                vis_f = vis.to(dtype=g_norm.dtype)
+                grad_accum = torch.where(vis, grad_accum + g_norm, grad_accum)
+                absgrad_accum = torch.where(vis, absgrad_accum + g_abs, absgrad_accum)
+                vis_count = vis_count + vis_f
+            elif gauss_data.means.grad is not None:
+                g_norm = gauss_data.means.grad.detach().norm(dim=-1)
+                vis_m = g_norm > 0
+                grad_accum = torch.where(vis_m, grad_accum + g_norm, grad_accum)
+                vis_count = vis_count + vis_m.to(dtype=vis_count.dtype)
             if gauss_data.means.grad is not None:
-                n = gauss_data.num_gaussians
-                if grad_accum.numel() != n:
-                    grad_accum = torch.zeros(n, device=gauss_data.device)
-                    vis_count = torch.zeros(n, device=gauss_data.device)
-                grad_accum += gauss_data.means.grad.detach().norm(dim=-1)
-                vis_count += 1.0
+                grad3d_accum += torch.nan_to_num(
+                    gauss_data.means.grad.detach().norm(dim=-1), nan=0.0, posinf=0.0, neginf=0.0
+                )
 
-        do_opt = True
-        if use_fastgs and fastgs_cfg is not None:
-            do_opt = should_step_optimizer(step + 1, fastgs_cfg)
-        if do_opt:
-            step_optimizers(optimizers)
-
+        # Official FastGS: densify/prune in no_grad before the Adam step.
         step_idx = step + 1
         if use_fastgs and fastgs_cfg is not None:
+            # Official FastGS: densify while iteration < densify_until (last event 14500).
             densify_now = (
                 step_idx >= args.densify_from
-                and step_idx <= fastgs_cfg.densify_until
+                and step_idx < fastgs_cfg.densify_until
                 and step_idx % fastgs_cfg.densify_every == 0
             )
-            prune_period = (
-                fastgs_cfg.prune_every_early
-                if step_idx <= fastgs_cfg.densify_until
-                else fastgs_cfg.prune_every_late
+            prune_now = (
+                step_idx > fastgs_cfg.densify_until
+                and step_idx < args.iterations
+                and step_idx % fastgs_cfg.prune_every_late == 0
             )
-            prune_now = step_idx >= args.densify_from and step_idx % prune_period == 0
             if densify_now or prune_now:
-                changed = densify_and_prune_fastgs(
+                size_th = None
+                if (
+                    args.reset_opacity_every > 0
+                    and step_idx > args.reset_opacity_every
+                ):
+                    size_th = fastgs_cfg.max_screen_size
+                changed, keep_idx, n_new = densify_and_prune_fastgs(
                     gauss_data,
                     frames,
                     grad_accum=grad_accum,
@@ -1817,13 +2235,57 @@ def main():
                     max_gaussians=args.max_gaussians,
                     max_resolution=schedule_max_res,
                     ssim_fn=_compute_ssim if _HAS_SSIM else None,
+                    do_densify=densify_now,
+                    do_prune=True,
+                    scene_scale=scene_scale,
+                    absgrad_accum=absgrad_accum,
+                    grad3d_accum=grad3d_accum,
+                    max_radii2d=max_radii2d,
+                    size_threshold=size_th,
                 )
                 if changed:
-                    optimizers = build_optimizers(gauss_data, args.lr)
+                    optimizers = remap_optimizers_after_densify(
+                        optimizers,
+                        gauss_data,
+                        keep_idx,
+                        n_new,
+                        step_idx,
+                        scene_scale,
+                        args.iterations,
+                        args.lr,
+                    )
+                    if densify_now:
+                        # Official replace_tensor_to_optimizer after the 0.8 opacity cap.
+                        reset_opacity_adam(optimizers)
                 n = gauss_data.num_gaussians
                 grad_accum = torch.zeros(n, device=gauss_data.device)
+                absgrad_accum = torch.zeros(n, device=gauss_data.device)
+                grad3d_accum = torch.zeros(n, device=gauss_data.device)
                 vis_count = torch.zeros(n, device=gauss_data.device)
-        elif strategy is None and args.densify_every > 0:
+                max_radii2d = torch.zeros(n, device=gauss_data.device)
+            # Official resets opacity only inside the densify phase (not after 15k).
+            if (
+                args.reset_opacity_every > 0
+                and step_idx >= args.densify_from
+                and step_idx < fastgs_cfg.densify_until
+                and step_idx % args.reset_opacity_every == 0
+            ):
+                reset_opacities(gauss_data, value=0.01)
+                reset_opacity_adam(optimizers)
+
+        do_opt = True
+        if use_fastgs and fastgs_cfg is not None:
+            do_opt = should_step_optimizer(step_idx, fastgs_cfg)
+        if do_opt:
+            scale_sh_rest_grads(gauss_data)
+            set_optimizer_lr(
+                optimizers["means"],
+                means_lr_at(step_idx, scene_scale, args.iterations, args.lr),
+            )
+            step_optimizers(optimizers)
+            sanitize_gaussians(gauss_data, scene_scale)
+
+        if (not use_fastgs) and strategy is None and args.densify_every > 0:
             if (
                 step_idx >= args.densify_from
                 and (args.densify_until <= 0 or step_idx <= args.densify_until)
@@ -1837,6 +2299,7 @@ def main():
                     prune_opacity_thresh=args.prune_opacity_thresh,
                     max_gaussians=args.max_gaussians,
                     split_scale_shrink=args.split_scale_shrink,
+                    scene_scale=scene_scale,
                     cull_screen_size=args.cull_screen_size,
                     split_screen_size=args.split_screen_size,
                     intrinsics=intrinsics,
@@ -1845,7 +2308,7 @@ def main():
                     width=width,
                 )
                 if changed:
-                    optimizers = build_optimizers(gauss_data, args.lr)
+                    optimizers = make_optimizers(step_idx)
                 n = gauss_data.num_gaussians
                 grad_accum = torch.zeros(n, device=gauss_data.device)
                 vis_count = torch.zeros(n, device=gauss_data.device)
@@ -1865,9 +2328,9 @@ def main():
             strategy_params["colors"] = torch.nn.Parameter(strategy_params["colors"].detach()[idx].contiguous(), requires_grad=True)
             strategy_params["opacities"] = torch.nn.Parameter(strategy_params["opacities"].detach()[idx].contiguous(), requires_grad=True)
             gauss_data.sync_from_strategy_params(strategy_params)
-            optimizers = build_optimizers(gauss_data, args.lr)
+            optimizers = make_optimizers(step + 1)
             if strategy is not None:
-                strategy_state = strategy.initialize_state(scene_scale=1.0)
+                strategy_state = strategy.initialize_state(scene_scale=scene_scale)
             print(f"Capped gaussians at step {step + 1}: {gauss_data.num_gaussians} -> {keep}")
 
         if gauss_data.num_gaussians != prev_n:
