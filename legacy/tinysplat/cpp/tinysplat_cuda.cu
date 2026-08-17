@@ -294,7 +294,11 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
     int num_tiles = tiles_x * tiles_y;
 
     // 1. Precompute Gaussian params
-    auto gaussians = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // Gaussian2D is 48 bytes (8 floats + 4 ints); the buffer is reinterpreted as
+    // Gaussian2D* below, so it must hold N structs, not N floats.
+    constexpr int64_t kFloatsPerGaussian2D = sizeof(Gaussian2D) / sizeof(float);
+    auto gaussians = torch::zeros({(int64_t)N * kFloatsPerGaussian2D},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     int blocks = (N + 255) / 256;
     precompute_gaussians_kernel<<<blocks, 256>>>(
         means.data_ptr<float>(),
@@ -368,7 +372,11 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
     int tiles_y = (H + kTileSize - 1) / kTileSize;
     int num_tiles = tiles_x * tiles_y;
 
-    auto gaussians = torch::zeros({N}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // Gaussian2D is 48 bytes (8 floats + 4 ints); the buffer is reinterpreted as
+    // Gaussian2D* below, so it must hold N structs, not N floats.
+    constexpr int64_t kFloatsPerGaussian2D = sizeof(Gaussian2D) / sizeof(float);
+    auto gaussians = torch::zeros({(int64_t)N * kFloatsPerGaussian2D},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     int blocks = (N + 255) / 256;
     precompute_gaussians_kernel<<<blocks, 256>>>(
         means.contiguous().data_ptr<float>(),

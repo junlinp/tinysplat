@@ -81,13 +81,6 @@ except ImportError:
         return log_scales + delta
 
 try:
-    from gsplat.strategy.default import DefaultStrategy
-    _HAS_GSPLAT_STRATEGY = True
-except Exception:
-    DefaultStrategy = None
-    _HAS_GSPLAT_STRATEGY = False
-
-try:
     from pytorch_msssim import ssim as _compute_ssim
 
     _HAS_SSIM = True
@@ -1099,13 +1092,6 @@ class GaussianData:
             "covariances": self.covariance_matrices().detach().cpu(),
         }
 
-    def sync_from_strategy_params(self, params: Dict[str, torch.Tensor]):
-        self.means = params["means"]
-        self.log_scales = params["scales"]
-        self.rotations = params["quats"]
-        self.colors = params["colors"]
-        self.opacities = params["opacities"]
-
 
 def save_checkpoint(
     data: GaussianData,
@@ -1641,7 +1627,7 @@ def densify_and_prune(
     height: int = 0,
     width: int = 0,
 ) -> bool:
-    """Densify and prune following gsplat's DefaultStrategy."""
+    """Built-in densify and prune (grad-threshold clone/split + opacity prune)."""
     with torch.no_grad():
         n = data.num_gaussians
         means = data.means.detach().clone()[:n]
@@ -1977,9 +1963,6 @@ def main():
         f"scales={_SCALES_LR * args.lr:g}, quats={_QUATS_LR * args.lr:g}, "
         f"opacity={_OPACITY_LR * args.lr:g}, sh={_SH_LR * args.lr:g}"
     )
-    strategy = None
-    strategy_state = None
-    strategy_params = None
     use_fastgs = bool(args.fastgs)
     if use_fastgs and not _HAS_FASTGS:
         raise RuntimeError("--fastgs requires tinysplat.fastgs / metal_backend (install legacy package).")
@@ -1998,8 +1981,6 @@ def main():
             cull_screen_size=0.0,
             ssim_lambda=args.ssim_lambda,
         )
-        # FastGS replaces gsplat DefaultStrategy.
-        strategy = None
         print(
             f"FastGS enabled: densify_every={fastgs_cfg.densify_every}, "
             f"K={fastgs_cfg.k_views}, τ_d={fastgs_cfg.densify_score_thresh}, "
@@ -2008,36 +1989,14 @@ def main():
             f"split_shrink={fastgs_cfg.split_scale_shrink}, "
             f"scene_scale={scene_scale:.4f}, metal={metal_available()}, sh_degree={args.sh_degree}"
         )
-    elif _HAS_GSPLAT_STRATEGY:
-        strategy = DefaultStrategy(
-            prune_opa=args.prune_opacity_thresh,
-            grow_grad2d=args.densify_grad_thresh,
-            grow_scale3d=0.01,
-            grow_scale2d=args.split_screen_size,
-            prune_scale3d=0.1,
-            prune_scale2d=args.cull_screen_size,
-            refine_scale2d_stop_iter=args.densify_until if args.densify_until > 0 else 0,
-            refine_start_iter=args.densify_from,
-            refine_stop_iter=args.densify_until if args.densify_until > 0 else max(args.iterations, 1 << 30),
-            reset_every=args.reset_opacity_every if args.reset_opacity_every > 0 else (1 << 30),
-            refine_every=args.densify_every if args.densify_every > 0 else (1 << 30),
-            pause_refine_after_reset=len(frames) + (args.densify_every if args.densify_every > 0 else 0),
-            absgrad=False,
-            revised_opacity=True,
-            verbose=False,
-            key_for_gradient="means2d",
+    else:
+        print(
+            f"Built-in densify/prune: every={args.densify_every}, from={args.densify_from}, "
+            f"until={args.densify_until}, grad_thresh={args.densify_grad_thresh}, "
+            f"prune_opa={args.prune_opacity_thresh}, scene_scale={scene_scale:.4f}"
         )
-        strategy_params = {
-            "means": gauss_data.means,
-            "scales": gauss_data.log_scales,
-            "quats": gauss_data.rotations,
-            "colors": gauss_data.colors,
-            "opacities": gauss_data.opacities,
-        }
-        strategy.check_sanity(strategy_params, optimizers)
-        strategy_state = strategy.initialize_state(scene_scale=scene_scale)
 
-    # Fallback densify stats when gsplat.DefaultStrategy is unavailable.
+    # Densify stats for the built-in densify_and_prune path.
     grad_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
     absgrad_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
     grad3d_accum = torch.zeros(gauss_data.num_gaussians, device=gauss_data.device)
@@ -2147,16 +2106,11 @@ def main():
         loss = (1.0 - args.ssim_lambda) * l1_loss + args.ssim_lambda * ssim_loss
 
         info = get_last_render_info()
-        if strategy is not None and isinstance(info, dict):
-            strategy.step_pre_backward(strategy_params, optimizers, strategy_state, step + 1, info)
 
         loss.backward()
 
         prev_n = gauss_data.num_gaussians
-        if strategy is not None and isinstance(info, dict):
-            strategy.step_post_backward(strategy_params, optimizers, strategy_state, step + 1, info, packed=False)
-            gauss_data.sync_from_strategy_params(strategy_params)
-        elif strategy is None and (args.densify_every > 0 or use_fastgs):
+        if args.densify_every > 0 or use_fastgs:
             n = gauss_data.num_gaussians
             if grad_accum.numel() != n:
                 grad_accum = torch.zeros(n, device=gauss_data.device)
@@ -2285,7 +2239,7 @@ def main():
             step_optimizers(optimizers)
             sanitize_gaussians(gauss_data, scene_scale)
 
-        if (not use_fastgs) and strategy is None and args.densify_every > 0:
+        if (not use_fastgs) and args.densify_every > 0:
             if (
                 step_idx >= args.densify_from
                 and (args.densify_until <= 0 or step_idx <= args.densify_until)
@@ -2319,19 +2273,22 @@ def main():
             ):
                 reset_opacities(gauss_data, value=0.01)
 
-        if strategy is not None and gauss_data.num_gaussians > args.max_gaussians:
+        if gauss_data.num_gaussians > args.max_gaussians:
             keep = args.max_gaussians
+            prev_total = gauss_data.num_gaussians
             idx = torch.randperm(gauss_data.num_gaussians, device=gauss_data.device)[:keep]
-            strategy_params["means"] = torch.nn.Parameter(strategy_params["means"].detach()[idx].contiguous(), requires_grad=True)
-            strategy_params["scales"] = torch.nn.Parameter(strategy_params["scales"].detach()[idx].contiguous(), requires_grad=True)
-            strategy_params["quats"] = torch.nn.Parameter(strategy_params["quats"].detach()[idx].contiguous(), requires_grad=True)
-            strategy_params["colors"] = torch.nn.Parameter(strategy_params["colors"].detach()[idx].contiguous(), requires_grad=True)
-            strategy_params["opacities"] = torch.nn.Parameter(strategy_params["opacities"].detach()[idx].contiguous(), requires_grad=True)
-            gauss_data.sync_from_strategy_params(strategy_params)
+            subset = {
+                "means": gauss_data.means.detach()[idx].contiguous(),
+                "log_scales": gauss_data.log_scales.detach()[idx].contiguous(),
+                "rotations": gauss_data.rotations.detach()[idx].contiguous(),
+                "colors": gauss_data.colors.detach()[idx].contiguous(),
+                "opacities": gauss_data.opacities.detach()[idx].contiguous(),
+            }
+            if gauss_data.sh_coeffs is not None:
+                subset["sh_coeffs"] = gauss_data.sh_coeffs.detach()[idx].contiguous()
+            gauss_data.replace(subset)
             optimizers = make_optimizers(step + 1)
-            if strategy is not None:
-                strategy_state = strategy.initialize_state(scene_scale=scene_scale)
-            print(f"Capped gaussians at step {step + 1}: {gauss_data.num_gaussians} -> {keep}")
+            print(f"Capped gaussians at step {step + 1}: {prev_total} -> {keep}")
 
         if gauss_data.num_gaussians != prev_n:
             print(f"Densified at step {step + 1}: {gauss_data.num_gaussians} gaussians")
@@ -2374,7 +2331,6 @@ def main():
                 )
             visualizer.update_gaussian_stats(gauss_data.num_gaussians)
 
-        # Densify/prune/reset are handled by gsplat.DefaultStrategy in step_post_backward.
         if visualizer.should_render_selected_frame(step + 1, effective_viser_update_every):
             selected_idx = min(visualizer.selected_frame_idx, len(frames) - 1)
             if prepared_frames is not None:
