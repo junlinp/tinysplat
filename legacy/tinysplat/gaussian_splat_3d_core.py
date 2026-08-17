@@ -6,7 +6,13 @@ Provides a single API that routes to device-specific implementations
 
 from typing import Callable, Dict, Optional, Tuple
 
+import os
+
 import torch
+
+# Escape hatch: TINYSPLAT_NO_FUSED_PROJECT=1 forces the reference PyTorch
+# projection, for A/B-ing the fused CUDA kernel against it.
+_DISABLE_FUSED_PROJECT = os.environ.get("TINYSPLAT_NO_FUSED_PROJECT", "") == "1"
 
 # ---------------------------------------------------------------------------
 # Validators
@@ -36,6 +42,43 @@ def _world_to_camera(camera_to_world: torch.Tensor) -> Tuple[torch.Tensor, torch
     return rotation_w2c, translation_w2c
 
 
+class _FusedProjectCUDA(torch.autograd.Function):
+    """Fused 3D->2D projection with a hand-written VJP.
+
+    The pure-PyTorch chain below is mathematically identical but costs ~100 ms
+    per iteration at N=136k, because autograd unwinds hundreds of small ops.
+    The raster kernels are only 5-8 ms of a 112 ms step, so this projection --
+    not rasterization -- is the training bottleneck.
+    """
+
+    @staticmethod
+    def forward(ctx, means, covariances, intrinsics, camera_to_world, near_plane, min_covariance):
+        from .cpp import load_cuda_extension
+
+        ext = load_cuda_extension()
+        pm, cov2d, depth, visible = ext.project_3d_forward_cuda(
+            means.contiguous(), covariances.contiguous(),
+            intrinsics, camera_to_world, float(near_plane), float(min_covariance),
+        )
+        ctx.save_for_backward(means, covariances, intrinsics, camera_to_world)
+        ctx.near_plane = float(near_plane)
+        ctx.min_covariance = float(min_covariance)
+        return pm, cov2d.view(-1, 2, 2), depth, visible
+
+    @staticmethod
+    def backward(ctx, g_pm, g_cov2d, g_depth, _g_visible):
+        from .cpp import load_cuda_extension
+
+        means, covariances, intrinsics, camera_to_world = ctx.saved_tensors
+        ext = load_cuda_extension()
+        g_means, g_cov3 = ext.project_3d_backward_cuda(
+            g_pm.contiguous(), g_cov2d.contiguous(), g_depth.contiguous(),
+            means.contiguous(), covariances.contiguous(),
+            intrinsics, camera_to_world, ctx.near_plane, ctx.min_covariance,
+        )
+        return g_means, g_cov3, None, None, None, None
+
+
 def _project_gaussians_3d_to_2d_pytorch(
     means: torch.Tensor,
     covariances: torch.Tensor,
@@ -44,6 +87,15 @@ def _project_gaussians_3d_to_2d_pytorch(
     near_plane: float = 1e-4,
     min_covariance: float = 1e-4,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Fused CUDA path; falls through to the reference implementation on any
+    # other device or if the extension is unavailable.
+    if means.is_cuda and not _DISABLE_FUSED_PROJECT:
+        try:
+            return _FusedProjectCUDA.apply(
+                means, covariances, intrinsics, camera_to_world, near_plane, min_covariance
+            )
+        except Exception:  # pragma: no cover - fall back rather than fail training
+            pass
     rotation_w2c, translation_w2c = _world_to_camera(camera_to_world)
     means_camera = means @ rotation_w2c.transpose(0, 1) + translation_w2c
     covariances_camera = (
