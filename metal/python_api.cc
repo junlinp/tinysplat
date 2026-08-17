@@ -72,6 +72,11 @@ int tinysplat_metal_count_hits(const float* proj_means, const float* proj_covs,
              : 0;
 }
 
+int tinysplat_metal_session_count_hits(const uint8_t* error_mask, int* counts, int n, int h,
+                                       int w) {
+  return tinysplat::metal::count_session_metric_hits(error_mask, counts, n, h, w) ? 1 : 0;
+}
+
 int tinysplat_metal_projected_backward(const float* grad_output, const float* proj_means,
                                        const float* proj_covs, const float* colors,
                                        const float* opacities, int n, int c, int h, int w,
@@ -143,6 +148,26 @@ int tinysplat_metal_session_backward_qs_sh(const float* grad_output, int n, int 
              grad_opacities, opts)
              ? 1
              : 0;
+}
+
+int tinysplat_metal_last_grad_means2d_n() { return tinysplat::metal::last_grad_means2d_count(); }
+
+int tinysplat_metal_last_grad_means2d(float* out, int max_n) {
+  return tinysplat::metal::copy_last_grad_means2d(out, max_n);
+}
+
+int tinysplat_metal_last_grad_means2d_abs_n() {
+  return tinysplat::metal::last_grad_means2d_abs_count();
+}
+
+int tinysplat_metal_last_grad_means2d_abs(float* out, int max_n) {
+  return tinysplat::metal::copy_last_grad_means2d_abs(out, max_n);
+}
+
+int tinysplat_metal_last_radii2d_n() { return tinysplat::metal::last_radii2d_count(); }
+
+int tinysplat_metal_last_radii2d(float* out, int max_n) {
+  return tinysplat::metal::copy_last_radii2d(out, max_n);
 }
 
 }  // extern "C"

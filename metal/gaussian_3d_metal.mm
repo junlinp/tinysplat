@@ -77,6 +77,8 @@ struct CameraParams {
   float cam_pos1;
   float cam_pos2;
   uint32_t sh_degree;
+  float tan_fovx;
+  float tan_fovy;
 };
 
 // Embedded Metal shaders: GPU project/tiles + tiled forward/backward with cooperative load.
@@ -139,7 +141,26 @@ struct CameraParams {
   float cam_pos1;
   float cam_pos2;
   uint sh_degree;
+  float tan_fovx;
+  float tan_fovy;
 };
+
+// Inria/FastGS: clamp Jacobian xy to 1.3 * tan(fov/2) so off-axis points
+// cannot explode the 2D covariance (and flatten dL/dmean2D).
+inline void ewa_jacobian(float cam_x, float cam_y, float cam_z, constant CameraParams& cam,
+                         thread float& j00, thread float& j02, thread float& j11, thread float& j12,
+                         thread float& jx, thread float& jy) {
+  const float z = cam_z;
+  const float limx = 1.3f * cam.tan_fovx;
+  const float limy = 1.3f * cam.tan_fovy;
+  jx = clamp(cam_x / z, -limx, limx) * z;
+  jy = clamp(cam_y / z, -limy, limy) * z;
+  const float z2 = z * z;
+  j00 = cam.fx / z;
+  j02 = -cam.fx * jx / z2;
+  j11 = cam.fy / z;
+  j12 = -cam.fy * jy / z2;
+}
 
 inline float compact_radius_m(float s00, float s01, float s11, float min_covariance,
                               float sigma_radius, float beta, bool use_compact_box) {
@@ -455,17 +476,16 @@ kernel void project_gaussians_3d(
 
   const float proj_x = cam.fx * cam_x / cam_z + cam.cx;
   const float proj_y = cam.fy * cam_y / cam_z + cam.cy;
-  const float j00 = cam.fx / cam_z;
-  const float j02 = -cam.fx * cam_x / (cam_z * cam_z);
-  const float j11 = cam.fy / cam_z;
-  const float j12 = -cam.fy * cam_y / (cam_z * cam_z);
+  float j00, j02, j11, j12, jx, jy;
+  ewa_jacobian(cam_x, cam_y, cam_z, cam, j00, j02, j11, j12, jx, jy);
 
   float s00 = j00 * (ccov00 * j00 + ccov02 * j02) + j02 * (ccov20 * j00 + ccov22 * j02);
   float s01 = j00 * (ccov01 * j11 + ccov02 * j12) + j02 * (ccov21 * j11 + ccov22 * j12);
   float s10 = j11 * (ccov10 * j00 + ccov12 * j02) + j12 * (ccov20 * j00 + ccov22 * j02);
   float s11 = j11 * (ccov11 * j11 + ccov12 * j12) + j12 * (ccov21 * j11 + ccov22 * j12);
-  s00 += cam.min_covariance;
-  s11 += cam.min_covariance;
+  // Inria low-pass: every Gaussian at least ~1px; plus min_covariance for invertibility.
+  s00 += cam.min_covariance + 0.3f;
+  s11 += cam.min_covariance + 0.3f;
   float det = s00 * s11 - s01 * s10;
   if (det <= cam.min_covariance) {
     det = cam.min_covariance;
@@ -545,17 +565,16 @@ kernel void project_gaussians_3d_qs(
 
   const float proj_x = cam.fx * cam_x / cam_z + cam.cx;
   const float proj_y = cam.fy * cam_y / cam_z + cam.cy;
-  const float j00 = cam.fx / cam_z;
-  const float j02 = -cam.fx * cam_x / (cam_z * cam_z);
-  const float j11 = cam.fy / cam_z;
-  const float j12 = -cam.fy * cam_y / (cam_z * cam_z);
+  float j00, j02, j11, j12, jx, jy;
+  ewa_jacobian(cam_x, cam_y, cam_z, cam, j00, j02, j11, j12, jx, jy);
 
   float s00 = j00 * (ccov00 * j00 + ccov02 * j02) + j02 * (ccov20 * j00 + ccov22 * j02);
   float s01 = j00 * (ccov01 * j11 + ccov02 * j12) + j02 * (ccov21 * j11 + ccov22 * j12);
   float s10 = j11 * (ccov10 * j00 + ccov12 * j02) + j12 * (ccov20 * j00 + ccov22 * j02);
   float s11 = j11 * (ccov11 * j11 + ccov12 * j12) + j12 * (ccov21 * j11 + ccov22 * j12);
-  s00 += cam.min_covariance;
-  s11 += cam.min_covariance;
+  // Inria low-pass: every Gaussian at least ~1px; plus min_covariance for invertibility.
+  s00 += cam.min_covariance + 0.3f;
+  s11 += cam.min_covariance + 0.3f;
   float det = s00 * s11 - s01 * s10;
   if (det <= cam.min_covariance) {
     det = cam.min_covariance;
@@ -598,10 +617,10 @@ kernel void project_gaussians_2d(
     uint gid [[thread_position_in_grid]]
 ) {
   if (gid >= cam.n) return;
-  float s00 = proj_covs[gid * 4 + 0] + cam.min_covariance;
+  float s00 = proj_covs[gid * 4 + 0] + cam.min_covariance + 0.3f;
   float s01 = proj_covs[gid * 4 + 1];
   float s10 = proj_covs[gid * 4 + 2];
-  float s11 = proj_covs[gid * 4 + 3] + cam.min_covariance;
+  float s11 = proj_covs[gid * 4 + 3] + cam.min_covariance + 0.3f;
   float det = s00 * s11 - s01 * s10;
   if (det <= cam.min_covariance) {
     det = cam.min_covariance;
@@ -824,11 +843,86 @@ kernel void tiled_alpha_forward(
     if (tg_tmax[0] <= 1e-4f) break;
   }
 
-  if (inside) {
+    if (inside) {
     const uint out = (y * params.width + x) * params.num_channels;
     if (params.num_channels > 0) output[out] = accum0;
     if (params.num_channels > 1) output[out + 1] = accum1;
     if (params.num_channels > 2) output[out + 2] = accum2;
+  }
+}
+
+// FastGS metric pass: count Gaussians that actually composite into high-error pixels
+// (same alpha loop as tiled_alpha_forward, not an AABB footprint walk).
+kernel void tiled_metric_count(
+    device const ProjectedGaussian* projected [[buffer(0)]],
+    device const float* opacities [[buffer(1)]],
+    device const int* tile_offsets [[buffer(2)]],
+    device const int* tile_ids [[buffer(3)]],
+    constant RasterParams& params [[buffer(4)]],
+    device const uchar* error_mask [[buffer(5)]],
+    device atomic_int* counts [[buffer(6)]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+  const uint x = tgid.x * params.tile_size + lid.x;
+  const uint y = tgid.y * params.tile_size + lid.y;
+  const bool inside = x < params.width && y < params.height;
+  const uint linear = lid.y * params.tile_size + lid.x;
+  const uint tile_idx = tgid.y * params.tiles_x + tgid.x;
+  const int start = tile_offsets[tile_idx];
+  const int end = tile_offsets[tile_idx + 1];
+  const bool high_err = inside && error_mask[y * params.width + x] != 0;
+
+  threadgroup ProjectedGaussian tg_pg[64];
+  threadgroup float tg_opa[64];
+  threadgroup float tg_tmax[8];
+
+  float T = 1.0f;
+  for (int base = start; base < end; base += 64) {
+    const int nload = min(64, end - base);
+    if (linear < uint(nload)) {
+      const int idx = tile_ids[base + int(linear)];
+      const ProjectedGaussian pg = projected[idx];
+      tg_pg[linear] = pg;
+      tg_opa[linear] = opacities[pg.source_index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (inside && T > 1e-4f) {
+      for (int j = 0; j < nload && T > 1e-4f; ++j) {
+        const ProjectedGaussian pg = tg_pg[j];
+        if ((int)x < pg.min_x || (int)x > pg.max_x || (int)y < pg.min_y || (int)y > pg.max_y) {
+          continue;
+        }
+        const float dx = float(x) - pg.mean_x;
+        const float dy = float(y) - pg.mean_y;
+        const float quad =
+            dx * (pg.inv_xx * dx + pg.inv_xy * dy) + dy * (pg.inv_yx * dx + pg.inv_yy * dy);
+        const float gaussian = exp(-0.5f * quad);
+        float alpha = clamp(tg_opa[j] * gaussian, 0.0f, 0.999f);
+        if (high_err) {
+          atomic_fetch_add_explicit(&counts[pg.source_index], 1, memory_order_relaxed);
+        }
+        T *= (1.0f - alpha);
+        if (T < 1e-4f) {
+          break;
+        }
+      }
+    }
+
+    float tmax = inside ? T : 0.0f;
+    tmax = simd_max(tmax);
+    if (simd_is_first()) {
+      tg_tmax[linear / 32] = tmax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (linear == 0) {
+      float m = 0.0f;
+      for (uint i = 0; i < 8; ++i) m = max(m, tg_tmax[i]);
+      tg_tmax[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tg_tmax[0] <= 1e-4f) break;
   }
 }
 
@@ -895,6 +989,7 @@ kernel void tiled_alpha_backward(
     device atomic_grad_t* grad_covs [[buffer(8)]],
     device atomic_grad_t* grad_colors [[buffer(9)]],
     device atomic_grad_t* grad_opacities [[buffer(10)]],
+    device atomic_grad_t* grad_means_abs [[buffer(11)]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]]
 ) {
@@ -973,6 +1068,7 @@ kernel void tiled_alpha_backward(
     }
 
     float g_mx = 0.0f, g_my = 0.0f;
+    float g_mx_abs = 0.0f, g_my_abs = 0.0f;
     float g_c00 = 0.0f, g_c01 = 0.0f, g_c10 = 0.0f, g_c11 = 0.0f;
     float g_c0 = 0.0f, g_c1 = 0.0f, g_c2 = 0.0f, g_o = 0.0f;
     if (hit) {
@@ -999,6 +1095,8 @@ kernel void tiled_alpha_backward(
       const float common = dL_dgaussian * gaussian;
       g_mx = common * ad_x;
       g_my = common * ad_y;
+      g_mx_abs = abs(g_mx);
+      g_my_abs = abs(g_my);
       const float half_common = 0.5f * common;
       g_c00 = half_common * (ad_x * ad_x);
       g_c01 = half_common * (ad_x * ad_y);
@@ -1009,6 +1107,8 @@ kernel void tiled_alpha_backward(
     }
     g_mx = simd_sum(g_mx);
     g_my = simd_sum(g_my);
+    g_mx_abs = simd_sum(g_mx_abs);
+    g_my_abs = simd_sum(g_my_abs);
     g_c00 = simd_sum(g_c00);
     g_c01 = simd_sum(g_c01);
     g_c10 = simd_sum(g_c10);
@@ -1020,6 +1120,8 @@ kernel void tiled_alpha_backward(
     if (simd_is_first()) {
       atomic_add_float(&grad_means[src * 2 + 0], g_mx);
       atomic_add_float(&grad_means[src * 2 + 1], g_my);
+      atomic_add_float(&grad_means_abs[src * 2 + 0], g_mx_abs);
+      atomic_add_float(&grad_means_abs[src * 2 + 1], g_my_abs);
       atomic_add_float(&grad_covs[src * 4 + 0], g_c00);
       atomic_add_float(&grad_covs[src * 4 + 1], g_c01);
       atomic_add_float(&grad_covs[src * 4 + 2], g_c10);
@@ -1079,10 +1181,8 @@ kernel void project_3d_vjp(
   const float z = cam_z;
   const float z2 = z * z;
   const float z3 = z2 * z;
-  const float j00 = cam.fx / z;
-  const float j02 = -cam.fx * cam_x / z2;
-  const float j11 = cam.fy / z;
-  const float j12 = -cam.fy * cam_y / z2;
+  float j00, j02, j11, j12, jx, jy;
+  ewa_jacobian(cam_x, cam_y, cam_z, cam, j00, j02, j11, j12, jx, jy);
 
   const float gpx = dmean2d[gid * 2 + 0];
   const float gpy = dmean2d[gid * 2 + 1];
@@ -1125,8 +1225,8 @@ kernel void project_3d_vjp(
   float dmz = gpx * j02 + gpy * j12;
   dmx += dJ02 * (-cam.fx / z2);
   dmy += dJ12 * (-cam.fy / z2);
-  dmz += dJ00 * (-cam.fx / z2) + dJ02 * (2.0f * cam.fx * cam_x / z3) +
-         dJ11 * (-cam.fy / z2) + dJ12 * (2.0f * cam.fy * cam_y / z3);
+  dmz += dJ00 * (-cam.fx / z2) + dJ02 * (2.0f * cam.fx * jx / z3) +
+         dJ11 * (-cam.fy / z2) + dJ12 * (2.0f * cam.fy * jy / z3);
 
   dmean3d[gid * 3 + 0] = cam.rwc00 * dmx + cam.rwc10 * dmy + cam.rwc20 * dmz;
   dmean3d[gid * 3 + 1] = cam.rwc01 * dmx + cam.rwc11 * dmy + cam.rwc21 * dmz;
@@ -1211,10 +1311,8 @@ kernel void project_3d_vjp_qs(
   const float z = cam_z;
   const float z2 = z * z;
   const float z3 = z2 * z;
-  const float j00 = cam.fx / z;
-  const float j02 = -cam.fx * cam_x / z2;
-  const float j11 = cam.fy / z;
-  const float j12 = -cam.fy * cam_y / z2;
+  float j00, j02, j11, j12, jx, jy;
+  ewa_jacobian(cam_x, cam_y, cam_z, cam, j00, j02, j11, j12, jx, jy);
 
   const float gpx = dmean2d[gid * 2 + 0];
   const float gpy = dmean2d[gid * 2 + 1];
@@ -1255,8 +1353,8 @@ kernel void project_3d_vjp_qs(
   float dmz = gpx * j02 + gpy * j12;
   dmx += dJ02 * (-cam.fx / z2);
   dmy += dJ12 * (-cam.fy / z2);
-  dmz += dJ00 * (-cam.fx / z2) + dJ02 * (2.0f * cam.fx * cam_x / z3) +
-         dJ11 * (-cam.fy / z2) + dJ12 * (2.0f * cam.fy * cam_y / z3);
+  dmz += dJ00 * (-cam.fx / z2) + dJ02 * (2.0f * cam.fx * jx / z3) +
+         dJ11 * (-cam.fy / z2) + dJ12 * (2.0f * cam.fy * jy / z3);
 
   dmean3d[gid * 3 + 0] = cam.rwc00 * dmx + cam.rwc10 * dmy + cam.rwc20 * dmz;
   dmean3d[gid * 3 + 1] = cam.rwc01 * dmx + cam.rwc11 * dmy + cam.rwc21 * dmz;
@@ -1424,6 +1522,7 @@ class MetalContext {
   id<MTLDevice> device() const { return device_; }
   id<MTLCommandQueue> queue() const { return queue_; }
   id<MTLComputePipelineState> forward_pipeline() const { return forward_pipeline_; }
+  id<MTLComputePipelineState> metric_pipeline() const { return metric_pipeline_; }
   id<MTLComputePipelineState> footprint_pipeline() const { return footprint_pipeline_; }
   id<MTLComputePipelineState> backward_pipeline() const { return backward_pipeline_; }
   id<MTLComputePipelineState> project_3d_pipeline() const { return project_3d_pipeline_; }
@@ -1457,8 +1556,69 @@ class MetalContext {
   }
 
   GrowBuf means, covs, scales, quats, colors, opa, proj, offsets, ids, output, go;
-  GrowBuf gm, gcov, gcol, gopa, gm3, gcov3, gls, gq, sh, dsh, camera, params;
-  GrowBuf mask, hitcounts, proj_means, proj_covs, depths;
+  GrowBuf gm, gcov, gcol, gopa, gm3, gcov3, gls, gq, sh, dsh, camera, params, gabs;
+  GrowBuf mask, hitcounts, proj_means, proj_covs, depths, last_gm2d, last_gm2d_abs, last_radii;
+  int last_gm2d_n = 0;
+  int last_gm2d_abs_n = 0;
+  int last_radii_n = 0;
+
+  void store_last_gm2d(id<MTLBuffer> gm_buf, int n, NSUInteger bytes) {
+    id<MTLBuffer> store = acquire(last_gm2d, bytes);
+    std::memcpy([store contents], [gm_buf contents], bytes);
+    last_gm2d_n = n;
+  }
+
+  void store_last_gm2d_abs(id<MTLBuffer> gm_abs_buf, int n, NSUInteger bytes) {
+    id<MTLBuffer> store = acquire(last_gm2d_abs, bytes);
+    std::memcpy([store contents], [gm_abs_buf contents], bytes);
+    last_gm2d_abs_n = n;
+  }
+
+  void store_last_radii2d(id<MTLBuffer> proj_buf, int n) {
+    if (proj_buf == nil || n <= 0) {
+      last_radii_n = 0;
+      return;
+    }
+    const auto* pg = static_cast<const ProjectedGaussian*>([proj_buf contents]);
+    id<MTLBuffer> store = acquire(last_radii, static_cast<NSUInteger>(n) * sizeof(float));
+    auto* out = static_cast<float*>([store contents]);
+    for (int i = 0; i < n; ++i) {
+      if (pg[i].max_x < pg[i].min_x || pg[i].max_y < pg[i].min_y) {
+        out[i] = 0.0f;
+        continue;
+      }
+      const int dx = pg[i].max_x - pg[i].min_x + 1;
+      const int dy = pg[i].max_y - pg[i].min_y + 1;
+      out[i] = 0.5f * static_cast<float>(std::max(dx, dy));
+    }
+    last_radii_n = n;
+  }
+
+  int copy_last_gm2d(float* out, int max_n) const {
+    if (out == nullptr || last_gm2d_n <= 0 || last_gm2d.buf == nil || max_n < last_gm2d_n) {
+      return 0;
+    }
+    std::memcpy(out, [last_gm2d.buf contents], static_cast<size_t>(last_gm2d_n) * 2 * sizeof(float));
+    return last_gm2d_n;
+  }
+
+  int copy_last_gm2d_abs(float* out, int max_n) const {
+    if (out == nullptr || last_gm2d_abs_n <= 0 || last_gm2d_abs.buf == nil ||
+        max_n < last_gm2d_abs_n) {
+      return 0;
+    }
+    std::memcpy(out, [last_gm2d_abs.buf contents],
+                static_cast<size_t>(last_gm2d_abs_n) * 2 * sizeof(float));
+    return last_gm2d_abs_n;
+  }
+
+  int copy_last_radii2d(float* out, int max_n) const {
+    if (out == nullptr || last_radii_n <= 0 || last_radii.buf == nil || max_n < last_radii_n) {
+      return 0;
+    }
+    std::memcpy(out, [last_radii.buf contents], static_cast<size_t>(last_radii_n) * sizeof(float));
+    return last_radii_n;
+  }
 
   struct BinRec {
     float depth;
@@ -1527,6 +1687,7 @@ class MetalContext {
     };
 
     forward_pipeline_ = make_pipe(@"tiled_alpha_forward");
+    metric_pipeline_ = make_pipe(@"tiled_metric_count");
     footprint_pipeline_ = make_pipe(@"footprint_hit_count");
     backward_pipeline_ = make_pipe(@"tiled_alpha_backward");
     project_3d_pipeline_ = make_pipe(@"project_gaussians_3d");
@@ -1542,6 +1703,7 @@ class MetalContext {
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   id<MTLComputePipelineState> forward_pipeline_ = nil;
+  id<MTLComputePipelineState> metric_pipeline_ = nil;
   id<MTLComputePipelineState> footprint_pipeline_ = nil;
   id<MTLComputePipelineState> backward_pipeline_ = nil;
   id<MTLComputePipelineState> project_3d_pipeline_ = nil;
@@ -1617,6 +1779,8 @@ CameraParams make_camera(const float* intrinsics, const float* c2w, int n, int h
   cam.n = static_cast<uint32_t>(n);
   cam.has_depths = has_depths ? 1u : 0u;
   cam.sh_degree = opts.sh_degree < 0 ? 0u : static_cast<uint32_t>(std::min(opts.sh_degree, 3));
+  cam.tan_fovx = (0.5f * static_cast<float>(w)) / std::max(cam.fx, 1e-6f);
+  cam.tan_fovy = (0.5f * static_cast<float>(h)) / std::max(cam.fy, 1e-6f);
   return cam;
 }
 
@@ -1630,6 +1794,22 @@ RasterParams make_raster_params(int h, int w, int c, int n_proj) {
   params.num_projected = static_cast<uint32_t>(n_proj);
   params.tiles_y = static_cast<uint32_t>((h + kTileSize - 1) / kTileSize);
   return params;
+}
+
+void ewa_jacobian_host(float cam_x, float cam_y, float cam_z, const CameraParams& cam, float& j00,
+                       float& j02, float& j11, float& j12, float& jx, float& jy) {
+  const float z = cam_z;
+  const float limx = 1.3f * cam.tan_fovx;
+  const float limy = 1.3f * cam.tan_fovy;
+  const float txtz = cam_x / z;
+  const float tytz = cam_y / z;
+  jx = std::min(limx, std::max(-limx, txtz)) * z;
+  jy = std::min(limy, std::max(-limy, tytz)) * z;
+  const float z2 = z * z;
+  j00 = cam.fx / z;
+  j02 = -cam.fx * jx / z2;
+  j11 = cam.fy / z;
+  j12 = -cam.fy * jy / z2;
 }
 
 float compact_radius(float s00, float s01, float s11, float min_covariance, float sigma_radius,
@@ -1685,17 +1865,15 @@ std::vector<ProjectedGaussian> project_gaussians(const float* means, const float
 
     const float proj_x = cam.fx * cam_x / cam_z + cam.cx;
     const float proj_y = cam.fy * cam_y / cam_z + cam.cy;
-    const float j00 = cam.fx / cam_z;
-    const float j02 = -cam.fx * cam_x / (cam_z * cam_z);
-    const float j11 = cam.fy / cam_z;
-    const float j12 = -cam.fy * cam_y / (cam_z * cam_z);
+    float j00, j02, j11, j12, jx, jy;
+    ewa_jacobian_host(cam_x, cam_y, cam_z, cam, j00, j02, j11, j12, jx, jy);
 
     float s00 = j00 * (ccov00 * j00 + ccov02 * j02) + j02 * (ccov20 * j00 + ccov22 * j02);
     float s01 = j00 * (ccov01 * j11 + ccov02 * j12) + j02 * (ccov21 * j11 + ccov22 * j12);
     float s10 = j11 * (ccov10 * j00 + ccov12 * j02) + j12 * (ccov20 * j00 + ccov22 * j02);
     float s11 = j11 * (ccov11 * j11 + ccov12 * j12) + j12 * (ccov21 * j11 + ccov22 * j12);
-    s00 += opts.min_covariance;
-    s11 += opts.min_covariance;
+    s00 += opts.min_covariance + 0.3f;
+    s11 += opts.min_covariance + 0.3f;
     float det = s00 * s11 - s01 * s10;
     if (det <= opts.min_covariance) {
       det = opts.min_covariance;
@@ -1881,6 +2059,13 @@ void bind_tile_buffers(id<MTLComputeCommandEncoder> enc, id<MTLComputePipelineSt
   [enc setBuffer:off_buf offset:0 atIndex:3];
   [enc setBuffer:id_buf offset:0 atIndex:4];
   [enc setBuffer:param_buf offset:0 atIndex:5];
+}
+
+id<MTLBuffer> acquire_zeroed_gabs(MetalContext& ctx, int n) {
+  const NSUInteger bytes = static_cast<NSUInteger>(n) * 2 * sizeof(float);
+  id<MTLBuffer> buf = ctx.acquire(ctx.gabs, bytes);
+  std::memset([buf contents], 0, bytes);
+  return buf;
 }
 
 void dispatch_tiles(id<MTLComputeCommandEncoder> enc, int tiles_x, int tiles_y) {
@@ -2093,6 +2278,7 @@ bool metal_tiled_backward(const std::vector<ProjectedGaussian>& projected,
     id<MTLBuffer> gcol_buf = ctx.acquire(ctx.gcol, gcol_bytes);
     id<MTLBuffer> gopa_buf = ctx.acquire(ctx.gopa, gopa_bytes);
     id<MTLBuffer> param_buf = ctx.acquire(ctx.params, sizeof(RasterParams));
+    id<MTLBuffer> gabs_buf = acquire_zeroed_gabs(ctx, n);
 
     blit_in(proj_buf, projected.data(), projected.size() * sizeof(ProjectedGaussian));
     blit_in(color_buf, colors, static_cast<size_t>(n) * c * sizeof(float));
@@ -2117,6 +2303,7 @@ bool metal_tiled_backward(const std::vector<ProjectedGaussian>& projected,
     [enc setBuffer:gcov_buf offset:0 atIndex:8];
     [enc setBuffer:gcol_buf offset:0 atIndex:9];
     [enc setBuffer:gopa_buf offset:0 atIndex:10];
+    [enc setBuffer:gabs_buf offset:0 atIndex:11];
     dispatch_tiles(enc, static_cast<int>(params.tiles_x), static_cast<int>(params.tiles_y));
     [enc endEncoding];
     [cmd commit];
@@ -2331,6 +2518,7 @@ bool gpu_forward(const float* means, const float* covs, const float* colors, con
     ctx.session_c = c;
     ctx.session_h = h;
     ctx.session_w = w;
+    ctx.store_last_radii2d(proj_buf, n);
     if (profile) {
       auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
       std::fprintf(stderr,
@@ -2436,6 +2624,7 @@ bool gpu_forward_qs(const float* means, const float* log_scales, const float* qu
     ctx.session_c = c;
     ctx.session_h = h;
     ctx.session_w = w;
+    ctx.store_last_radii2d(proj_buf, n);
     if (profile) {
       auto ms = [](auto a, auto b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -2510,6 +2699,7 @@ bool gpu_backward(const float* grad_output, const float* proj_means, const float
     id<MTLBuffer> gcov_buf = ctx.acquire(ctx.gcov, gc_bytes);
     id<MTLBuffer> gcol_buf = ctx.acquire(ctx.gcol, gcol_bytes);
     id<MTLBuffer> gopa_buf = ctx.acquire(ctx.gopa, gopa_bytes);
+    id<MTLBuffer> gabs_buf = acquire_zeroed_gabs(ctx, n);
     blit_in(go_buf, grad_output, static_cast<size_t>(h) * w * c * sizeof(float));
     std::memset([gm_buf contents], 0, gm_bytes);
     std::memset([gcov_buf contents], 0, gc_bytes);
@@ -2525,6 +2715,7 @@ bool gpu_backward(const float* grad_output, const float* proj_means, const float
     [encr setBuffer:gcov_buf offset:0 atIndex:8];
     [encr setBuffer:gcol_buf offset:0 atIndex:9];
     [encr setBuffer:gopa_buf offset:0 atIndex:10];
+    [encr setBuffer:gabs_buf offset:0 atIndex:11];
     dispatch_tiles(encr, static_cast<int>(params.tiles_x), static_cast<int>(params.tiles_y));
     [encr endEncoding];
     [cmdr commit];
@@ -2567,6 +2758,7 @@ bool gpu_session_backward(const float* grad_output, int n, int c, int h, int w,
     id<MTLBuffer> gopa_buf = ctx.acquire(ctx.gopa, gopa_bytes);
     id<MTLBuffer> gm3_buf = ctx.acquire(ctx.gm3, gm3_bytes);
     id<MTLBuffer> gcov3_buf = ctx.acquire(ctx.gcov3, gc3_bytes);
+    id<MTLBuffer> gabs_buf = acquire_zeroed_gabs(ctx, n);
     blit_in(go_buf, grad_output, static_cast<size_t>(h) * w * c * sizeof(float));
     std::memset([gm_buf contents], 0, gm_bytes);
     std::memset([gcov_buf contents], 0, gc_bytes);
@@ -2583,6 +2775,7 @@ bool gpu_session_backward(const float* grad_output, int n, int c, int h, int w,
     [enc setBuffer:gcov_buf offset:0 atIndex:8];
     [enc setBuffer:gcol_buf offset:0 atIndex:9];
     [enc setBuffer:gopa_buf offset:0 atIndex:10];
+    [enc setBuffer:gabs_buf offset:0 atIndex:11];
     dispatch_tiles(enc, static_cast<int>(params.tiles_x), static_cast<int>(params.tiles_y));
     [enc endEncoding];
 
@@ -2604,6 +2797,8 @@ bool gpu_session_backward(const float* grad_output, int n, int c, int h, int w,
     std::memcpy(grad_covs3d, [gcov3_buf contents], gc3_bytes);
     std::memcpy(grad_colors, [gcol_buf contents], gcol_bytes);
     std::memcpy(grad_opacities, [gopa_buf contents], gopa_bytes);
+    ctx.store_last_gm2d(gm_buf, n, gm_bytes);
+    ctx.store_last_gm2d_abs(gabs_buf, n, gm_bytes);
     ctx.session_valid = false;
     ctx.session_qs = false;
     ctx.session_sh = false;
@@ -2660,6 +2855,7 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     id<MTLBuffer> gls_buf = ctx.acquire(ctx.gls, gls_bytes);
     id<MTLBuffer> gq_buf = ctx.acquire(ctx.gq, gq_bytes);
     id<MTLBuffer> dsh_buf = use_sh ? ctx.acquire(ctx.dsh, dsh_bytes) : nil;
+    id<MTLBuffer> gabs_buf = acquire_zeroed_gabs(ctx, n);
     blit_in(go_buf, grad_output, static_cast<size_t>(h) * w * c * sizeof(float));
     std::memset([gm_buf contents], 0, gm_bytes);
     std::memset([gcov_buf contents], 0, gc_bytes);
@@ -2679,6 +2875,7 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     [enc setBuffer:gcov_buf offset:0 atIndex:8];
     [enc setBuffer:gcol_buf offset:0 atIndex:9];
     [enc setBuffer:gopa_buf offset:0 atIndex:10];
+    [enc setBuffer:gabs_buf offset:0 atIndex:11];
     dispatch_tiles(enc, static_cast<int>(params.tiles_x), static_cast<int>(params.tiles_y));
     [enc endEncoding];
 
@@ -2718,6 +2915,8 @@ bool gpu_session_backward_qs(const float* grad_output, int n, int c, int h, int 
     } else {
       std::memcpy(grad_colors, [gcol_buf contents], gcol_bytes);
     }
+    ctx.store_last_gm2d(gm_buf, n, gm_bytes);
+    ctx.store_last_gm2d_abs(gabs_buf, n, gm_bytes);
     ctx.session_valid = false;
     ctx.session_qs = false;
     ctx.session_sh = false;
@@ -2937,6 +3136,50 @@ bool gaussian_splat_3d_session_backward_qs_sh(
                                  grad_opacities, grad_sh, opts);
 }
 
+bool count_session_metric_hits(const uint8_t* error_mask, int* counts, int num_gaussians,
+                               int height, int width) {
+  if (num_gaussians <= 0 || height <= 0 || width <= 0 || error_mask == nullptr ||
+      counts == nullptr) {
+    return false;
+  }
+  std::fill(counts, counts + num_gaussians, 0);
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  if (!ctx.session_valid || ctx.session_n != num_gaussians || ctx.session_h != height ||
+      ctx.session_w != width || ctx.metric_pipeline() == nil || ctx.proj.buf == nil ||
+      ctx.opa.buf == nil || ctx.offsets.buf == nil || ctx.ids.buf == nil) {
+    return false;
+  }
+  @autoreleasepool {
+    const RasterParams params = make_raster_params(height, width, ctx.session_c, num_gaussians);
+    id<MTLBuffer> param_buf = ctx.acquire(ctx.params, sizeof(RasterParams));
+    blit_in(param_buf, &params, sizeof(RasterParams));
+    id<MTLBuffer> mask_buf =
+        ctx.acquire(ctx.mask, static_cast<NSUInteger>(height) * static_cast<NSUInteger>(width));
+    id<MTLBuffer> count_buf =
+        ctx.acquire(ctx.hitcounts, static_cast<NSUInteger>(num_gaussians) * sizeof(int));
+    blit_in(mask_buf, error_mask, static_cast<size_t>(height) * static_cast<size_t>(width));
+    std::memset([count_buf contents], 0, static_cast<size_t>(num_gaussians) * sizeof(int));
+
+    id<MTLCommandBuffer> cmd = [ctx.queue() commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:ctx.metric_pipeline()];
+    [enc setBuffer:ctx.proj.buf offset:0 atIndex:0];
+    [enc setBuffer:ctx.opa.buf offset:0 atIndex:1];
+    [enc setBuffer:ctx.offsets.buf offset:0 atIndex:2];
+    [enc setBuffer:ctx.ids.buf offset:0 atIndex:3];
+    [enc setBuffer:param_buf offset:0 atIndex:4];
+    [enc setBuffer:mask_buf offset:0 atIndex:5];
+    [enc setBuffer:count_buf offset:0 atIndex:6];
+    dispatch_tiles(enc, static_cast<int>(params.tiles_x), static_cast<int>(params.tiles_y));
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    std::memcpy(counts, [count_buf contents], static_cast<size_t>(num_gaussians) * sizeof(int));
+  }
+  return true;
+}
+
 bool count_footprint_hits(const float* proj_means, const float* proj_covs, const float* opacities,
                           int num_gaussians, int height, int width, const uint8_t* error_mask,
                           int* counts, const Splat3DMetalOptions& opts) {
@@ -3035,6 +3278,42 @@ bool count_footprint_hits(const float* proj_means, const float* proj_covs, const
     counts[pg.source_index] += hits;
   }
   return true;
+}
+
+int last_grad_means2d_count() {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.last_gm2d_n;
+}
+
+int copy_last_grad_means2d(float* out, int max_n) {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.copy_last_gm2d(out, max_n);
+}
+
+int last_grad_means2d_abs_count() {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.last_gm2d_abs_n;
+}
+
+int copy_last_grad_means2d_abs(float* out, int max_n) {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.copy_last_gm2d_abs(out, max_n);
+}
+
+int last_radii2d_count() {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.last_radii_n;
+}
+
+int copy_last_radii2d(float* out, int max_n) {
+  auto& ctx = MetalContext::instance();
+  std::lock_guard<std::mutex> lock(ctx.mutex());
+  return ctx.copy_last_radii2d(out, max_n);
 }
 
 }  // namespace metal
