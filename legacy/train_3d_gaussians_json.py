@@ -882,7 +882,7 @@ def densify_and_prune(
     height: int = 0,
     width: int = 0,
 ) -> bool:
-    """Densify and prune following gsplat's DefaultStrategy."""
+    """Built-in densify and prune (grad-threshold clone/split + opacity prune)."""
     with torch.no_grad():
         n = data.num_gaussians
         means = data.means.detach().clone()[:n]

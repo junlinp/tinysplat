@@ -110,7 +110,7 @@ tinysplat/
 
 - No spherical harmonics, densification, or COLMAP loader in C++
 - 3D CUDA backward is in **projected 2D space** only (full 3D Jacobian chain not implemented)
-- Python training remains in `train_3d_gaussians_json.py` (gsplat backend)
+- Python training remains in `train_3d_gaussians_json.py` (built-in densify/prune; no gsplat)
 
 ## Legacy Python version
 
@@ -122,7 +122,7 @@ Novel-view PSNR / SSIM / LPIPS on the standard **train** / **truck** scenes (Hug
 
 ```bash
 pip install -e legacy
-pip install gsplat huggingface_hub lpips pytorch-msssim
+pip install huggingface_hub lpips pytorch-msssim
 
 python benchmarks/tanks_and_temples/run_benchmark.py --device cuda
 # smoke: add --iterations 200
