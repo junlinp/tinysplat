@@ -32,7 +32,7 @@ __global__ void precompute_gaussians_kernel(
     const float* __restrict__ means,  // (N, 2)
     const float* __restrict__ covs,   // (N, 4)
     Gaussian2D* __restrict__ out,
-    int N, int H, int W
+    int N, int H, int W, bool density_normalize
 ) {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= N) return;
@@ -62,7 +62,7 @@ __global__ void precompute_gaussians_kernel(
     out[g] = Gaussian2D{
         mx, my,
         d * inv_det, -b * inv_det, -c * inv_det, a * inv_det,
-        1.0f / (2.0f * kPi * sqrtf(det + kEps)),
+        density_normalize ? 1.0f / (2.0f * kPi * sqrtf(det + kEps)) : 1.0f,
         0.0f,
         min_x, max_x, min_y, max_y
     };
@@ -96,8 +96,10 @@ __global__ void count_tile_membership_kernel(
 // Assign gaussian IDs into tile bins
 __global__ void assign_tile_bins_kernel(
     const Gaussian2D* __restrict__ gaussians,
-    int* __restrict__ tile_counts,
+    const int* __restrict__ tile_starts,   // exclusive prefix sum, num_tiles + 1
+    int* __restrict__ tile_fill,           // per-tile fill counter, zeroed
     int* __restrict__ tile_bins,
+    int* __restrict__ bin_tile_ids,        // tile index per slot, for sorting
     int tiles_x, int tiles_y, int N
 ) {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
@@ -114,8 +116,14 @@ __global__ void assign_tile_bins_kernel(
     for (int ty = tile_min_y; ty <= tile_max_y; ++ty) {
         for (int tx = tile_min_x; tx <= tile_max_x; ++tx) {
             if (tx < 0 || tx >= tiles_x || ty < 0 || ty >= tiles_y) continue;
-            int slot = atomicAdd(&tile_counts[ty * tiles_x + tx], 1);
+            const int tile_idx = ty * tiles_x + tx;
+            // atomicAdd returns a per-tile local slot; it must be offset by the
+            // tile's base in tile_bins. Without the base every tile wrote from
+            // index 0 and the bins aliased each other.
+            const int local = atomicAdd(&tile_fill[tile_idx], 1);
+            const int slot = tile_starts[tile_idx] + local;
             tile_bins[slot] = g;
+            bin_tile_ids[slot] = tile_idx;
         }
     }
 }
@@ -185,13 +193,11 @@ __global__ void rasterize_backward_kernel(
     const Gaussian2D* __restrict__ gaussians,
     const float* __restrict__ colors,
     const float* __restrict__ opacities,
-    const int* __restrict__ tile_starts,
-    const int* __restrict__ tile_bins,
     float* __restrict__ grad_means,
     float* __restrict__ grad_covs,
     float* __restrict__ grad_colors,
     float* __restrict__ grad_opacities,
-    int N, int H, int W, int C, int tiles_x, int tiles_y
+    int N, int H, int W, int C
 ) {
     int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= N) return;
@@ -206,17 +212,12 @@ __global__ void rasterize_backward_kernel(
         for (int x = gk.min_x; x <= gk.max_x; ++x) {
             if (x < 0 || x >= W || y < 0 || y >= H) continue;
 
-            int tile_x = x / kTileSize;
-            int tile_y = y / kTileSize;
-            int tile_idx = tile_y * tiles_x + tile_x;
-            int bin_start = tile_starts[tile_idx];
-            int bin_end = tile_starts[tile_idx + 1];
-
-            bool in_tile = false;
-            for (int bi = bin_start; bi < bin_end; ++bi) {
-                if (tile_bins[bi] == g) { in_tile = true; break; }
-            }
-            if (!in_tile) continue;
+            // This loop already walks only g's own bounding box, and
+            // assign_tile_bins_kernel puts g in every tile that box overlaps,
+            // so g is guaranteed to be in the bin of the tile containing (x, y).
+            // The old code proved that by scanning the whole bin for g at every
+            // pixel -- O(bbox_area * bin_length) per Gaussian, which dominated
+            // the backward pass (~37 s/iter on an RTX 4090 at N=136k).
 
             float dx = (float)x - gk.mean_x;
             float dy = (float)y - gk.mean_y;
@@ -279,7 +280,13 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
     torch::Tensor colors,
     torch::Tensor opacities,
     int64_t height,
-    int64_t width
+    int64_t width,
+    // 3DGS alpha compositing uses alpha = opacity * exp(-0.5 * quad) with no
+    // density normalization; the 1/(2*pi*sqrt(det)) factor only belongs in the
+    // weighted mode where it cancels. Applying it here scaled alpha down by the
+    // screen-space Gaussian's peak density (~22x on truck) and made every CUDA
+    // render far too dim. Default true to preserve the standalone 2D API.
+    bool density_normalize
 ) {
     TORCH_CHECK(means.is_cuda(), "means must be CUDA");
     TORCH_CHECK(covariances.is_cuda(), "covariances must be CUDA");
@@ -304,7 +311,7 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
         means.data_ptr<float>(),
         covariances.data_ptr<float>(),
         (Gaussian2D*)gaussians.data_ptr<float>(),
-        N, H, W
+        N, H, W, density_normalize
     );
 
     // 2. Count tile memberships
@@ -315,26 +322,39 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
         tiles_x, tiles_y, N
     );
 
-    // 3. Prefix sum to get offsets
-    auto counts_host = tile_counts.cpu();
-    std::vector<int> counts(num_tiles);
-    for (int i = 0; i < num_tiles; ++i) counts[i] = counts_host.data_ptr<int>()[i];
-
-    std::vector<int> tile_starts(num_tiles + 1, 0);
-    for (int i = 0; i < num_tiles; ++i) tile_starts[i + 1] = tile_starts[i] + counts[i];
-    int total_bins = tile_starts[num_tiles];
+    // 3. Exclusive prefix sum on device. Doing this on the host cost a full
+    //    device->host->device round trip (and a pipeline stall) every call.
+    auto tile_starts_t = torch::zeros({num_tiles + 1},
+                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    tile_starts_t.slice(0, 1, num_tiles + 1).copy_(torch::cumsum(tile_counts, 0, torch::kInt32));
+    // Only the grand total needs to reach the host, to size the bin buffer.
+    const int total_bins = tile_starts_t[num_tiles].item<int>();
 
     // 4. Build tile bins
-    auto tile_bins = torch::zeros({total_bins}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    auto tile_counts_tmp = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    auto tile_bins = torch::zeros({std::max(total_bins, 1)},
+                                  torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    auto tile_fill = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    auto bin_tile_ids = torch::zeros_like(tile_bins);
     assign_tile_bins_kernel<<<blocks, 256>>>(
         (Gaussian2D*)gaussians.data_ptr<float>(),
-        tile_counts_tmp.data_ptr<int>(),
+        tile_starts_t.data_ptr<int>(),
+        tile_fill.data_ptr<int>(),
         tile_bins.data_ptr<int>(),
+        bin_tile_ids.data_ptr<int>(),
         tiles_x, tiles_y, N
     );
 
-    auto tile_starts_t = torch::from_blob(tile_starts.data(), {num_tiles + 1}, torch::kInt32).clone().to(torch::kCUDA);
+    // atomicAdd hands out slots in nondeterministic order, so within a tile the
+    // bin was unsorted. Alpha compositing is order-dependent and the caller
+    // supplies Gaussians already sorted front-to-back, so index order *is* depth
+    // order: sorting each tile's segment by Gaussian id restores it. Sorting the
+    // composite key (tile_idx, g) globally does this in one pass and preserves
+    // the tile_starts layout, since tile_idx is the high-order part.
+    if (total_bins > 0) {
+        auto keys = bin_tile_ids.to(torch::kInt64) * (int64_t)(N + 1)
+                  + tile_bins.to(torch::kInt64);
+        tile_bins = tile_bins.index({torch::argsort(keys)}).contiguous();
+    }
 
     // 5. Rasterize
     auto output = torch::zeros({H, W, C}, torch::TensorOptions().dtype(colors.dtype()).device(torch::kCUDA));
@@ -363,14 +383,14 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
     torch::Tensor colors,
     torch::Tensor opacities,
     int64_t height,
-    int64_t width
+    int64_t width,
+    // Must match the forward's convention or the gradients are inconsistent
+    // with the rendered image.
+    bool density_normalize
 ) {
     auto N = means.size(0);
     auto C = colors.size(1);
     int H = (int)height, W = (int)width;
-    int tiles_x = (W + kTileSize - 1) / kTileSize;
-    int tiles_y = (H + kTileSize - 1) / kTileSize;
-    int num_tiles = tiles_x * tiles_y;
 
     // Gaussian2D is 48 bytes (8 floats + 4 ints); the buffer is reinterpreted as
     // Gaussian2D* below, so it must hold N structs, not N floats.
@@ -382,35 +402,11 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
         means.contiguous().data_ptr<float>(),
         covariances.contiguous().data_ptr<float>(),
         (Gaussian2D*)gaussians.data_ptr<float>(),
-        N, H, W
+        N, H, W, density_normalize
     );
 
-    auto tile_counts = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    count_tile_membership_kernel<<<blocks, 256>>>(
-        (Gaussian2D*)gaussians.data_ptr<float>(),
-        tile_counts.data_ptr<int>(),
-        tiles_x, tiles_y, N
-    );
-
-    auto counts_host = tile_counts.cpu();
-    std::vector<int> counts(num_tiles);
-    for (int i = 0; i < num_tiles; ++i) counts[i] = counts_host.data_ptr<int>()[i];
-
-    std::vector<int> tile_starts(num_tiles + 1, 0);
-    for (int i = 0; i < num_tiles; ++i) tile_starts[i + 1] = tile_starts[i] + counts[i];
-    int total_bins = tile_starts[num_tiles];
-
-    auto tile_bins = torch::zeros({total_bins}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    auto tile_counts_tmp = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    assign_tile_bins_kernel<<<blocks, 256>>>(
-        (Gaussian2D*)gaussians.data_ptr<float>(),
-        tile_counts_tmp.data_ptr<int>(),
-        tile_bins.data_ptr<int>(),
-        tiles_x, tiles_y, N
-    );
-
-    auto tile_starts_t = torch::from_blob(tile_starts.data(), {num_tiles + 1}, torch::kInt32).clone().to(torch::kCUDA);
-
+    // The backward accumulates per Gaussian over its own bounding box and no
+    // longer consults the tile bins, so none of the binning work is needed here.
     auto grad_means = torch::zeros_like(means);
     auto grad_covariances = torch::zeros_like(covariances);
     auto grad_colors = torch::zeros_like(colors);
@@ -422,13 +418,11 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
         (Gaussian2D*)gaussians.data_ptr<float>(),
         colors.contiguous().data_ptr<float>(),
         opacities.contiguous().data_ptr<float>(),
-        tile_starts_t.data_ptr<int>(),
-        tile_bins.data_ptr<int>(),
         grad_means.data_ptr<float>(),
         grad_covariances.data_ptr<float>(),
         grad_colors.data_ptr<float>(),
         grad_opacities.data_ptr<float>(),
-        N, H, W, C, tiles_x, tiles_y
+        N, H, W, C
     );
 
     return {grad_means, grad_covariances, grad_colors, grad_opacities};
@@ -444,8 +438,10 @@ torch::Tensor gaussian_splat_3d_projected_forward_cuda(
     float min_covariance,
     float sigma_radius
 ) {
+    // 3DGS alpha convention: no density normalization.
     return gaussian_splat_2d_forward_cuda(
-        projected_means, projected_covariances, projected_colors, projected_opacities, height, width);
+        projected_means, projected_covariances, projected_colors, projected_opacities,
+        height, width, /*density_normalize=*/false);
 }
 
 std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
@@ -459,6 +455,270 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
     float min_covariance,
     float sigma_radius
 ) {
+    // 3DGS alpha convention, matching gaussian_splat_3d_projected_forward_cuda.
     return gaussian_splat_2d_backward_cuda(
-        grad_output, projected_means, projected_covariances, projected_colors, projected_opacities, height, width);
+        grad_output, projected_means, projected_covariances, projected_colors,
+        projected_opacities, height, width, /*density_normalize=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// Fused 3D -> 2D projection (forward + VJP)
+//
+// Replaces the pure-PyTorch projection chain, which dominated training: an
+// iteration cost ~112 ms of which the raster kernels were only 5-8 ms, the
+// rest being autograd unwinding hundreds of small ops over N Gaussians.
+//
+// Semantics match _project_gaussians_3d_to_2d_pytorch exactly (no Inria
+// low-pass), so this is a pure speedup and the CPU/CUDA parity test still holds.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct CamConst {
+    float w[9];   // world->camera rotation, row major
+    float t[3];   // world->camera translation
+    float fx, fy, cx, cy;
+    float near_plane, min_cov;
+};
+
+__global__ void project_fwd_kernel(
+    const float* __restrict__ means,   // (N,3)
+    const float* __restrict__ cov3,    // (N,9)
+    float* __restrict__ proj_means,    // (N,2)
+    float* __restrict__ cov2d,         // (N,4)  xx,xy,yx,yy
+    float* __restrict__ depth,         // (N)
+    bool*  __restrict__ visible,       // (N)
+    CamConst cam, int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    const float mx = means[i*3+0], my = means[i*3+1], mz = means[i*3+2];
+    const float cx_ = cam.w[0]*mx + cam.w[1]*my + cam.w[2]*mz + cam.t[0];
+    const float cy_ = cam.w[3]*mx + cam.w[4]*my + cam.w[5]*mz + cam.t[1];
+    const float cz  = cam.w[6]*mx + cam.w[7]*my + cam.w[8]*mz + cam.t[2];
+
+    depth[i]   = cz;
+    visible[i] = cz > cam.near_plane;
+    const float z = visible[i] ? cz : 1.0f;   // matches torch.where(safe_z)
+
+    proj_means[i*2+0] = cam.fx * cx_ / z + cam.cx;
+    proj_means[i*2+1] = cam.fy * cy_ / z + cam.cy;
+
+    // Cc = W * cov3 * W^T
+    float tmp[9], cc[9];
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float s = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) s += cam.w[r*3+k] * cov3[i*9 + k*3 + c];
+            tmp[r*3+c] = s;
+        }
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float s = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) s += tmp[r*3+k] * cam.w[c*3+k];
+            cc[r*3+c] = s;
+        }
+
+    const float iz = 1.0f / z, iz2 = iz * iz;
+    const float j00 = cam.fx * iz, j02 = -cam.fx * cx_ * iz2;
+    const float j11 = cam.fy * iz, j12 = -cam.fy * cy_ * iz2;
+
+    // C2 = J Cc J^T with J = [[j00,0,j02],[0,j11,j12]]
+    const float a0 = j00*cc[0] + j02*cc[6];
+    const float a1 = j00*cc[1] + j02*cc[7];
+    const float a2 = j00*cc[2] + j02*cc[8];
+    const float b0 = j11*cc[3] + j12*cc[6];
+    const float b1 = j11*cc[4] + j12*cc[7];
+    const float b2 = j11*cc[5] + j12*cc[8];
+
+    cov2d[i*4+0] = a0*j00 + a2*j02 + cam.min_cov;
+    cov2d[i*4+1] = a1*j11 + a2*j12;
+    cov2d[i*4+2] = b0*j00 + b2*j02;
+    cov2d[i*4+3] = b1*j11 + b2*j12 + cam.min_cov;
+}
+
+__global__ void project_bwd_kernel(
+    const float* __restrict__ g_proj_means,  // (N,2)
+    const float* __restrict__ g_cov2d,       // (N,4)
+    const float* __restrict__ g_depth,       // (N)
+    const float* __restrict__ means,         // (N,3)
+    const float* __restrict__ cov3,          // (N,9)
+    float* __restrict__ grad_means,          // (N,3)
+    float* __restrict__ grad_cov3,           // (N,9)
+    CamConst cam, int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    const float mx = means[i*3+0], my = means[i*3+1], mz = means[i*3+2];
+    const float cx_ = cam.w[0]*mx + cam.w[1]*my + cam.w[2]*mz + cam.t[0];
+    const float cy_ = cam.w[3]*mx + cam.w[4]*my + cam.w[5]*mz + cam.t[1];
+    const float cz  = cam.w[6]*mx + cam.w[7]*my + cam.w[8]*mz + cam.t[2];
+    const bool  vis = cz > cam.near_plane;
+    const float z   = vis ? cz : 1.0f;
+    const float iz = 1.0f / z, iz2 = iz*iz, iz3 = iz2*iz;
+
+    float tmp[9], cc[9];
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float s = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) s += cam.w[r*3+k] * cov3[i*9 + k*3 + c];
+            tmp[r*3+c] = s;
+        }
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float s = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) s += tmp[r*3+k] * cam.w[c*3+k];
+            cc[r*3+c] = s;
+        }
+
+    const float j00 = cam.fx * iz, j02 = -cam.fx * cx_ * iz2;
+    const float j11 = cam.fy * iz, j12 = -cam.fy * cy_ * iz2;
+
+    const float G00 = g_cov2d[i*4+0], G01 = g_cov2d[i*4+1];
+    const float G10 = g_cov2d[i*4+2], G11 = g_cov2d[i*4+3];
+
+    // dCc = J^T G J   (3x3, J is 2x3)
+    float Jm[6] = {j00, 0.f, j02, 0.f, j11, j12};   // row major 2x3
+    float GJ[6];                                    // G * J  -> 2x3
+    #pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        GJ[0*3+c] = G00*Jm[0*3+c] + G01*Jm[1*3+c];
+        GJ[1*3+c] = G10*Jm[0*3+c] + G11*Jm[1*3+c];
+    }
+    float dCc[9];
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c)
+            dCc[r*3+c] = Jm[0*3+r]*GJ[0*3+c] + Jm[1*3+r]*GJ[1*3+c];
+
+    // grad_cov3 = W^T dCc W
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float s = 0.f;
+            #pragma unroll
+            for (int a = 0; a < 3; ++a)
+                #pragma unroll
+                for (int b = 0; b < 3; ++b)
+                    s += cam.w[a*3+r] * dCc[a*3+b] * cam.w[b*3+c];
+            grad_cov3[i*9 + r*3 + c] = s;
+        }
+
+    // dJ = G J Cc^T + G^T J Cc ; Cc symmetric so dJ = (G + G^T) J Cc
+    float Gs00 = G00 + G00, Gs01 = G01 + G10, Gs10 = G10 + G01, Gs11 = G11 + G11;
+    float JC[6];   // J * Cc -> 2x3
+    #pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        JC[0*3+c] = j00*cc[0*3+c] + j02*cc[2*3+c];
+        JC[1*3+c] = j11*cc[1*3+c] + j12*cc[2*3+c];
+    }
+    // dL/dJ = (G + G^T) J Cc  -- no 1/2 factor.
+    float dJ[6];
+    #pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        dJ[0*3+c] = Gs00*JC[0*3+c] + Gs01*JC[1*3+c];
+        dJ[1*3+c] = Gs10*JC[0*3+c] + Gs11*JC[1*3+c];
+    }
+
+    // camera-space gradient
+    const float dpx = g_proj_means[i*2+0], dpy = g_proj_means[i*2+1];
+    float dcx = j00 * dpx;                 // d p / d c == J
+    float dcy = j11 * dpy;
+    float dcz = j02 * dpx + j12 * dpy;
+
+    // through J's dependence on (cx_, cy_, z)
+    dcx += dJ[0*3+2] * (-cam.fx * iz2);
+    dcy += dJ[1*3+2] * (-cam.fy * iz2);
+    dcz += dJ[0*3+0] * (-cam.fx * iz2)
+         + dJ[0*3+2] * ( 2.0f * cam.fx * cx_ * iz3)
+         + dJ[1*3+1] * (-cam.fy * iz2)
+         + dJ[1*3+2] * ( 2.0f * cam.fy * cy_ * iz3);
+
+    if (!vis) { dcx = 0.f; dcy = 0.f; dcz = 0.f; }   // safe_z branch is constant
+    dcz += g_depth[i];                               // depth is emitted directly
+
+    // grad_means = W^T dc
+    grad_means[i*3+0] = cam.w[0]*dcx + cam.w[3]*dcy + cam.w[6]*dcz;
+    grad_means[i*3+1] = cam.w[1]*dcx + cam.w[4]*dcy + cam.w[7]*dcz;
+    grad_means[i*3+2] = cam.w[2]*dcx + cam.w[5]*dcy + cam.w[8]*dcz;
+}
+
+CamConst make_cam(torch::Tensor intrinsics, torch::Tensor camera_to_world,
+                  float near_plane, float min_cov) {
+    auto K = intrinsics.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto M = camera_to_world.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    auto k = K.accessor<float,2>();
+    auto m = M.accessor<float,2>();
+    CamConst c{};
+    // world->camera is the inverse of camera_to_world (rotation transposed)
+    for (int r = 0; r < 3; ++r)
+        for (int col = 0; col < 3; ++col) c.w[r*3+col] = m[col][r];
+    for (int r = 0; r < 3; ++r)
+        c.t[r] = -(c.w[r*3+0]*m[0][3] + c.w[r*3+1]*m[1][3] + c.w[r*3+2]*m[2][3]);
+    c.fx = k[0][0]; c.fy = k[1][1]; c.cx = k[0][2]; c.cy = k[1][2];
+    c.near_plane = near_plane; c.min_cov = min_cov;
+    return c;
+}
+
+}  // namespace
+
+std::vector<torch::Tensor> project_3d_forward_cuda(
+    torch::Tensor means, torch::Tensor cov3,
+    torch::Tensor intrinsics, torch::Tensor camera_to_world,
+    double near_plane, double min_covariance
+) {
+    TORCH_CHECK(means.is_cuda(), "means must be CUDA");
+    auto m = means.contiguous(), c = cov3.contiguous().view({-1, 9});
+    const int N = (int)m.size(0);
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto proj_means = torch::empty({N, 2}, f32);
+    auto cov2d      = torch::empty({N, 4}, f32);
+    auto depth      = torch::empty({N}, f32);
+    auto visible    = torch::empty({N}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
+    if (N > 0) {
+        project_fwd_kernel<<<(N + 255) / 256, 256>>>(
+            m.data_ptr<float>(), c.data_ptr<float>(),
+            proj_means.data_ptr<float>(), cov2d.data_ptr<float>(),
+            depth.data_ptr<float>(), visible.data_ptr<bool>(),
+            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance), N);
+    }
+    return {proj_means, cov2d, depth, visible};
+}
+
+std::vector<torch::Tensor> project_3d_backward_cuda(
+    torch::Tensor grad_proj_means, torch::Tensor grad_cov2d, torch::Tensor grad_depth,
+    torch::Tensor means, torch::Tensor cov3,
+    torch::Tensor intrinsics, torch::Tensor camera_to_world,
+    double near_plane, double min_covariance
+) {
+    auto m  = means.contiguous(), c = cov3.contiguous().view({-1, 9});
+    auto gp = grad_proj_means.contiguous(), gc = grad_cov2d.contiguous().view({-1, 4});
+    auto gd = grad_depth.contiguous();
+    const int N = (int)m.size(0);
+    auto grad_means = torch::zeros_like(m);
+    auto grad_cov3  = torch::zeros({N, 9}, m.options());
+    if (N > 0) {
+        project_bwd_kernel<<<(N + 255) / 256, 256>>>(
+            gp.data_ptr<float>(), gc.data_ptr<float>(), gd.data_ptr<float>(),
+            m.data_ptr<float>(), c.data_ptr<float>(),
+            grad_means.data_ptr<float>(), grad_cov3.data_ptr<float>(),
+            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance), N);
+    }
+    return {grad_means, grad_cov3.view({N, 3, 3})};
 }

@@ -2264,7 +2264,13 @@ def main():
                 if changed:
                     optimizers = make_optimizers(step_idx)
                 n = gauss_data.num_gaussians
+                # All four accumulators are indexed per Gaussian, so every one
+                # must follow a clone/split. Resizing only two left
+                # absgrad_accum and grad3d_accum at the old length and the next
+                # step raised a shape mismatch.
                 grad_accum = torch.zeros(n, device=gauss_data.device)
+                absgrad_accum = torch.zeros(n, device=gauss_data.device)
+                grad3d_accum = torch.zeros(n, device=gauss_data.device)
                 vis_count = torch.zeros(n, device=gauss_data.device)
             if (
                 args.reset_opacity_every > 0
