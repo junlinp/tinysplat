@@ -234,6 +234,74 @@ _PROJECT_REGISTRY: Dict[str, Callable] = {}
 _PREPARE_REGISTRY: Dict[str, Callable] = {}
 
 
+def register_cuda_3d_core():
+    """CUDA-specific projection prep: keep the visibility/overlap filter, drop
+    the global depth sort.
+
+    The shared implementation sorts every visible Gaussian by depth so that
+    array index order *is* depth order, which is what the CPU and MPS
+    rasterizers rely on when they composite in array order. The CUDA
+    rasterizer no longer needs that: it orders each tile's bin by depth
+    directly, so the sort here is redundant work on every render.
+
+    Returns the same tuple as the shared version plus the depths, which the
+    CUDA backend forwards to the rasterizer as the bin sort key.
+    """
+
+    def _prepare_cuda(
+        means, covariances, colors, opacities, intrinsics, camera_to_world,
+        height, width, near_plane, min_covariance, sigma_radius,
+    ):
+        projected_means, projected_covariances, depths, visible_mask = (
+            _project_gaussians_3d_to_2d_pytorch(
+                means=means, covariances=covariances, intrinsics=intrinsics,
+                camera_to_world=camera_to_world, near_plane=near_plane,
+                min_covariance=min_covariance, height=height, width=width,
+            )
+        )
+        if not torch.any(visible_mask):
+            return None
+
+        # Compaction is kept deliberately. Skipping it and marking culled
+        # Gaussians with an empty bounding box is faster (~3%), but it feeds
+        # invisible entries -- whose projected covariance is garbage, computed
+        # with safe_z = 1 -- into FastGS's VCD and AbsGS statistics. Measured
+        # over a 30k run that collapsed n_split from 13,710 to 3,985, held N at
+        # ~195k instead of ~420k, and cost 0.54 dB PSNR. Revisit only with the
+        # statistics masked by validity.
+        idx = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
+        vm = projected_means[idx]
+        vc = projected_covariances[idx]
+
+        cov_xx, cov_xy, cov_yy = vc[:, 0, 0], vc[:, 0, 1], vc[:, 1, 1]
+        trace = cov_xx + cov_yy
+        disc = torch.sqrt(torch.clamp((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy * cov_xy, min=0.0))
+        lambda_max = torch.clamp(0.5 * (trace + disc), min=min_covariance)
+        radius = sigma_radius * torch.sqrt(lambda_max)
+
+        overlap = (
+            (torch.ceil(vm[:, 0] + radius) >= 0)
+            & (torch.floor(vm[:, 0] - radius) < width)
+            & (torch.ceil(vm[:, 1] + radius) >= 0)
+            & (torch.floor(vm[:, 1] - radius) < height)
+        )
+        if not torch.any(overlap):
+            return None
+
+        keep = idx[overlap]
+        # No argsort: the rasterizer orders each tile's bin by depth.
+        return (
+            projected_means[keep],
+            projected_covariances[keep],
+            colors[keep],
+            opacities[keep],
+            keep,
+            depths[keep],
+        )
+
+    register_prepare_fn("cuda", _prepare_cuda)
+
+
 def register_project_fn(device: str, fn: Callable):
     """Register a device-specific project_gaussians_3d_to_2d implementation."""
     _PROJECT_REGISTRY[device] = fn
@@ -307,6 +375,11 @@ def _auto_register():
         from tinysplat.mps import register_mps_3d_core
 
         register_mps_3d_core()
+    except Exception:
+        pass
+
+    try:
+        register_cuda_3d_core()
     except Exception:
         pass
 

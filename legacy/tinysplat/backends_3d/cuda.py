@@ -71,7 +71,23 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
         if prepared is None:
             return torch.zeros(height, width, colors.shape[1], dtype=colors.dtype, device=means.device)
 
-        projected_means, projected_covariances, projected_colors, projected_opacities, visible_indices = prepared
+        # The CUDA prepare returns depths as a 6th element: it skips the global
+        # depth sort and the rasterizer orders each tile's bin by depth instead.
+        if len(prepared) == 7:
+            # CUDA path: uncompacted, plus depths (bin sort key) and a validity
+            # mask (empty bbox for culled Gaussians).
+            (projected_means, projected_covariances, projected_colors,
+             projected_opacities, visible_indices, projected_depths,
+             projected_valid) = prepared
+        elif len(prepared) == 6:
+            (projected_means, projected_covariances, projected_colors,
+             projected_opacities, visible_indices, projected_depths) = prepared
+            projected_valid = None
+        else:
+            (projected_means, projected_covariances, projected_colors,
+             projected_opacities, visible_indices) = prepared
+            projected_depths = None
+            projected_valid = None
 
         ctx.height = height
         ctx.width = width
@@ -109,6 +125,31 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
         projected_colors = projected_colors.to(torch.device("cuda"))
         projected_opacities = projected_opacities.to(torch.device("cuda"))
 
+        if hasattr(extension, "gaussian_splat_3d_projected_forward_binned_cuda"):
+            image, tile_starts, tile_bins = extension.gaussian_splat_3d_projected_forward_binned_cuda(
+                projected_means,
+                projected_covariances,
+                projected_colors,
+                projected_opacities,
+                height,
+                width,
+                min_covariance,
+                sigma_radius,
+                projected_depths.to(torch.device("cuda")).contiguous()
+                if projected_depths is not None else torch.empty(0, device="cuda"),
+                projected_valid.to(torch.device("cuda")).contiguous()
+                if projected_valid is not None else torch.empty(0, dtype=torch.bool, device="cuda"),
+            )
+            # Hand the bins to the backward; rebuilding them there repeated
+            # count + scan + fill + sort for no reason (~13% of GPU time).
+            ctx.tile_starts = tile_starts
+            ctx.tile_bins = tile_bins
+            ctx.valid = (projected_valid.to(torch.device("cuda")).contiguous()
+                         if projected_valid is not None else None)
+            return image
+
+        ctx.tile_starts = None
+        ctx.tile_bins = None
         return extension.gaussian_splat_3d_projected_forward_cuda(
             projected_means,
             projected_covariances,
@@ -167,6 +208,10 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
                 ctx.width,
                 ctx.min_covariance,
                 ctx.sigma_radius,
+                ctx.tile_starts if ctx.tile_starts is not None else torch.empty(0),
+                ctx.tile_bins if ctx.tile_bins is not None else torch.empty(0),
+                ctx.valid if getattr(ctx, "valid", None) is not None
+                else torch.empty(0, dtype=torch.bool),
             )
         )
 
