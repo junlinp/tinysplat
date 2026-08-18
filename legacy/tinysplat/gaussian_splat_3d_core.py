@@ -262,20 +262,41 @@ def register_cuda_3d_core():
         if not torch.any(visible_mask):
             return None
 
-        # No compaction. Gathering the visible subset cost ~118 GPU ops per
-        # call; instead the whole array goes to the rasterizer and the
-        # precompute kernel gives invisible Gaussians an empty bounding box so
-        # the binning skips them. Off-screen culling is free there too, since
-        # precompute already clamps the box to the image.
-        n = means.shape[0]
+        # Compaction is kept deliberately. Skipping it and marking culled
+        # Gaussians with an empty bounding box is faster (~3%), but it feeds
+        # invisible entries -- whose projected covariance is garbage, computed
+        # with safe_z = 1 -- into FastGS's VCD and AbsGS statistics. Measured
+        # over a 30k run that collapsed n_split from 13,710 to 3,985, held N at
+        # ~195k instead of ~420k, and cost 0.54 dB PSNR. Revisit only with the
+        # statistics masked by validity.
+        idx = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
+        vm = projected_means[idx]
+        vc = projected_covariances[idx]
+
+        cov_xx, cov_xy, cov_yy = vc[:, 0, 0], vc[:, 0, 1], vc[:, 1, 1]
+        trace = cov_xx + cov_yy
+        disc = torch.sqrt(torch.clamp((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy * cov_xy, min=0.0))
+        lambda_max = torch.clamp(0.5 * (trace + disc), min=min_covariance)
+        radius = sigma_radius * torch.sqrt(lambda_max)
+
+        overlap = (
+            (torch.ceil(vm[:, 0] + radius) >= 0)
+            & (torch.floor(vm[:, 0] - radius) < width)
+            & (torch.ceil(vm[:, 1] + radius) >= 0)
+            & (torch.floor(vm[:, 1] - radius) < height)
+        )
+        if not torch.any(overlap):
+            return None
+
+        keep = idx[overlap]
+        # No argsort: the rasterizer orders each tile's bin by depth.
         return (
-            projected_means,
-            projected_covariances,
-            colors,
-            opacities,
-            torch.arange(n, device=means.device),
-            depths,
-            visible_mask,
+            projected_means[keep],
+            projected_covariances[keep],
+            colors[keep],
+            opacities[keep],
+            keep,
+            depths[keep],
         )
 
     register_prepare_fn("cuda", _prepare_cuda)
