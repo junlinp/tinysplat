@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import random
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -460,10 +461,14 @@ def parse_args():
         action="store_true",
         help="Disable the viser UI (recommended for headless benchmarks).",
     )
+    # FastGS is the densification strategy the published benchmark numbers use,
+    # and it now works on both Metal and CUDA, so it is on by default.
     parser.add_argument(
         "--fastgs",
-        action="store_true",
-        help="Enable FastGS VCD/VCP densify/prune (official compositor scoring + AbsGS split).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="FastGS VCD/VCP densify/prune (official compositor scoring + AbsGS "
+             "split). Enabled by default; use --no-fastgs for the built-in path.",
     )
     parser.add_argument(
         "--sh-degree",
@@ -1976,13 +1981,24 @@ def main():
         f"opacity={_OPACITY_LR * args.lr:g}, sh={_SH_LR * args.lr:g}"
     )
     use_fastgs = bool(args.fastgs)
+    # FastGS is on by default, so an unavailable backend must not make the
+    # trainer unusable (e.g. on CPU). Fall back with a clear message when it was
+    # merely the default, but fail loudly when the user asked for it explicitly:
+    # silently not densifying looks like training that runs and produces a bad
+    # model, which is far worse than an error.
+    explicitly_requested = "--fastgs" in sys.argv
+    unavailable = None
     if use_fastgs and not _HAS_FASTGS:
-        raise RuntimeError("--fastgs requires tinysplat.fastgs / metal_backend (install legacy package).")
-    if use_fastgs and not stats_available():
-        raise RuntimeError(
-            "--fastgs needs per-render stats from a Metal or CUDA rasterizer; "
-            "neither is available. Training would silently never densify."
-        )
+        unavailable = "tinysplat.fastgs is not importable (install the legacy package)"
+    elif use_fastgs and not stats_available():
+        unavailable = "no Metal or CUDA rasterizer can supply per-render VCD/AbsGS stats"
+    if unavailable is not None:
+        if explicitly_requested:
+            raise RuntimeError(
+                f"--fastgs requested but {unavailable}. Training would silently never densify."
+            )
+        print(f"FastGS unavailable ({unavailable}); using the built-in densify/prune.")
+        use_fastgs = False
     fastgs_cfg = None
     if use_fastgs:
         fastgs_cfg = FastGSConfig(
