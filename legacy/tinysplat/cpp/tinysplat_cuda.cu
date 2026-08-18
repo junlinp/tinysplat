@@ -217,6 +217,7 @@ __global__ void rasterize_backward_perpixel_kernel(
     const int* __restrict__ tile_starts,
     const int* __restrict__ tile_bins,
     float* __restrict__ grad_means,          // (N,2)
+    float* __restrict__ grad_means_abs,      // (N,2) AbsGS: sum of |contribution|
     float* __restrict__ grad_covs,           // (N,4)
     float* __restrict__ grad_colors,         // (N,C)
     float* __restrict__ grad_opacities,      // (N)
@@ -332,8 +333,16 @@ __global__ void rasterize_backward_perpixel_kernel(
                     const float dG    = dalpha * sh_opa[k];
                     const float dquad = -0.5f * G * dG;
                     // d = pixel - mean, so d(mean) picks up the sign flip.
-                    atomicAdd(&grad_means[g*2+0], -2.0f * dquad * qx);
-                    atomicAdd(&grad_means[g*2+1], -2.0f * dquad * qy);
+                    const float gm_x = -2.0f * dquad * qx;
+                    const float gm_y = -2.0f * dquad * qy;
+                    atomicAdd(&grad_means[g*2+0], gm_x);
+                    atomicAdd(&grad_means[g*2+1], gm_y);
+                    // AbsGS (FastGS split criterion) needs the sum of magnitudes,
+                    // which cancellation destroys in the signed accumulation.
+                    if (grad_means_abs != nullptr) {
+                        atomicAdd(&grad_means_abs[g*2+0], fabsf(gm_x));
+                        atomicAdd(&grad_means_abs[g*2+1], fabsf(gm_y));
+                    }
                     // quad = d^T S^-1 d  =>  dquad/dS = -(S^-1 d)(S^-1 d)^T
                     atomicAdd(&grad_covs[g*4+0], -dquad * qx * qx);
                     atomicAdd(&grad_covs[g*4+1], -dquad * qx * qy);
@@ -347,6 +356,43 @@ __global__ void rasterize_backward_perpixel_kernel(
         }
         __syncthreads();
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// FastGS VCD support: per-Gaussian high-error footprint hit counts.
+// Mirrors the Metal footprint_hit_count kernel. Counts, for each projected
+// Gaussian, how many high-error pixels inside its bounding box it actually
+// contributes to (alpha >= 1e-4).
+// ---------------------------------------------------------------------------
+
+__global__ void footprint_hit_count_kernel(
+    const Gaussian2D* __restrict__ gaussians,
+    const float* __restrict__ opacities,
+    const unsigned char* __restrict__ error_mask,
+    int* __restrict__ counts,
+    int N, int H, int W
+) {
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= N) return;
+    const Gaussian2D& gk = gaussians[g];
+    if (gk.max_x < gk.min_x || gk.max_y < gk.min_y) return;
+
+    const int x0 = max(gk.min_x, 0), x1 = min(gk.max_x, W - 1);
+    const int y0 = max(gk.min_y, 0), y1 = min(gk.max_y, H - 1);
+    const float opa = opacities[g];
+    int hits = 0;
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            if (error_mask[y * W + x] == 0) continue;
+            const float dx = (float)x - gk.mean_x, dy = (float)y - gk.mean_y;
+            const float quad = dx * (gk.inv_xx*dx + gk.inv_xy*dy)
+                             + dy * (gk.inv_yx*dx + gk.inv_yy*dy);
+            if (opa * expf(-0.5f * quad) < 1e-4f) continue;
+            ++hits;
+        }
+    }
+    counts[g] = hits;
 }
 
 torch::Tensor gaussian_splat_2d_forward_cuda(
@@ -510,6 +556,7 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
     }
 
     auto grad_means = torch::zeros_like(means);
+    auto grad_means_abs = torch::zeros_like(means);
     auto grad_covariances = torch::zeros_like(covariances);
     auto grad_colors = torch::zeros_like(colors);
     auto grad_opacities = torch::zeros_like(opacities);
@@ -524,13 +571,14 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
         tile_starts_t.data_ptr<int>(),
         tile_bins.data_ptr<int>(),
         grad_means.data_ptr<float>(),
+        grad_means_abs.data_ptr<float>(),
         grad_covariances.data_ptr<float>(),
         grad_colors.data_ptr<float>(),
         grad_opacities.data_ptr<float>(),
         N, H, W, C, tiles_x, tiles_y
     );
 
-    return {grad_means, grad_covariances, grad_colors, grad_opacities};
+    return {grad_means, grad_covariances, grad_colors, grad_opacities, grad_means_abs};
 }
 
 torch::Tensor gaussian_splat_3d_projected_forward_cuda(
@@ -829,4 +877,36 @@ std::vector<torch::Tensor> project_3d_backward_cuda(
             make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance), N);
     }
     return {grad_means, grad_cov3.view({N, 3, 3})};
+}
+
+
+torch::Tensor footprint_hit_count_cuda(
+    torch::Tensor projected_means,        // (N,2)
+    torch::Tensor projected_covariances,  // (N,2,2)
+    torch::Tensor projected_opacities,    // (N,)
+    torch::Tensor error_mask,             // (H,W) uint8
+    int64_t height, int64_t width
+) {
+    TORCH_CHECK(projected_means.is_cuda(), "projected_means must be CUDA");
+    auto pm = projected_means.contiguous();
+    auto pc = projected_covariances.contiguous().view({-1, 4});
+    auto po = projected_opacities.contiguous();
+    auto mask = error_mask.to(torch::kUInt8).contiguous();
+    const int N = (int)pm.size(0);
+    const int H = (int)height, W = (int)width;
+    auto counts = torch::zeros({N}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    if (N == 0) return counts;
+
+    constexpr int64_t kFloatsPerGaussian2D = sizeof(Gaussian2D) / sizeof(float);
+    auto gaussians = torch::zeros({(int64_t)N * kFloatsPerGaussian2D},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    const int blocks = (N + 255) / 256;
+    // 3DGS alpha convention, matching the forward used for this session.
+    precompute_gaussians_kernel<<<blocks, 256>>>(
+        pm.data_ptr<float>(), pc.data_ptr<float>(),
+        (Gaussian2D*)gaussians.data_ptr<float>(), N, H, W, /*density_normalize=*/false);
+    footprint_hit_count_kernel<<<blocks, 256>>>(
+        (Gaussian2D*)gaussians.data_ptr<float>(), po.data_ptr<float>(),
+        mask.data_ptr<unsigned char>(), counts.data_ptr<int>(), N, H, W);
+    return counts;
 }

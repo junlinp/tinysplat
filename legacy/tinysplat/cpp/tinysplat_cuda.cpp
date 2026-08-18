@@ -61,6 +61,14 @@ std::vector<torch::Tensor> project_3d_backward_cuda(
     double near_plane, double min_covariance
 );
 
+torch::Tensor footprint_hit_count_cuda(
+    torch::Tensor projected_means,
+    torch::Tensor projected_covariances,
+    torch::Tensor projected_opacities,
+    torch::Tensor error_mask,
+    int64_t height, int64_t width
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gaussian_splat_2d_forward_cuda", &gaussian_splat_2d_forward_cuda, "2D Gaussian splatting forward (CUDA)");
     m.def("gaussian_splat_2d_backward_cuda", &gaussian_splat_2d_backward_cuda, "2D Gaussian splatting backward (CUDA)");
@@ -68,4 +76,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gaussian_splat_3d_projected_backward_cuda", &gaussian_splat_3d_projected_backward_cuda, "3D projected Gaussian splatting backward (CUDA)");
     m.def("project_3d_forward_cuda", &project_3d_forward_cuda, "Fused 3D->2D projection (CUDA)");
     m.def("project_3d_backward_cuda", &project_3d_backward_cuda, "Fused 3D->2D projection VJP (CUDA)");
+    m.def("footprint_hit_count_cuda", &footprint_hit_count_cuda, "FastGS VCD footprint hit counts (CUDA)");
 }

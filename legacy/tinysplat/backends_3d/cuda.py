@@ -3,6 +3,31 @@
 import torch
 
 from ..cpp import load_cuda_extension
+
+# FastGS needs per-Gaussian statistics from the most recent render. The Metal
+# backend keeps this inside its raster session; the CUDA path projects in
+# PyTorch, so the equivalent state is cached here. Keys:
+#   proj_means, proj_covs, proj_opacities  -- the projected splats
+#   visible_indices                        -- projected -> original mapping
+#   height, width, num_gaussians
+#   grad_means2d_abs                       -- AbsGS sums, set by backward
+_SESSION = {}
+
+# The 2D mean gradients must NOT live in _SESSION: FastGS re-renders K views to
+# build its VCD scores, every forward clears the session, and that wiped the
+# gradients the training backward had just stored (absgrad read back as 0/0/0).
+# They are keyed by Gaussian count so a stale set is never served after a
+# densify step changes N.
+_GRAD2D = {"signed": None, "abs": None, "n": 0}
+
+
+def last_session():
+    return _SESSION
+
+
+def last_grad2d():
+    return _GRAD2D
+
 from .common import Backend3DOps
 
 
@@ -67,6 +92,17 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
             visible_indices,
         )
 
+        _SESSION.clear()
+        _SESSION.update(
+            proj_means=projected_means.detach(),
+            proj_covs=projected_covariances.detach(),
+            proj_opacities=projected_opacities.detach(),
+            visible_indices=visible_indices.detach(),
+            height=height,
+            width=width,
+            num_gaussians=int(means.shape[0]),
+        )
+
         # Move to CUDA for rasterization
         projected_means = projected_means.to(torch.device("cuda"))
         projected_covariances = projected_covariances.to(torch.device("cuda"))
@@ -114,7 +150,13 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
         proj_opacities_cuda = projected_opacities.to(torch.device("cuda"))
 
         # 2D backward: get gradients for projected Gaussians
-        grad_proj_means, grad_proj_covs, grad_proj_colors, grad_proj_opacities = (
+        (
+            grad_proj_means,
+            grad_proj_covs,
+            grad_proj_colors,
+            grad_proj_opacities,
+            grad_proj_means_abs,
+        ) = (
             extension.gaussian_splat_3d_projected_backward_cuda(
                 grad_output,
                 proj_means_cuda,
@@ -127,6 +169,21 @@ class _GaussianSplat3DCUDAFunction(torch.autograd.Function):
                 ctx.sigma_radius,
             )
         )
+
+        # Scatter to original Gaussian indices here, while visible_indices is in
+        # scope, and keep it outside _SESSION so later forwards cannot clear it.
+        n_orig = int(means.shape[0])
+        idx = visible_indices.to(grad_proj_means.device).reshape(-1)
+        k = min(idx.numel(), grad_proj_means.shape[0])
+        signed_full = torch.zeros(n_orig, 2, device=grad_proj_means.device,
+                                  dtype=grad_proj_means.dtype)
+        abs_full = torch.zeros_like(signed_full)
+        if k:
+            signed_full.index_copy_(0, idx[:k], grad_proj_means[:k].detach())
+            abs_full.index_copy_(0, idx[:k], grad_proj_means_abs[:k].detach())
+        _GRAD2D["signed"] = signed_full
+        _GRAD2D["abs"] = abs_full
+        _GRAD2D["n"] = n_orig
 
         needs = ctx.needs_input_grad
 
