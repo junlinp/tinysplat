@@ -167,7 +167,7 @@ __global__ void rasterize_forward_kernel(
         float qy = gk.inv_yx * dx + gk.inv_yy * dy;
         float quad = dx * qx + dy * qy;
         float gaussian = expf(-0.5f * quad) * gk.normalization;
-        float alpha = fminf(1.0f, opacities[g] * gaussian);
+        float alpha = fminf(0.999f, opacities[g] * gaussian);
         float w = alpha * T;
 
         accum.x += w * colors[g * C + 0];
@@ -184,95 +184,170 @@ __global__ void rasterize_forward_kernel(
     total_weight[y * W + x] = 1.0f - T;
 }
 
-// ---------------------------------------------------------------------------
-// Backward rasterization
-// ---------------------------------------------------------------------------
 
-__global__ void rasterize_backward_kernel(
-    const float* __restrict__ grad_output,
-    const Gaussian2D* __restrict__ gaussians,
-    const float* __restrict__ colors,
-    const float* __restrict__ opacities,
-    float* __restrict__ grad_means,
-    float* __restrict__ grad_covs,
-    float* __restrict__ grad_colors,
-    float* __restrict__ grad_opacities,
-    int N, int H, int W, int C
-) {
-    int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= N) return;
-
-    const Gaussian2D& gk = gaussians[g];
-    float gm_x = 0.0f, gm_y = 0.0f;
-    float gop = 0.0f;
-    float gcv[4] = {0.f, 0.f, 0.f, 0.f};
-    float gcl[4] = {0.f, 0.f, 0.f, 0.f};
-
-    for (int y = gk.min_y; y <= gk.max_y; ++y) {
-        for (int x = gk.min_x; x <= gk.max_x; ++x) {
-            if (x < 0 || x >= W || y < 0 || y >= H) continue;
-
-            // This loop already walks only g's own bounding box, and
-            // assign_tile_bins_kernel puts g in every tile that box overlaps,
-            // so g is guaranteed to be in the bin of the tile containing (x, y).
-            // The old code proved that by scanning the whole bin for g at every
-            // pixel -- O(bbox_area * bin_length) per Gaussian, which dominated
-            // the backward pass (~37 s/iter on an RTX 4090 at N=136k).
-
-            float dx = (float)x - gk.mean_x;
-            float dy = (float)y - gk.mean_y;
-            float qx = gk.inv_xx * dx + gk.inv_xy * dy;
-            float qy = gk.inv_yx * dx + gk.inv_yy * dy;
-            float quad = dx * qx + dy * qy;
-            float gaussian = expf(-0.5f * quad) * gk.normalization;
-            float alpha = fminf(1.0f, opacities[g] * gaussian);
-
-            float grad_out_r = grad_output[(y * W + x) * C + 0];
-            float grad_out_g = C > 1 ? grad_output[(y * W + x) * C + 1] : 0.0f;
-            float grad_out_b = C > 2 ? grad_output[(y * W + x) * C + 2] : 0.0f;
-
-            // grad_color
-            gcl[0] += grad_out_r * alpha;
-            if (C > 1) gcl[1] += grad_out_g * alpha;
-            if (C > 2) gcl[2] += grad_out_b * alpha;
-
-            // grad_opacity
-            gop += (grad_out_r * colors[g * C] +
-                    grad_out_g * colors[g * C + 1] +
-                    grad_out_b * colors[g * C + 2]) * gaussian;
-
-            // grad_mean
-            float contrib = (grad_out_r + grad_out_g + grad_out_b) * alpha;
-            gm_x += contrib * qx;
-            gm_y += contrib * qy;
-
-            // grad_cov (simplified)
-            float base = (grad_out_r + grad_out_g + grad_out_b) * alpha * opacities[g];
-            float outer00 = qx * qx, outer01 = qx * qy;
-            float outer10 = qy * qx, outer11 = qy * qy;
-            gcv[0] += base * (outer00 - 0.5f * gk.inv_xx);
-            gcv[1] += base * (outer01 - 0.5f * gk.inv_xy);
-            gcv[2] += base * (outer10 - 0.5f * gk.inv_yx);
-            gcv[3] += base * (outer11 - 0.5f * gk.inv_yy);
-        }
-    }
-
-    grad_means[g * 2 + 0] = gm_x;
-    grad_means[g * 2 + 1] = gm_y;
-    grad_opacities[g] = gop;
-    for (int c = 0; c < C && c < 4; ++c) {
-        grad_colors[g * C + c] = gcl[c];
-    }
-    for (int i = 0; i < 4; ++i) {
-        grad_covs[g * 4 + i] = gcv[i];
-    }
-}
 
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Host-side wrappers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Per-pixel backward rasterization
+//
+// The previous backward ran one thread per Gaussian over that Gaussian's whole
+// bounding box. Profiling a real iteration put it at 91.7% of CUDA time
+// (92.5 ms/step): total work is sum of bbox areas, and one large Gaussian
+// stalls its entire warp. It also dropped the transmittance factor, so the
+// gradient it produced was only an approximation.
+//
+// This version mirrors the forward: one block per tile, one thread per pixel,
+// Gaussians staged through shared memory. Two front-to-back passes avoid the
+// numerically awkward T /= (1 - alpha) recovery used by reference 3DGS:
+//   pass 1 computes final transmittance and the pixel's total colour,
+//   pass 2 re-walks accumulating a prefix, so the suffix needed by the alpha
+//          gradient is simply (total - prefix).
+// ---------------------------------------------------------------------------
+
+__global__ void rasterize_backward_perpixel_kernel(
+    const float* __restrict__ grad_output,   // (H,W,C)
+    const Gaussian2D* __restrict__ gaussians,
+    const float* __restrict__ colors,
+    const float* __restrict__ opacities,
+    const int* __restrict__ tile_starts,
+    const int* __restrict__ tile_bins,
+    float* __restrict__ grad_means,          // (N,2)
+    float* __restrict__ grad_covs,           // (N,4)
+    float* __restrict__ grad_colors,         // (N,C)
+    float* __restrict__ grad_opacities,      // (N)
+    int N, int H, int W, int C, int tiles_x, int tiles_y
+) {
+    const int tile_idx = blockIdx.y * tiles_x + blockIdx.x;
+    const int x = blockIdx.x * kTileSize + threadIdx.x;
+    const int y = blockIdx.y * kTileSize + threadIdx.y;
+    const bool inside = (x < W) && (y < H);
+
+    const int bin_start = tile_starts[tile_idx];
+    const int bin_end   = tile_starts[tile_idx + 1];
+    const int n_bin     = bin_end - bin_start;
+
+    const int lane = threadIdx.y * kTileSize + threadIdx.x;   // 0..255
+    constexpr int kChunk = kTileSize * kTileSize;             // 256
+
+    __shared__ Gaussian2D sh_g[kChunk];
+    __shared__ float sh_col[kChunk * 3];
+    __shared__ float sh_opa[kChunk];
+
+    float go[3] = {0.f, 0.f, 0.f};
+    if (inside) {
+        go[0] = grad_output[(y * W + x) * C + 0];
+        if (C > 1) go[1] = grad_output[(y * W + x) * C + 1];
+        if (C > 2) go[2] = grad_output[(y * W + x) * C + 2];
+    }
+
+    // ---- pass 1: total composited colour and final transmittance ----
+    float T = 1.0f;
+    float total[3] = {0.f, 0.f, 0.f};
+    bool done = !inside;
+    for (int base = 0; base < n_bin; base += kChunk) {
+        const int m = min(kChunk, n_bin - base);
+        if (lane < m) {
+            const int g = tile_bins[bin_start + base + lane];
+            sh_g[lane] = gaussians[g];
+            sh_opa[lane] = opacities[g];
+            sh_col[lane*3+0] = colors[g*C+0];
+            sh_col[lane*3+1] = (C > 1) ? colors[g*C+1] : 0.f;
+            sh_col[lane*3+2] = (C > 2) ? colors[g*C+2] : 0.f;
+        }
+        __syncthreads();
+        if (!done) {
+            for (int k = 0; k < m; ++k) {
+                const Gaussian2D& gk = sh_g[k];
+                if (x < gk.min_x || x > gk.max_x || y < gk.min_y || y > gk.max_y) continue;
+                const float dx = (float)x - gk.mean_x, dy = (float)y - gk.mean_y;
+                const float qx = gk.inv_xx*dx + gk.inv_xy*dy;
+                const float qy = gk.inv_yx*dx + gk.inv_yy*dy;
+                const float G  = expf(-0.5f * (dx*qx + dy*qy)) * gk.normalization;
+                const float alpha = fminf(0.999f, sh_opa[k] * G);
+                const float w = alpha * T;
+                total[0] += w * sh_col[k*3+0];
+                total[1] += w * sh_col[k*3+1];
+                total[2] += w * sh_col[k*3+2];
+                T *= (1.0f - alpha);
+                if (T < 1e-4f) { done = true; break; }
+            }
+        }
+        __syncthreads();
+    }
+
+    // ---- pass 2: gradients, using suffix = total - prefix ----
+    T = 1.0f;
+    float prefix[3] = {0.f, 0.f, 0.f};
+    done = !inside;
+    for (int base = 0; base < n_bin; base += kChunk) {
+        const int m = min(kChunk, n_bin - base);
+        if (lane < m) {
+            const int g = tile_bins[bin_start + base + lane];
+            sh_g[lane] = gaussians[g];
+            sh_opa[lane] = opacities[g];
+            sh_col[lane*3+0] = colors[g*C+0];
+            sh_col[lane*3+1] = (C > 1) ? colors[g*C+1] : 0.f;
+            sh_col[lane*3+2] = (C > 2) ? colors[g*C+2] : 0.f;
+        }
+        __syncthreads();
+        if (!done) {
+            for (int k = 0; k < m; ++k) {
+                const Gaussian2D& gk = sh_g[k];
+                if (x < gk.min_x || x > gk.max_x || y < gk.min_y || y > gk.max_y) continue;
+                const int g = tile_bins[bin_start + base + k];
+
+                const float dx = (float)x - gk.mean_x, dy = (float)y - gk.mean_y;
+                const float qx = gk.inv_xx*dx + gk.inv_xy*dy;
+                const float qy = gk.inv_yx*dx + gk.inv_yy*dy;
+                const float G  = expf(-0.5f * (dx*qx + dy*qy)) * gk.normalization;
+                const float raw = sh_opa[k] * G;
+                const float alpha = fminf(0.999f, raw);
+                const float w = alpha * T;
+
+                prefix[0] += w * sh_col[k*3+0];
+                prefix[1] += w * sh_col[k*3+1];
+                prefix[2] += w * sh_col[k*3+2];
+
+                // dL/dcolor
+                atomicAdd(&grad_colors[g*C+0], w * go[0]);
+                if (C > 1) atomicAdd(&grad_colors[g*C+1], w * go[1]);
+                if (C > 2) atomicAdd(&grad_colors[g*C+2], w * go[2]);
+
+                // dL/dalpha = sum_ch go * (T*c - suffix/(1-alpha))
+                const float inv_1ma = 1.0f / fmaxf(1.0f - alpha, 1e-3f);
+                float dalpha = 0.f;
+                #pragma unroll
+                for (int ch = 0; ch < 3; ++ch) {
+                    const float suffix = total[ch] - prefix[ch];
+                    dalpha += go[ch] * (T * sh_col[k*3+ch] - suffix * inv_1ma);
+                }
+
+                if (raw < 0.999f) {           // clamp has zero derivative above
+                    atomicAdd(&grad_opacities[g], dalpha * G);
+                    const float dG    = dalpha * sh_opa[k];
+                    const float dquad = -0.5f * G * dG;
+                    // d = pixel - mean, so d(mean) picks up the sign flip.
+                    atomicAdd(&grad_means[g*2+0], -2.0f * dquad * qx);
+                    atomicAdd(&grad_means[g*2+1], -2.0f * dquad * qy);
+                    // quad = d^T S^-1 d  =>  dquad/dS = -(S^-1 d)(S^-1 d)^T
+                    atomicAdd(&grad_covs[g*4+0], -dquad * qx * qx);
+                    atomicAdd(&grad_covs[g*4+1], -dquad * qx * qy);
+                    atomicAdd(&grad_covs[g*4+2], -dquad * qy * qx);
+                    atomicAdd(&grad_covs[g*4+3], -dquad * qy * qy);
+                }
+
+                T *= (1.0f - alpha);
+                if (T < 1e-4f) { done = true; break; }
+            }
+        }
+        __syncthreads();
+    }
+}
 
 torch::Tensor gaussian_splat_2d_forward_cuda(
     torch::Tensor means,
@@ -405,24 +480,54 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
         N, H, W, density_normalize
     );
 
-    // The backward accumulates per Gaussian over its own bounding box and no
-    // longer consults the tile bins, so none of the binning work is needed here.
+    // The per-pixel backward walks the same tile bins as the forward, so the
+    // binning has to be rebuilt here (identically, including the depth sort).
+    const int tiles_x = (W + kTileSize - 1) / kTileSize;
+    const int tiles_y = (H + kTileSize - 1) / kTileSize;
+    const int num_tiles = tiles_x * tiles_y;
+    auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+
+    auto tile_counts = torch::zeros({num_tiles}, i32);
+    count_tile_membership_kernel<<<blocks, 256>>>(
+        (Gaussian2D*)gaussians.data_ptr<float>(), tile_counts.data_ptr<int>(),
+        tiles_x, tiles_y, N);
+
+    auto tile_starts_t = torch::zeros({num_tiles + 1}, i32);
+    tile_starts_t.slice(0, 1, num_tiles + 1).copy_(torch::cumsum(tile_counts, 0, torch::kInt32));
+    const int total_bins = tile_starts_t[num_tiles].item<int>();
+
+    auto tile_bins = torch::zeros({std::max(total_bins, 1)}, i32);
+    auto tile_fill = torch::zeros({num_tiles}, i32);
+    auto bin_tile_ids = torch::zeros_like(tile_bins);
+    assign_tile_bins_kernel<<<blocks, 256>>>(
+        (Gaussian2D*)gaussians.data_ptr<float>(), tile_starts_t.data_ptr<int>(),
+        tile_fill.data_ptr<int>(), tile_bins.data_ptr<int>(),
+        bin_tile_ids.data_ptr<int>(), tiles_x, tiles_y, N);
+    if (total_bins > 0) {
+        auto keys = bin_tile_ids.to(torch::kInt64) * (int64_t)(N + 1)
+                  + tile_bins.to(torch::kInt64);
+        tile_bins = tile_bins.index({torch::argsort(keys)}).contiguous();
+    }
+
     auto grad_means = torch::zeros_like(means);
     auto grad_covariances = torch::zeros_like(covariances);
     auto grad_colors = torch::zeros_like(colors);
     auto grad_opacities = torch::zeros_like(opacities);
 
-    blocks = (N + 255) / 256;
-    rasterize_backward_kernel<<<blocks, 256>>>(
+    dim3 bblock(kTileSize, kTileSize);
+    dim3 bgrid(tiles_x, tiles_y);
+    rasterize_backward_perpixel_kernel<<<bgrid, bblock>>>(
         grad_output.contiguous().data_ptr<float>(),
         (Gaussian2D*)gaussians.data_ptr<float>(),
         colors.contiguous().data_ptr<float>(),
         opacities.contiguous().data_ptr<float>(),
+        tile_starts_t.data_ptr<int>(),
+        tile_bins.data_ptr<int>(),
         grad_means.data_ptr<float>(),
         grad_covariances.data_ptr<float>(),
         grad_colors.data_ptr<float>(),
         grad_opacities.data_ptr<float>(),
-        N, H, W, C
+        N, H, W, C, tiles_x, tiles_y
     );
 
     return {grad_means, grad_covariances, grad_colors, grad_opacities};
@@ -460,6 +565,9 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
         grad_output, projected_means, projected_covariances, projected_colors,
         projected_opacities, height, width, /*density_normalize=*/false);
 }
+
+
+
 
 // ---------------------------------------------------------------------------
 // Fused 3D -> 2D projection (forward + VJP)
