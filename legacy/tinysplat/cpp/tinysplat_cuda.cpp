@@ -51,14 +51,16 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
 std::vector<torch::Tensor> project_3d_forward_cuda(
     torch::Tensor means, torch::Tensor cov3,
     torch::Tensor intrinsics, torch::Tensor camera_to_world,
-    double near_plane, double min_covariance
+    double near_plane, double min_covariance,
+    double height, double width
 );
 
 std::vector<torch::Tensor> project_3d_backward_cuda(
     torch::Tensor grad_proj_means, torch::Tensor grad_cov2d, torch::Tensor grad_depth,
     torch::Tensor means, torch::Tensor cov3,
     torch::Tensor intrinsics, torch::Tensor camera_to_world,
-    double near_plane, double min_covariance
+    double near_plane, double min_covariance,
+    double height, double width
 );
 
 torch::Tensor footprint_hit_count_cuda(
