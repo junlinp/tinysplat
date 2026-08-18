@@ -976,3 +976,145 @@ torch::Tensor footprint_hit_count_cuda(
         mask.data_ptr<unsigned char>(), counts.data_ptr<int>(), N, H, W);
     return counts;
 }
+
+// ---------------------------------------------------------------------------
+// Fused quaternion + log-scale projection ("qs"), matching the Metal path.
+//
+// Without this the caller must build the 3x3 covariance in PyTorch, and
+// covariance_matrices() plus its backward showed up as aten::bmm at 38% of GPU
+// time -- work Metal never pays because it fuses quat -> covariance ->
+// projection in one kernel. This provides the direct 3D Jacobian chain:
+// gradients land on means, log_scales and quats without a cov3 intermediate.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Rotation matrix (row major) from a normalized quaternion (w, x, y, z).
+__device__ __forceinline__ void quat_to_R(float w, float x, float y, float z, float* R) {
+    const float xx=x*x, yy=y*y, zz=z*z, xy=x*y, xz=x*z, yz=y*z, wx=w*x, wy=w*y, wz=w*z;
+    R[0]=1.f-2.f*(yy+zz); R[1]=2.f*(xy-wz);     R[2]=2.f*(xz+wy);
+    R[3]=2.f*(xy+wz);     R[4]=1.f-2.f*(xx+zz); R[5]=2.f*(yz-wx);
+    R[6]=2.f*(xz-wy);     R[7]=2.f*(yz+wx);     R[8]=1.f-2.f*(xx+yy);
+}
+
+// cov3 = R diag(s^2) R^T
+__device__ __forceinline__ void qs_to_cov3(const float* q, const float* ls, float* cov3) {
+    const float n = rsqrtf(fmaxf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3], 1e-20f));
+    float R[9]; quat_to_R(q[0]*n, q[1]*n, q[2]*n, q[3]*n, R);
+    const float s0=expf(ls[0]), s1=expf(ls[1]), s2=expf(ls[2]);
+    const float d0=s0*s0, d1=s1*s1, d2=s2*s2;
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c)
+            cov3[r*3+c] = R[r*3+0]*d0*R[c*3+0] + R[r*3+1]*d1*R[c*3+1] + R[r*3+2]*d2*R[c*3+2];
+}
+
+// Given dL/dcov3, produce dL/dlog_scales and dL/dquat (unnormalized).
+__device__ __forceinline__ void qs_vjp(const float* q, const float* ls, const float* dC,
+                                       float* d_ls, float* d_q) {
+    const float qn2 = fmaxf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3], 1e-20f);
+    const float inv = rsqrtf(qn2);
+    const float w=q[0]*inv, x=q[1]*inv, y=q[2]*inv, z=q[3]*inv;
+    float R[9]; quat_to_R(w, x, y, z, R);
+    const float s0=expf(ls[0]), s1=expf(ls[1]), s2=expf(ls[2]);
+    const float d[3] = {s0*s0, s1*s1, s2*s2};
+
+    // Symmetrize: cov3 is symmetric so only the symmetric part of dC acts.
+    float G[9];
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) G[r*3+c] = dC[r*3+c] + dC[c*3+r];
+
+    // dL/dD_kk = (R^T dC R)_kk  ->  dL/dls_k = 2 * s_k^2 * that
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        float acc = 0.f;
+        #pragma unroll
+        for (int a = 0; a < 3; ++a)
+            #pragma unroll
+            for (int b = 0; b < 3; ++b) acc += R[a*3+k] * dC[a*3+b] * R[b*3+k];
+        d_ls[k] = 2.f * d[k] * acc;
+    }
+
+    // dL/dR = (dC + dC^T) R D
+    float dR[9];
+    #pragma unroll
+    for (int r = 0; r < 3; ++r)
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            float acc = 0.f;
+            #pragma unroll
+            for (int a = 0; a < 3; ++a) acc += G[r*3+a] * R[a*3+c];
+            dR[r*3+c] = acc * d[c];
+        }
+
+    // dR/dn for each quaternion component, contracted with dR.
+    const float dn_w = 2.f*(-dR[1]*z + dR[2]*y + dR[3]*z - dR[5]*x - dR[6]*y + dR[7]*x);
+    const float dn_x = 2.f*( dR[1]*y + dR[2]*z + dR[3]*y - 2.f*dR[4]*x - dR[5]*w
+                           + dR[6]*z + dR[7]*w - 2.f*dR[8]*x);
+    const float dn_y = 2.f*(-2.f*dR[0]*y + dR[1]*x + dR[2]*w + dR[3]*x + dR[5]*z
+                           - dR[6]*w + dR[7]*z - 2.f*dR[8]*y);
+    const float dn_z = 2.f*(-2.f*dR[0]*z - dR[1]*w + dR[2]*x + dR[3]*w - 2.f*dR[4]*z
+                           + dR[5]*y + dR[6]*x + dR[7]*y);
+
+    // Back through the normalization n = q / ||q||.
+    const float dn[4] = {dn_w, dn_x, dn_y, dn_z};
+    const float nq[4] = {w, x, y, z};
+    float dot = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) dot += dn[k] * nq[k];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) d_q[k] = (dn[k] - dot * nq[k]) * inv;
+}
+
+__global__ void qs_to_cov3_kernel(
+    const float* __restrict__ quats, const float* __restrict__ log_scales,
+    float* __restrict__ cov3, int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    qs_to_cov3(&quats[i*4], &log_scales[i*3], &cov3[i*9]);
+}
+
+__global__ void qs_vjp_kernel(
+    const float* __restrict__ quats, const float* __restrict__ log_scales,
+    const float* __restrict__ grad_cov3,
+    float* __restrict__ grad_log_scales, float* __restrict__ grad_quats, int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    qs_vjp(&quats[i*4], &log_scales[i*3], &grad_cov3[i*9],
+           &grad_log_scales[i*3], &grad_quats[i*4]);
+}
+
+}  // namespace
+
+torch::Tensor quat_scale_to_cov3_cuda(torch::Tensor quats, torch::Tensor log_scales) {
+    TORCH_CHECK(quats.is_cuda(), "quats must be CUDA");
+    auto q = quats.contiguous(), ls = log_scales.contiguous();
+    const int N = (int)q.size(0);
+    auto cov3 = torch::empty({N, 3, 3}, q.options());
+    if (N > 0) {
+        qs_to_cov3_kernel<<<(N + 255) / 256, 256>>>(
+            q.data_ptr<float>(), ls.data_ptr<float>(), cov3.data_ptr<float>(), N);
+    }
+    return cov3;
+}
+
+std::vector<torch::Tensor> quat_scale_to_cov3_vjp_cuda(
+    torch::Tensor quats, torch::Tensor log_scales, torch::Tensor grad_cov3
+) {
+    auto q = quats.contiguous(), ls = log_scales.contiguous();
+    auto gc = grad_cov3.contiguous().view({-1, 9});
+    const int N = (int)q.size(0);
+    auto g_ls = torch::zeros_like(ls);
+    auto g_q  = torch::zeros_like(q);
+    if (N > 0) {
+        qs_vjp_kernel<<<(N + 255) / 256, 256>>>(
+            q.data_ptr<float>(), ls.data_ptr<float>(), gc.data_ptr<float>(),
+            g_ls.data_ptr<float>(), g_q.data_ptr<float>(), N);
+    }
+    return {g_q, g_ls};
+}
