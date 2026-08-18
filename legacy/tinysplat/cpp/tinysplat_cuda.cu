@@ -428,7 +428,50 @@ __global__ void footprint_hit_count_kernel(
     counts[g] = hits;
 }
 
+
+// Build (tile_starts, tile_bins) for an already-precomputed Gaussian2D array.
+// Shared so the backward can reuse the forward's bins instead of rebuilding
+// them -- count + scan + fill + sort was ~13% of GPU time, run twice per step.
+static std::vector<torch::Tensor> build_tile_bins(
+    torch::Tensor gaussians, int N, int tiles_x, int tiles_y, int blocks
+) {
+    const int num_tiles = tiles_x * tiles_y;
+    auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+
+    auto tile_counts = torch::zeros({num_tiles}, i32);
+    count_tile_membership_kernel<<<blocks, 256>>>(
+        (Gaussian2D*)gaussians.data_ptr<float>(), tile_counts.data_ptr<int>(),
+        tiles_x, tiles_y, N);
+
+    auto tile_starts = torch::zeros({num_tiles + 1}, i32);
+    tile_starts.slice(0, 1, num_tiles + 1).copy_(torch::cumsum(tile_counts, 0, torch::kInt32));
+    const int total_bins = tile_starts[num_tiles].item<int>();
+
+    auto tile_bins = torch::zeros({std::max(total_bins, 1)}, i32);
+    auto tile_fill = torch::zeros({num_tiles}, i32);
+    auto bin_tile_ids = torch::zeros_like(tile_bins);
+    assign_tile_bins_kernel<<<blocks, 256>>>(
+        (Gaussian2D*)gaussians.data_ptr<float>(), tile_starts.data_ptr<int>(),
+        tile_fill.data_ptr<int>(), tile_bins.data_ptr<int>(),
+        bin_tile_ids.data_ptr<int>(), tiles_x, tiles_y, N);
+
+    // atomicAdd hands out slots nondeterministically; alpha compositing is
+    // order dependent and the caller supplies Gaussians depth sorted, so index
+    // order is depth order. Sorting the composite key (tile, index) restores it
+    // in one pass and preserves the tile_starts layout.
+    if (total_bins > 0) {
+        auto keys = bin_tile_ids.to(torch::kInt64) * (int64_t)(N + 1)
+                  + tile_bins.to(torch::kInt64);
+        tile_bins = tile_bins.index({torch::argsort(keys)}).contiguous();
+    }
+    return {tile_starts, tile_bins};
+}
+
 torch::Tensor gaussian_splat_2d_forward_cuda(
+    torch::Tensor means, torch::Tensor covariances, torch::Tensor colors,
+    torch::Tensor opacities, int64_t height, int64_t width, bool density_normalize);
+
+static std::vector<torch::Tensor> forward_core(
     torch::Tensor means,
     torch::Tensor covariances,
     torch::Tensor colors,
@@ -468,47 +511,10 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
         N, H, W, density_normalize
     );
 
-    // 2. Count tile memberships
-    auto tile_counts = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    count_tile_membership_kernel<<<blocks, 256>>>(
-        (Gaussian2D*)gaussians.data_ptr<float>(),
-        tile_counts.data_ptr<int>(),
-        tiles_x, tiles_y, N
-    );
-
-    // 3. Exclusive prefix sum on device. Doing this on the host cost a full
-    //    device->host->device round trip (and a pipeline stall) every call.
-    auto tile_starts_t = torch::zeros({num_tiles + 1},
-                                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    tile_starts_t.slice(0, 1, num_tiles + 1).copy_(torch::cumsum(tile_counts, 0, torch::kInt32));
-    // Only the grand total needs to reach the host, to size the bin buffer.
-    const int total_bins = tile_starts_t[num_tiles].item<int>();
-
-    // 4. Build tile bins
-    auto tile_bins = torch::zeros({std::max(total_bins, 1)},
-                                  torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    auto tile_fill = torch::zeros({num_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    auto bin_tile_ids = torch::zeros_like(tile_bins);
-    assign_tile_bins_kernel<<<blocks, 256>>>(
-        (Gaussian2D*)gaussians.data_ptr<float>(),
-        tile_starts_t.data_ptr<int>(),
-        tile_fill.data_ptr<int>(),
-        tile_bins.data_ptr<int>(),
-        bin_tile_ids.data_ptr<int>(),
-        tiles_x, tiles_y, N
-    );
-
-    // atomicAdd hands out slots in nondeterministic order, so within a tile the
-    // bin was unsorted. Alpha compositing is order-dependent and the caller
-    // supplies Gaussians already sorted front-to-back, so index order *is* depth
-    // order: sorting each tile's segment by Gaussian id restores it. Sorting the
-    // composite key (tile_idx, g) globally does this in one pass and preserves
-    // the tile_starts layout, since tile_idx is the high-order part.
-    if (total_bins > 0) {
-        auto keys = bin_tile_ids.to(torch::kInt64) * (int64_t)(N + 1)
-                  + tile_bins.to(torch::kInt64);
-        tile_bins = tile_bins.index({torch::argsort(keys)}).contiguous();
-    }
+    // 2-4. Tile bins (shared helper; also returned so the backward can reuse them)
+    auto bins = build_tile_bins(gaussians, N, tiles_x, tiles_y, blocks);
+    auto tile_starts_t = bins[0];
+    auto tile_bins = bins[1];
 
     // 5. Rasterize
     auto output = torch::zeros({H, W, C}, torch::TensorOptions().dtype(colors.dtype()).device(torch::kCUDA));
@@ -527,7 +533,121 @@ torch::Tensor gaussian_splat_2d_forward_cuda(
         N, H, W, C, tiles_x, tiles_y
     );
 
-    return output;
+    return {output, tile_starts_t, tile_bins};
+}
+
+torch::Tensor gaussian_splat_2d_forward_cuda(
+    torch::Tensor means, torch::Tensor covariances, torch::Tensor colors,
+    torch::Tensor opacities, int64_t height, int64_t width, bool density_normalize
+) {
+    return forward_core(means, covariances, colors, opacities, height, width,
+                        density_normalize)[0];
+}
+
+std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor means,
+    torch::Tensor covariances,
+    torch::Tensor colors,
+    torch::Tensor opacities,
+    int64_t height,
+    int64_t width,
+    // Must match the forward's convention or the gradients are inconsistent
+    // with the rendered image.
+    bool density_normalize,
+    // Bins from the forward. Empty means rebuild them (the 2D API path).
+    torch::Tensor tile_starts_in,
+    torch::Tensor tile_bins_in
+) {
+    auto N = means.size(0);
+    auto C = colors.size(1);
+    int H = (int)height, W = (int)width;
+
+    // Gaussian2D is 48 bytes (8 floats + 4 ints); the buffer is reinterpreted as
+    // Gaussian2D* below, so it must hold N structs, not N floats.
+    constexpr int64_t kFloatsPerGaussian2D = sizeof(Gaussian2D) / sizeof(float);
+    auto gaussians = torch::zeros({(int64_t)N * kFloatsPerGaussian2D},
+                                  torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    int blocks = (N + 255) / 256;
+    precompute_gaussians_kernel<<<blocks, 256>>>(
+        means.contiguous().data_ptr<float>(),
+        covariances.contiguous().data_ptr<float>(),
+        (Gaussian2D*)gaussians.data_ptr<float>(),
+        N, H, W, density_normalize
+    );
+
+    // The per-pixel backward walks the same tile bins as the forward. Reusing
+    // the forward's bins avoids repeating count + scan + fill + sort, which was
+    // ~13% of GPU time; rebuilding is kept as the fallback for callers that
+    // cannot supply them.
+    const int tiles_x = (W + kTileSize - 1) / kTileSize;
+    const int tiles_y = (H + kTileSize - 1) / kTileSize;
+    torch::Tensor tile_starts_t, tile_bins;
+    if (tile_starts_in.defined() && tile_starts_in.numel() > 0) {
+        tile_starts_t = tile_starts_in.contiguous();
+        tile_bins = tile_bins_in.contiguous();
+    } else {
+        auto bins = build_tile_bins(gaussians, N, tiles_x, tiles_y, blocks);
+        tile_starts_t = bins[0];
+        tile_bins = bins[1];
+    }
+
+    auto grad_means = torch::zeros_like(means);
+    auto grad_means_abs = torch::zeros_like(means);
+    auto grad_covariances = torch::zeros_like(covariances);
+    auto grad_colors = torch::zeros_like(colors);
+    auto grad_opacities = torch::zeros_like(opacities);
+
+    dim3 bblock(kTileSize, kTileSize);
+    dim3 bgrid(tiles_x, tiles_y);
+    rasterize_backward_perpixel_kernel<<<bgrid, bblock>>>(
+        grad_output.contiguous().data_ptr<float>(),
+        (Gaussian2D*)gaussians.data_ptr<float>(),
+        colors.contiguous().data_ptr<float>(),
+        opacities.contiguous().data_ptr<float>(),
+        tile_starts_t.data_ptr<int>(),
+        tile_bins.data_ptr<int>(),
+        grad_means.data_ptr<float>(),
+        grad_means_abs.data_ptr<float>(),
+        grad_covariances.data_ptr<float>(),
+        grad_colors.data_ptr<float>(),
+        grad_opacities.data_ptr<float>(),
+        N, H, W, C, tiles_x, tiles_y
+    );
+
+    return {grad_means, grad_covariances, grad_colors, grad_opacities, grad_means_abs};
+}
+
+torch::Tensor gaussian_splat_3d_projected_forward_cuda(
+    torch::Tensor projected_means,
+    torch::Tensor projected_covariances,
+    torch::Tensor projected_colors,
+    torch::Tensor projected_opacities,
+    int64_t height,
+    int64_t width,
+    float min_covariance,
+    float sigma_radius
+) {
+    // 3DGS alpha convention: no density normalization.
+    return gaussian_splat_2d_forward_cuda(
+        projected_means, projected_covariances, projected_colors, projected_opacities,
+        height, width, /*density_normalize=*/false);
+}
+
+// Same forward, but also hands back the tile bins so the backward can skip
+// rebuilding them. Returns {image, tile_starts, tile_bins}.
+std::vector<torch::Tensor> gaussian_splat_3d_projected_forward_binned_cuda(
+    torch::Tensor projected_means,
+    torch::Tensor projected_covariances,
+    torch::Tensor projected_colors,
+    torch::Tensor projected_opacities,
+    int64_t height,
+    int64_t width,
+    float min_covariance,
+    float sigma_radius
+) {
+    return forward_core(projected_means, projected_covariances, projected_colors,
+                        projected_opacities, height, width, /*density_normalize=*/false);
 }
 
 std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
@@ -614,21 +734,6 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
     return {grad_means, grad_covariances, grad_colors, grad_opacities, grad_means_abs};
 }
 
-torch::Tensor gaussian_splat_3d_projected_forward_cuda(
-    torch::Tensor projected_means,
-    torch::Tensor projected_covariances,
-    torch::Tensor projected_colors,
-    torch::Tensor projected_opacities,
-    int64_t height,
-    int64_t width,
-    float min_covariance,
-    float sigma_radius
-) {
-    // 3DGS alpha convention: no density normalization.
-    return gaussian_splat_2d_forward_cuda(
-        projected_means, projected_covariances, projected_colors, projected_opacities,
-        height, width, /*density_normalize=*/false);
-}
 
 std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
     torch::Tensor grad_output,
@@ -639,12 +744,15 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
     int64_t height,
     int64_t width,
     float min_covariance,
-    float sigma_radius
+    float sigma_radius,
+    torch::Tensor tile_starts,
+    torch::Tensor tile_bins
 ) {
     // 3DGS alpha convention, matching gaussian_splat_3d_projected_forward_cuda.
     return gaussian_splat_2d_backward_cuda(
         grad_output, projected_means, projected_covariances, projected_colors,
-        projected_opacities, height, width, /*density_normalize=*/false);
+        projected_opacities, height, width, /*density_normalize=*/false,
+        tile_starts, tile_bins);
 }
 
 
