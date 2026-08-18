@@ -42,12 +42,18 @@ try:
         should_step_optimizer,
         split_child_log_scales,
     )
-    from tinysplat.metal_backend import (
+    from tinysplat.metal_backend import metal_available
+
+    # Device-dispatched: Metal when available, otherwise CUDA. Importing these
+    # from metal_backend meant they were stubs on CUDA, so VCD counts were all
+    # zero and --fastgs silently never densified.
+    from tinysplat.fastgs_stats import (
         count_session_hits,
         last_grad_means2d,
         last_grad_means2d_abs,
         last_radii2d,
-        metal_available,
+        stats_available,
+        stats_backend_name,
     )
     from tinysplat.sh import colors_from_sh, init_sh_from_rgb, sh_degree_from_step
 
@@ -69,6 +75,12 @@ except ImportError:
 
     def count_session_hits(*args, **kwargs):
         return None
+
+    def stats_available():
+        return False
+
+    def stats_backend_name():
+        return "none"
 
     def screen_frac_from_proj_covs(proj_covs, height, width):
         return torch.zeros(proj_covs.shape[0], device=proj_covs.device)
@@ -1966,8 +1978,11 @@ def main():
     use_fastgs = bool(args.fastgs)
     if use_fastgs and not _HAS_FASTGS:
         raise RuntimeError("--fastgs requires tinysplat.fastgs / metal_backend (install legacy package).")
-    if use_fastgs and not metal_available():
-        print("Warning: Metal dylib unavailable; FastGS footprint counts may fall back / fail.")
+    if use_fastgs and not stats_available():
+        raise RuntimeError(
+            "--fastgs needs per-render stats from a Metal or CUDA rasterizer; "
+            "neither is available. Training would silently never densify."
+        )
     fastgs_cfg = None
     if use_fastgs:
         fastgs_cfg = FastGSConfig(
@@ -1987,7 +2002,7 @@ def main():
             f"error_tau={fastgs_cfg.error_tau}, grow_scale3d={fastgs_cfg.grow_scale3d}, "
             f"grad_thresh={fastgs_cfg.grad_thresh}, grad_abs_thresh={fastgs_cfg.grad_abs_thresh}, "
             f"split_shrink={fastgs_cfg.split_scale_shrink}, "
-            f"scene_scale={scene_scale:.4f}, metal={metal_available()}, sh_degree={args.sh_degree}"
+            f"scene_scale={scene_scale:.4f}, stats={stats_backend_name()}, sh_degree={args.sh_degree}"
         )
     else:
         print(
