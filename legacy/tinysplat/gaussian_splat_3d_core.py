@@ -52,17 +52,20 @@ class _FusedProjectCUDA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, means, covariances, intrinsics, camera_to_world, near_plane, min_covariance):
+    def forward(ctx, means, covariances, intrinsics, camera_to_world, near_plane,
+                min_covariance, height, width):
         from .cpp import load_cuda_extension
 
         ext = load_cuda_extension()
         pm, cov2d, depth, visible = ext.project_3d_forward_cuda(
             means.contiguous(), covariances.contiguous(),
             intrinsics, camera_to_world, float(near_plane), float(min_covariance),
+            float(height or 0), float(width or 0),
         )
         ctx.save_for_backward(means, covariances, intrinsics, camera_to_world)
         ctx.near_plane = float(near_plane)
         ctx.min_covariance = float(min_covariance)
+        ctx.hw = (float(height or 0), float(width or 0))
         return pm, cov2d.view(-1, 2, 2), depth, visible
 
     @staticmethod
@@ -75,8 +78,9 @@ class _FusedProjectCUDA(torch.autograd.Function):
             g_pm.contiguous(), g_cov2d.contiguous(), g_depth.contiguous(),
             means.contiguous(), covariances.contiguous(),
             intrinsics, camera_to_world, ctx.near_plane, ctx.min_covariance,
+            ctx.hw[0], ctx.hw[1],
         )
-        return g_means, g_cov3, None, None, None, None
+        return g_means, g_cov3, None, None, None, None, None, None
 
 
 def _project_gaussians_3d_to_2d_pytorch(
@@ -86,13 +90,16 @@ def _project_gaussians_3d_to_2d_pytorch(
     camera_to_world: torch.Tensor,
     near_plane: float = 1e-4,
     min_covariance: float = 1e-4,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Fused CUDA path; falls through to the reference implementation on any
     # other device or if the extension is unavailable.
     if means.is_cuda and not _DISABLE_FUSED_PROJECT:
         try:
             return _FusedProjectCUDA.apply(
-                means, covariances, intrinsics, camera_to_world, near_plane, min_covariance
+                means, covariances, intrinsics, camera_to_world, near_plane,
+                min_covariance, height, width
             )
         except Exception:  # pragma: no cover - fall back rather than fail training
             pass
@@ -118,11 +125,24 @@ def _project_gaussians_3d_to_2d_pytorch(
         dim=1,
     )
 
+    # Inria/FastGS EWA Jacobian clamp. Without it an off-axis or near-plane
+    # Gaussian gets an unbounded d(screen)/d(camera) term, the 2D covariance
+    # explodes, and a handful of splats dominate every gradient: measured
+    # grad2d max was 706 on CUDA against 0.0037 on Metal, which has this clamp.
+    # The projected mean itself stays unclamped -- only the covariance Jacobian
+    # is limited.
+    tan_fovx = (0.5 * float(width) / fx) if width else (cx / fx)
+    tan_fovy = (0.5 * float(height) / fy) if height else (cy / fy)
+    lim_x = 1.3 * tan_fovx
+    lim_y = 1.3 * tan_fovy
+    jx = torch.clamp(x / safe_z, -lim_x, lim_x) * safe_z
+    jy = torch.clamp(y / safe_z, -lim_y, lim_y) * safe_z
+
     jacobian = torch.zeros(means.shape[0], 2, 3, dtype=means.dtype, device=means.device)
     jacobian[:, 0, 0] = fx / safe_z
-    jacobian[:, 0, 2] = -fx * x / (safe_z * safe_z)
+    jacobian[:, 0, 2] = -fx * jx / (safe_z * safe_z)
     jacobian[:, 1, 1] = fy / safe_z
-    jacobian[:, 1, 2] = -fy * y / (safe_z * safe_z)
+    jacobian[:, 1, 2] = -fy * jy / (safe_z * safe_z)
 
     projected_covariances = jacobian @ covariances_camera @ jacobian.transpose(1, 2)
     projected_covariances = projected_covariances + (
@@ -153,6 +173,8 @@ def _prepare_projected_gaussians_3d_pytorch(
             camera_to_world=camera_to_world,
             near_plane=near_plane,
             min_covariance=min_covariance,
+            height=height,
+            width=width,
         )
     )
 
