@@ -234,6 +234,53 @@ _PROJECT_REGISTRY: Dict[str, Callable] = {}
 _PREPARE_REGISTRY: Dict[str, Callable] = {}
 
 
+def register_cuda_3d_core():
+    """CUDA-specific projection prep: keep the visibility/overlap filter, drop
+    the global depth sort.
+
+    The shared implementation sorts every visible Gaussian by depth so that
+    array index order *is* depth order, which is what the CPU and MPS
+    rasterizers rely on when they composite in array order. The CUDA
+    rasterizer no longer needs that: it orders each tile's bin by depth
+    directly, so the sort here is redundant work on every render.
+
+    Returns the same tuple as the shared version plus the depths, which the
+    CUDA backend forwards to the rasterizer as the bin sort key.
+    """
+
+    def _prepare_cuda(
+        means, covariances, colors, opacities, intrinsics, camera_to_world,
+        height, width, near_plane, min_covariance, sigma_radius,
+    ):
+        projected_means, projected_covariances, depths, visible_mask = (
+            _project_gaussians_3d_to_2d_pytorch(
+                means=means, covariances=covariances, intrinsics=intrinsics,
+                camera_to_world=camera_to_world, near_plane=near_plane,
+                min_covariance=min_covariance, height=height, width=width,
+            )
+        )
+        if not torch.any(visible_mask):
+            return None
+
+        # No compaction. Gathering the visible subset cost ~118 GPU ops per
+        # call; instead the whole array goes to the rasterizer and the
+        # precompute kernel gives invisible Gaussians an empty bounding box so
+        # the binning skips them. Off-screen culling is free there too, since
+        # precompute already clamps the box to the image.
+        n = means.shape[0]
+        return (
+            projected_means,
+            projected_covariances,
+            colors,
+            opacities,
+            torch.arange(n, device=means.device),
+            depths,
+            visible_mask,
+        )
+
+    register_prepare_fn("cuda", _prepare_cuda)
+
+
 def register_project_fn(device: str, fn: Callable):
     """Register a device-specific project_gaussians_3d_to_2d implementation."""
     _PROJECT_REGISTRY[device] = fn
@@ -307,6 +354,11 @@ def _auto_register():
         from tinysplat.mps import register_mps_3d_core
 
         register_mps_3d_core()
+    except Exception:
+        pass
+
+    try:
+        register_cuda_3d_core()
     except Exception:
         pass
 

@@ -23,7 +23,8 @@ std::vector<torch::Tensor> gaussian_splat_2d_backward_cuda(
     int64_t width,
     bool density_normalize = true,
     torch::Tensor tile_starts_in = torch::Tensor(),
-    torch::Tensor tile_bins_in = torch::Tensor()
+    torch::Tensor tile_bins_in = torch::Tensor(),
+    torch::Tensor valid = torch::Tensor()
 );
 
 torch::Tensor gaussian_splat_3d_projected_forward_cuda(
@@ -48,7 +49,8 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_backward_cuda(
     float min_covariance,
     float sigma_radius,
     torch::Tensor tile_starts = torch::Tensor(),
-    torch::Tensor tile_bins = torch::Tensor()
+    torch::Tensor tile_bins = torch::Tensor(),
+    torch::Tensor valid = torch::Tensor()
 );
 
 
@@ -57,7 +59,8 @@ std::vector<torch::Tensor> gaussian_splat_3d_projected_forward_binned_cuda(
     torch::Tensor projected_covariances,
     torch::Tensor projected_colors,
     torch::Tensor projected_opacities,
-    int64_t height, int64_t width, float min_covariance, float sigma_radius);
+    int64_t height, int64_t width, float min_covariance, float sigma_radius,
+    torch::Tensor depths, torch::Tensor valid);
 
 std::vector<torch::Tensor> project_3d_forward_cuda(
     torch::Tensor means, torch::Tensor cov3,
@@ -94,7 +97,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("colors"), py::arg("opacities"), py::arg("height"), py::arg("width"),
           py::arg("density_normalize") = true,
           py::arg("tile_starts_in") = torch::empty({0}, torch::kInt32),
-          py::arg("tile_bins_in") = torch::empty({0}, torch::kInt32));
+          py::arg("tile_bins_in") = torch::empty({0}, torch::kInt32),
+          py::arg("valid") = torch::empty({0}, torch::kBool));
     m.def("gaussian_splat_3d_projected_forward_cuda", &gaussian_splat_3d_projected_forward_cuda, "3D projected Gaussian splatting forward (CUDA)");
     // pybind11 does not inherit C++ default arguments, so the optional bins
     // have to be declared here or every caller must pass them.
@@ -105,7 +109,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("height"), py::arg("width"),
           py::arg("min_covariance"), py::arg("sigma_radius"),
           py::arg("tile_starts") = torch::empty({0}, torch::kInt32),
-          py::arg("tile_bins") = torch::empty({0}, torch::kInt32));
+          py::arg("tile_bins") = torch::empty({0}, torch::kInt32),
+          py::arg("valid") = torch::empty({0}, torch::kBool));
     m.def("project_3d_forward_cuda", &project_3d_forward_cuda, "Fused 3D->2D projection (CUDA)");
     m.def("project_3d_backward_cuda", &project_3d_backward_cuda, "Fused 3D->2D projection VJP (CUDA)");
     m.def("footprint_hit_count_cuda", &footprint_hit_count_cuda, "FastGS VCD footprint hit counts (CUDA)");
@@ -113,5 +118,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("quat_scale_to_cov3_vjp_cuda", &quat_scale_to_cov3_vjp_cuda, "VJP of the above (CUDA)");
     m.def("gaussian_splat_3d_projected_forward_binned_cuda",
           &gaussian_splat_3d_projected_forward_binned_cuda,
-          "3D projected forward returning {image, tile_starts, tile_bins} (CUDA)");
+          "3D projected forward returning {image, tile_starts, tile_bins} (CUDA)",
+          py::arg("projected_means"), py::arg("projected_covariances"),
+          py::arg("projected_colors"), py::arg("projected_opacities"),
+          py::arg("height"), py::arg("width"),
+          py::arg("min_covariance"), py::arg("sigma_radius"),
+          py::arg("depths") = torch::empty({0}, torch::kFloat32),
+          py::arg("valid") = torch::empty({0}, torch::kBool));
 }
