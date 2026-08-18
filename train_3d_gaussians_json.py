@@ -1002,6 +1002,14 @@ class GaussianData:
         self.active_sh_degree = sh_degree_from_step(step, self.max_sh_degree)
 
     def covariance_matrices(self) -> torch.Tensor:
+        # On CUDA this is a single fused kernel. In PyTorch the quat -> 3x3
+        # covariance construction plus its backward showed up as aten::bmm at
+        # 38% of GPU time -- work Metal never pays because it fuses the same
+        # thing into its projection kernels.
+        if self.log_scales.is_cuda:
+            fused = _fused_quat_scale_to_cov3(self.rotations, self.log_scales)
+            if fused is not None:
+                return fused
         scales = torch.exp(self.log_scales)
         norm = self.rotations.norm(dim=1, keepdim=True).clamp(min=1e-8)
         q = self.rotations / norm
@@ -1108,6 +1116,43 @@ class GaussianData:
             "opacities": self.visible_opacities().detach().cpu(),
             "covariances": self.covariance_matrices().detach().cpu(),
         }
+
+
+class _QuatScaleToCov3CUDA(torch.autograd.Function):
+    """quat + log-scale -> 3x3 covariance, fused, with a hand-written VJP."""
+
+    @staticmethod
+    def forward(ctx, quats, log_scales):
+        from tinysplat.cpp import load_cuda_extension
+
+        ext = load_cuda_extension()
+        cov3 = ext.quat_scale_to_cov3_cuda(quats.contiguous(), log_scales.contiguous())
+        ctx.save_for_backward(quats, log_scales)
+        return cov3
+
+    @staticmethod
+    def backward(ctx, grad_cov3):
+        from tinysplat.cpp import load_cuda_extension
+
+        quats, log_scales = ctx.saved_tensors
+        ext = load_cuda_extension()
+        g_q, g_ls = ext.quat_scale_to_cov3_vjp_cuda(
+            quats.contiguous(), log_scales.contiguous(), grad_cov3.contiguous()
+        )
+        return g_q, g_ls
+
+
+def _fused_quat_scale_to_cov3(quats, log_scales):
+    """Fused covariance on CUDA, or None to fall back to the PyTorch path."""
+    try:
+        from tinysplat.cpp import load_cuda_extension
+
+        ext = load_cuda_extension()
+        if ext is None or not hasattr(ext, "quat_scale_to_cov3_cuda"):
+            return None
+        return _QuatScaleToCov3CUDA.apply(quats, log_scales)
+    except Exception:
+        return None
 
 
 def save_checkpoint(

@@ -71,6 +71,10 @@ torch::Tensor footprint_hit_count_cuda(
     int64_t height, int64_t width
 );
 
+torch::Tensor quat_scale_to_cov3_cuda(torch::Tensor quats, torch::Tensor log_scales);
+std::vector<torch::Tensor> quat_scale_to_cov3_vjp_cuda(
+    torch::Tensor quats, torch::Tensor log_scales, torch::Tensor grad_cov3);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gaussian_splat_2d_forward_cuda", &gaussian_splat_2d_forward_cuda, "2D Gaussian splatting forward (CUDA)");
     m.def("gaussian_splat_2d_backward_cuda", &gaussian_splat_2d_backward_cuda, "2D Gaussian splatting backward (CUDA)");
@@ -79,4 +83,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("project_3d_forward_cuda", &project_3d_forward_cuda, "Fused 3D->2D projection (CUDA)");
     m.def("project_3d_backward_cuda", &project_3d_backward_cuda, "Fused 3D->2D projection VJP (CUDA)");
     m.def("footprint_hit_count_cuda", &footprint_hit_count_cuda, "FastGS VCD footprint hit counts (CUDA)");
+    m.def("quat_scale_to_cov3_cuda", &quat_scale_to_cov3_cuda, "Fused quat+log-scale -> 3x3 covariance (CUDA)");
+    m.def("quat_scale_to_cov3_vjp_cuda", &quat_scale_to_cov3_vjp_cuda, "VJP of the above (CUDA)");
 }
