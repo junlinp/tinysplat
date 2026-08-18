@@ -209,6 +209,15 @@ __global__ void rasterize_forward_kernel(
 //          gradient is simply (total - prefix).
 // ---------------------------------------------------------------------------
 
+// Sum a value across the warp; lane 0 ends up with the total. Every thread in
+// the warp is compositing the same Gaussian at the same loop index, so one
+// atomic per warp replaces 32 -- the same trick Metal uses via simd_sum().
+__device__ __forceinline__ float warp_sum(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    return v;
+}
+
 __global__ void rasterize_backward_perpixel_kernel(
     const float* __restrict__ grad_output,   // (H,W,C)
     const Gaussian2D* __restrict__ gaussians,
@@ -296,30 +305,37 @@ __global__ void rasterize_backward_perpixel_kernel(
             sh_col[lane*3+2] = (C > 2) ? colors[g*C+2] : 0.f;
         }
         __syncthreads();
-        if (!done) {
-            for (int k = 0; k < m; ++k) {
-                const Gaussian2D& gk = sh_g[k];
-                if (x < gk.min_x || x > gk.max_x || y < gk.min_y || y > gk.max_y) continue;
-                const int g = tile_bins[bin_start + base + k];
 
+        // No `continue`/`break` in this loop: every lane must reach the warp
+        // shuffles below, so misses and finished pixels contribute zero rather
+        // than diverging. All lanes share the same Gaussian at a given k.
+        for (int k = 0; k < m; ++k) {
+            const Gaussian2D& gk = sh_g[k];
+            const int g = tile_bins[bin_start + base + k];
+            const bool hit = !done && inside &&
+                             x >= gk.min_x && x <= gk.max_x &&
+                             y >= gk.min_y && y <= gk.max_y;
+
+            float d_c0 = 0.f, d_c1 = 0.f, d_c2 = 0.f;
+            float d_opa = 0.f, gm_x = 0.f, gm_y = 0.f;
+            float d_cv0 = 0.f, d_cv1 = 0.f, d_cv3 = 0.f;
+            float alpha = 0.f;
+
+            if (hit) {
                 const float dx = (float)x - gk.mean_x, dy = (float)y - gk.mean_y;
                 const float qx = gk.inv_xx*dx + gk.inv_xy*dy;
                 const float qy = gk.inv_yx*dx + gk.inv_yy*dy;
                 const float G  = expf(-0.5f * (dx*qx + dy*qy)) * gk.normalization;
                 const float raw = sh_opa[k] * G;
-                const float alpha = fminf(0.999f, raw);
+                alpha = fminf(0.999f, raw);
                 const float w = alpha * T;
 
                 prefix[0] += w * sh_col[k*3+0];
                 prefix[1] += w * sh_col[k*3+1];
                 prefix[2] += w * sh_col[k*3+2];
 
-                // dL/dcolor
-                atomicAdd(&grad_colors[g*C+0], w * go[0]);
-                if (C > 1) atomicAdd(&grad_colors[g*C+1], w * go[1]);
-                if (C > 2) atomicAdd(&grad_colors[g*C+2], w * go[2]);
+                d_c0 = w * go[0]; d_c1 = w * go[1]; d_c2 = w * go[2];
 
-                // dL/dalpha = sum_ch go * (T*c - suffix/(1-alpha))
                 const float inv_1ma = 1.0f / fmaxf(1.0f - alpha, 1e-3f);
                 float dalpha = 0.f;
                 #pragma unroll
@@ -327,31 +343,48 @@ __global__ void rasterize_backward_perpixel_kernel(
                     const float suffix = total[ch] - prefix[ch];
                     dalpha += go[ch] * (T * sh_col[k*3+ch] - suffix * inv_1ma);
                 }
-
-                if (raw < 0.999f) {           // clamp has zero derivative above
-                    atomicAdd(&grad_opacities[g], dalpha * G);
-                    const float dG    = dalpha * sh_opa[k];
-                    const float dquad = -0.5f * G * dG;
+                if (raw < 0.999f) {          // clamp has zero derivative above
+                    d_opa = dalpha * G;
+                    const float dquad = -0.5f * G * (dalpha * sh_opa[k]);
                     // d = pixel - mean, so d(mean) picks up the sign flip.
-                    const float gm_x = -2.0f * dquad * qx;
-                    const float gm_y = -2.0f * dquad * qy;
-                    atomicAdd(&grad_means[g*2+0], gm_x);
-                    atomicAdd(&grad_means[g*2+1], gm_y);
-                    // AbsGS (FastGS split criterion) needs the sum of magnitudes,
-                    // which cancellation destroys in the signed accumulation.
-                    if (grad_means_abs != nullptr) {
-                        atomicAdd(&grad_means_abs[g*2+0], fabsf(gm_x));
-                        atomicAdd(&grad_means_abs[g*2+1], fabsf(gm_y));
-                    }
+                    gm_x = -2.0f * dquad * qx;
+                    gm_y = -2.0f * dquad * qy;
                     // quad = d^T S^-1 d  =>  dquad/dS = -(S^-1 d)(S^-1 d)^T
-                    atomicAdd(&grad_covs[g*4+0], -dquad * qx * qx);
-                    atomicAdd(&grad_covs[g*4+1], -dquad * qx * qy);
-                    atomicAdd(&grad_covs[g*4+2], -dquad * qy * qx);
-                    atomicAdd(&grad_covs[g*4+3], -dquad * qy * qy);
+                    d_cv0 = -dquad * qx * qx;
+                    d_cv1 = -dquad * qx * qy;
+                    d_cv3 = -dquad * qy * qy;
                 }
+            }
 
+            // One atomic per warp instead of one per pixel; Metal does the same
+            // with simd_sum(). At 400k Gaussians the raw per-pixel atomics left
+            // the GPU latency-bound at ~195W of a 450W budget.
+            const float r_c0 = warp_sum(d_c0), r_c1 = warp_sum(d_c1), r_c2 = warp_sum(d_c2);
+            const float r_op = warp_sum(d_opa);
+            const float r_mx = warp_sum(gm_x), r_my = warp_sum(gm_y);
+            const float r_ax = warp_sum(fabsf(gm_x)), r_ay = warp_sum(fabsf(gm_y));
+            const float r_v0 = warp_sum(d_cv0), r_v1 = warp_sum(d_cv1), r_v3 = warp_sum(d_cv3);
+
+            if ((lane & 31) == 0) {
+                if (r_c0 != 0.f) atomicAdd(&grad_colors[g*C+0], r_c0);
+                if (C > 1 && r_c1 != 0.f) atomicAdd(&grad_colors[g*C+1], r_c1);
+                if (C > 2 && r_c2 != 0.f) atomicAdd(&grad_colors[g*C+2], r_c2);
+                if (r_op != 0.f) atomicAdd(&grad_opacities[g], r_op);
+                if (r_mx != 0.f) atomicAdd(&grad_means[g*2+0], r_mx);
+                if (r_my != 0.f) atomicAdd(&grad_means[g*2+1], r_my);
+                if (grad_means_abs != nullptr) {
+                    if (r_ax != 0.f) atomicAdd(&grad_means_abs[g*2+0], r_ax);
+                    if (r_ay != 0.f) atomicAdd(&grad_means_abs[g*2+1], r_ay);
+                }
+                if (r_v0 != 0.f) atomicAdd(&grad_covs[g*4+0], r_v0);
+                if (r_v1 != 0.f) { atomicAdd(&grad_covs[g*4+1], r_v1);
+                                   atomicAdd(&grad_covs[g*4+2], r_v1); }
+                if (r_v3 != 0.f) atomicAdd(&grad_covs[g*4+3], r_v3);
+            }
+
+            if (hit) {
                 T *= (1.0f - alpha);
-                if (T < 1e-4f) { done = true; break; }
+                if (T < 1e-4f) done = true;
             }
         }
         __syncthreads();
