@@ -635,6 +635,7 @@ struct CamConst {
     float t[3];   // world->camera translation
     float fx, fy, cx, cy;
     float near_plane, min_cov;
+    float lim_x, lim_y;   // 1.3 * tan(fov/2), Inria EWA Jacobian clamp
 };
 
 __global__ void project_fwd_kernel(
@@ -683,8 +684,12 @@ __global__ void project_fwd_kernel(
         }
 
     const float iz = 1.0f / z, iz2 = iz * iz;
-    const float j00 = cam.fx * iz, j02 = -cam.fx * cx_ * iz2;
-    const float j11 = cam.fy * iz, j12 = -cam.fy * cy_ * iz2;
+    // Inria/FastGS clamp: an off-axis or near-plane Gaussian otherwise gets an
+    // unbounded d(screen)/d(camera) term and its 2D covariance explodes.
+    const float jx = fminf(fmaxf(cx_ * iz, -cam.lim_x), cam.lim_x) * z;
+    const float jy = fminf(fmaxf(cy_ * iz, -cam.lim_y), cam.lim_y) * z;
+    const float j00 = cam.fx * iz, j02 = -cam.fx * jx * iz2;
+    const float j11 = cam.fy * iz, j12 = -cam.fy * jy * iz2;
 
     // C2 = J Cc J^T with J = [[j00,0,j02],[0,j11,j12]]
     const float a0 = j00*cc[0] + j02*cc[6];
@@ -741,8 +746,17 @@ __global__ void project_bwd_kernel(
             cc[r*3+c] = s;
         }
 
-    const float j00 = cam.fx * iz, j02 = -cam.fx * cx_ * iz2;
-    const float j11 = cam.fy * iz, j12 = -cam.fy * cy_ * iz2;
+    const float tx = cx_ * iz, ty = cy_ * iz;
+    const bool clamp_x = fabsf(tx) > cam.lim_x;
+    const bool clamp_y = fabsf(ty) > cam.lim_y;
+    const float jx = (clamp_x ? copysignf(cam.lim_x, tx) : tx) * z;
+    const float jy = (clamp_y ? copysignf(cam.lim_y, ty) : ty) * z;
+    const float j00 = cam.fx * iz, j02 = -cam.fx * jx * iz2;
+    const float j11 = cam.fy * iz, j12 = -cam.fy * jy * iz2;
+    // The projected mean is NOT clamped, so d(mean)/d(camera) uses the exact
+    // terms rather than the clamped j02/j12.
+    const float p02 = -cam.fx * cx_ * iz2;
+    const float p12 = -cam.fy * cy_ * iz2;
 
     const float G00 = g_cov2d[i*4+0], G01 = g_cov2d[i*4+1];
     const float G10 = g_cov2d[i*4+2], G11 = g_cov2d[i*4+3];
@@ -794,17 +808,26 @@ __global__ void project_bwd_kernel(
 
     // camera-space gradient
     const float dpx = g_proj_means[i*2+0], dpy = g_proj_means[i*2+1];
-    float dcx = j00 * dpx;                 // d p / d c == J
+    float dcx = j00 * dpx;                 // d(proj mean)/d(camera), unclamped
     float dcy = j11 * dpy;
-    float dcz = j02 * dpx + j12 * dpy;
+    float dcz = p02 * dpx + p12 * dpy;
 
-    // through J's dependence on (cx_, cy_, z)
-    dcx += dJ[0*3+2] * (-cam.fx * iz2);
-    dcy += dJ[1*3+2] * (-cam.fy * iz2);
-    dcz += dJ[0*3+0] * (-cam.fx * iz2)
-         + dJ[0*3+2] * ( 2.0f * cam.fx * cx_ * iz3)
-         + dJ[1*3+1] * (-cam.fy * iz2)
-         + dJ[1*3+2] * ( 2.0f * cam.fy * cy_ * iz3);
+    // through J's dependence on (cx_, cy_, z). Inside the clamp jx = cx_, so the
+    // usual terms apply; outside it jx = +/-lim_x * z, which no longer depends on
+    // cx_ at all and depends on z only linearly.
+    dcz += dJ[0*3+0] * (-cam.fx * iz2) + dJ[1*3+1] * (-cam.fy * iz2);
+    if (clamp_x) {
+        dcz += dJ[0*3+2] * ( cam.fx * copysignf(cam.lim_x, tx) * iz2);
+    } else {
+        dcx += dJ[0*3+2] * (-cam.fx * iz2);
+        dcz += dJ[0*3+2] * ( 2.0f * cam.fx * cx_ * iz3);
+    }
+    if (clamp_y) {
+        dcz += dJ[1*3+2] * ( cam.fy * copysignf(cam.lim_y, ty) * iz2);
+    } else {
+        dcy += dJ[1*3+2] * (-cam.fy * iz2);
+        dcz += dJ[1*3+2] * ( 2.0f * cam.fy * cy_ * iz3);
+    }
 
     if (!vis) { dcx = 0.f; dcy = 0.f; dcz = 0.f; }   // safe_z branch is constant
     dcz += g_depth[i];                               // depth is emitted directly
@@ -816,7 +839,7 @@ __global__ void project_bwd_kernel(
 }
 
 CamConst make_cam(torch::Tensor intrinsics, torch::Tensor camera_to_world,
-                  float near_plane, float min_cov) {
+                  float near_plane, float min_cov, float height, float width) {
     auto K = intrinsics.to(torch::kCPU).to(torch::kFloat32).contiguous();
     auto M = camera_to_world.to(torch::kCPU).to(torch::kFloat32).contiguous();
     auto k = K.accessor<float,2>();
@@ -829,6 +852,12 @@ CamConst make_cam(torch::Tensor intrinsics, torch::Tensor camera_to_world,
         c.t[r] = -(c.w[r*3+0]*m[0][3] + c.w[r*3+1]*m[1][3] + c.w[r*3+2]*m[2][3]);
     c.fx = k[0][0]; c.fy = k[1][1]; c.cx = k[0][2]; c.cy = k[1][2];
     c.near_plane = near_plane; c.min_cov = min_cov;
+    // Metal: tan_fovx = (0.5 * width) / fx. Fall back to the principal point
+    // when the image size is not supplied.
+    const float tan_fovx = (width > 0.f ? 0.5f * width : c.cx) / fmaxf(c.fx, 1e-6f);
+    const float tan_fovy = (height > 0.f ? 0.5f * height : c.cy) / fmaxf(c.fy, 1e-6f);
+    c.lim_x = 1.3f * tan_fovx;
+    c.lim_y = 1.3f * tan_fovy;
     return c;
 }
 
@@ -837,7 +866,8 @@ CamConst make_cam(torch::Tensor intrinsics, torch::Tensor camera_to_world,
 std::vector<torch::Tensor> project_3d_forward_cuda(
     torch::Tensor means, torch::Tensor cov3,
     torch::Tensor intrinsics, torch::Tensor camera_to_world,
-    double near_plane, double min_covariance
+    double near_plane, double min_covariance,
+    double height, double width
 ) {
     TORCH_CHECK(means.is_cuda(), "means must be CUDA");
     auto m = means.contiguous(), c = cov3.contiguous().view({-1, 9});
@@ -852,7 +882,8 @@ std::vector<torch::Tensor> project_3d_forward_cuda(
             m.data_ptr<float>(), c.data_ptr<float>(),
             proj_means.data_ptr<float>(), cov2d.data_ptr<float>(),
             depth.data_ptr<float>(), visible.data_ptr<bool>(),
-            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance), N);
+            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance,
+                     (float)height, (float)width), N);
     }
     return {proj_means, cov2d, depth, visible};
 }
@@ -861,7 +892,8 @@ std::vector<torch::Tensor> project_3d_backward_cuda(
     torch::Tensor grad_proj_means, torch::Tensor grad_cov2d, torch::Tensor grad_depth,
     torch::Tensor means, torch::Tensor cov3,
     torch::Tensor intrinsics, torch::Tensor camera_to_world,
-    double near_plane, double min_covariance
+    double near_plane, double min_covariance,
+    double height, double width
 ) {
     auto m  = means.contiguous(), c = cov3.contiguous().view({-1, 9});
     auto gp = grad_proj_means.contiguous(), gc = grad_cov2d.contiguous().view({-1, 4});
@@ -874,7 +906,8 @@ std::vector<torch::Tensor> project_3d_backward_cuda(
             gp.data_ptr<float>(), gc.data_ptr<float>(), gd.data_ptr<float>(),
             m.data_ptr<float>(), c.data_ptr<float>(),
             grad_means.data_ptr<float>(), grad_cov3.data_ptr<float>(),
-            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance), N);
+            make_cam(intrinsics, camera_to_world, (float)near_plane, (float)min_covariance,
+                     (float)height, (float)width), N);
     }
     return {grad_means, grad_cov3.view({N, 3, 3})};
 }
