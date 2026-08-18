@@ -4,14 +4,15 @@
 # Run this ON the rented instance, not locally:
 #   bash vastai_truck_cuda.sh
 #
-# NOTE ON --fastgs: it is deliberately NOT passed. FastGS's VCD/VCP scores come
-# from count_session_hits(), which is implemented only in the Metal backend. On
-# CUDA it returns None, the trainer substitutes all-zero hit counts, and no
-# Gaussian ever clears the densify threshold -- training silently never
-# densifies and lands around ~9 PSNR. Without --fastgs the trainer uses
-# the built-in densify_and_prune path instead.
-# For the same reason benchmarks/.../run_benchmark.py is NOT used here: it
-# hardcodes --fastgs with no way to disable it.
+# --fastgs IS passed. FastGS's VCD/VCP statistics used to be Metal-only, so on
+# CUDA they returned None, the trainer substituted all-zero hit counts, and
+# training silently never densified. That was fixed in #20 (CUDA
+# footprint_hit_count + AbsGS accumulator) and #21 (the EWA Jacobian clamp that
+# CUDA was missing, without which gradients were dominated by outliers and
+# training did not converge). Reaching the published quality needs both.
+#
+# benchmarks/.../run_benchmark.py hardcodes --fastgs, which is now correct on
+# CUDA; this script exists mainly to drive a single scene with explicit flags.
 
 set -euo pipefail
 
@@ -65,7 +66,7 @@ train () {  # $1 = iterations, $2 = output dir
   python -u train_3d_gaussians_json.py "$DATASET" \
     --iterations "$1" --output-dir "$2" \
     --eval-hold 8 --device cuda --num-downscales 0 \
-    --sh-degree 3 --no-viser --cache-images \
+    --sh-degree 3 --no-viser --cache-images --fastgs \
     --densify-every 500 --densify-from 500 --densify-until 15000
 }
 
@@ -100,8 +101,12 @@ echo "metrics    : $WORK/out_$SCENE/metrics.json"
 echo "M1 baseline for comparison: PSNR 25.08 / SSIM 0.8697 / LPIPS 0.1255 (with FastGS)"
 echo "Retrieve with:  vastai copy <INSTANCE_ID>:$WORK/out_$SCENE/gaussians.pt ."
 
-# MEASURED 2026-08-17 on an RTX 4090: ~37-46 s/iter, i.e. ~308 h for 30k.
-# The CUDA 3D rasterizer (splat_3d_per_pixel_kernel) has no tile binning and is
-# O(N*H*W), making it ~74x slower than the Metal path on an M1. Until that kernel
-# is tiled, the full benchmark is not practical here -- use --iterations for
-# smoke tests only.
+# MEASURED on an RTX 4090 at commit 901a7db: ~20 it/s, i.e. ~25 min for 30k.
+#
+# For context on how that number moved: it was 37-46 s/iter before #18 (a 12x
+# buffer overflow, aliased tile bins, a density-normalisation factor applied
+# under alpha compositing, and a per-pixel linear scan of the tile bin in the
+# backward) and #19 (a per-pixel backward replacing the per-Gaussian one, which
+# also made the gradient exact rather than dropping transmittance). Do not trust
+# older timing notes -- and if you microbenchmark the backward, use realistic
+# projected covariances: synthetic 1-4px ones understate its cost by ~20x.
