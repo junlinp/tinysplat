@@ -109,8 +109,26 @@ tinysplat/
 ### Known limits (C++ core)
 
 - No spherical harmonics, densification, or COLMAP loader in C++
-- 3D CUDA backward is in **projected 2D space** only (full 3D Jacobian chain not implemented)
+- The standalone `cuda/` Bazel library still has no tile binning in its 3D
+  compositing kernel; the PyTorch extension under `legacy/tinysplat/cpp/` (which
+  Python training uses) does
 - Python training remains in `train_3d_gaussians_json.py` (built-in densify/prune; no gsplat)
+
+### Python training backends
+
+Both Metal and CUDA support the full pipeline, including FastGS:
+
+| | Metal (Apple Silicon) | CUDA |
+|---|---|---|
+| rasterizer | fused `qs` kernels | tiled forward + per-pixel backward |
+| projection | fused in Metal | fused CUDA kernel with hand-written VJP |
+| FastGS VCD / AbsGS | yes | yes (`cuda_backend`, dispatched by `fastgs_stats`) |
+
+The CUDA backward computes gradients in projected 2D space and recovers 3D
+gradients by re-running the projection under autograd, where Metal computes them
+directly in its kernels. Both agree numerically -- the CUDA path matches the CPU
+reference on every parameter -- so this is an implementation difference rather
+than a capability gap.
 
 ## Legacy Python version
 
