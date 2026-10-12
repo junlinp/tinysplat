@@ -173,6 +173,16 @@ def add_training_cameras(
     return handles
 
 
+def set_camera_to_frame(client: Any, frame: Any, look_distance: float = 1.0) -> None:
+    """Match a dataset camera's optical pose and vertical field of view."""
+    c2w = frame.camera_to_world.detach().cpu().numpy().astype(np.float64)
+    k = frame.intrinsics.detach().cpu().numpy().astype(np.float64)
+    client.camera.up_direction = -c2w[:3, 1]  # OpenCV +Y points down.
+    client.camera.position = c2w[:3, 3]
+    client.camera.look_at = c2w[:3, 3] + c2w[:3, 2] * look_distance
+    client.camera.fov = 2.0 * float(np.arctan2(frame.height * 0.5, k[1, 1]))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path, help="Path to gaussians.pt")
@@ -189,7 +199,8 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["webgl", "tinysplat"],
         default="webgl",
-        help="Initial render mode (switchable in the GUI).",
+        help="Initial render mode: webgl uses base colors only; tinysplat includes "
+             "learned view-dependent SH appearance (switchable in the GUI).",
     )
     parser.add_argument(
         "--opacity-floor",
@@ -209,7 +220,19 @@ def parse_args() -> argparse.Namespace:
         default=720,
         help="Initial server-side render height for tinysplat mode.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--gpu-memory-limit-gb", type=float, default=0.0,
+        help="Cap the CUDA PyTorch allocator in GiB (0 leaves it unrestricted).",
+    )
+    parser.add_argument(
+        "--torch-num-threads", type=int, default=0,
+        help="Set CPU intra-op threads (0 keeps the runtime default).",
+    )
+    args = parser.parse_args()
+    if (not np.isfinite(args.gpu_memory_limit_gb)
+            or args.gpu_memory_limit_gb < 0 or args.torch_num_threads < 0):
+        parser.error("memory limit must be finite and limits must be nonnegative")
+    return args
 
 
 def main() -> int:
@@ -222,6 +245,14 @@ def main() -> int:
         return 1
 
     print(f"Loading {ckpt} on {device} ...")
+    if device == "cuda" and args.gpu_memory_limit_gb > 0:
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        fraction = args.gpu_memory_limit_gb * 1024**3 / total_memory
+        if fraction > 1.0:
+            raise ValueError("--gpu-memory-limit-gb exceeds the selected GPU's total memory")
+        torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
     gauss_data = load_checkpoint(ckpt, device)
     print(f"Loaded {gauss_data.num_gaussians} gaussians (SH {gauss_data.active_sh_degree})")
 
@@ -280,18 +311,16 @@ def main() -> int:
         @gui_jump_btn.on_click
         def _(event: Any) -> None:
             index = int(gui_jump.value.split(":", 1)[0])
-            c2w = frames[index].camera_to_world.detach().cpu().numpy().astype(np.float64)
-            forward = c2w[:3, 2]  # OpenCV convention: +Z is the viewing direction.
-            client = event.client
-            client.camera.position = c2w[:3, 3]
-            client.camera.wxyz = vtf.SO3.from_matrix(c2w[:3, :3]).wxyz
-            client.camera.look_at = c2w[:3, 3] + forward * radius
+            set_camera_to_frame(event.client, frames[index], radius)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
-        client.camera.position = center + np.array([0.0, -radius, radius * 0.35])
-        client.camera.look_at = center
-        client.camera.up_direction = np.array([0.0, 0.0, 1.0])
+        if frames:
+            set_camera_to_frame(client, frames[0])
+        else:
+            client.camera.position = center + np.array([0.0, -radius, radius * 0.35])
+            client.camera.look_at = center
+            client.camera.up_direction = np.array([0.0, 0.0, 1.0])
 
     # ---- Server-side render loop -------------------------------------------
     def render_loop() -> None:
