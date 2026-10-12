@@ -461,6 +461,19 @@ def parse_args():
         action="store_true",
         help="Disable the viser UI (recommended for headless benchmarks).",
     )
+    parser.add_argument(
+        "--fastgs-late-prune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable FastGS pruning after densification ends. Disable for a "
+             "quality comparison when late pruning removes useful scene detail.",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save gaussians_step_NNNNN.pt every N steps (0 disables intermediate checkpoints).",
+    )
     # FastGS is the densification strategy the published benchmark numbers use,
     # and it now works on both Metal and CUDA, so it is on by default.
     parser.add_argument(
@@ -481,7 +494,10 @@ def parse_args():
         action="store_true",
         help="Prefer Metal tiled rasterizer when the dylib is available.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be nonnegative")
+    return args
 
 
 def choose_device() -> str:
@@ -2244,7 +2260,8 @@ def main():
                 and step_idx % fastgs_cfg.densify_every == 0
             )
             prune_now = (
-                step_idx > fastgs_cfg.densify_until
+                args.fastgs_late_prune
+                and step_idx > fastgs_cfg.densify_until
                 and step_idx < args.iterations
                 and step_idx % fastgs_cfg.prune_every_late == 0
             )
@@ -2452,6 +2469,13 @@ def main():
                     width=first_width,
                 ).detach()
             save_image(eval_render, output_dir / f"render_frame0_step_{step + 1:05d}.png")
+
+        if (
+            args.checkpoint_every > 0
+            and (step + 1) % args.checkpoint_every == 0
+            and step + 1 < args.iterations
+        ):
+            save_checkpoint(gauss_data, output_dir / f"gaussians_step_{step + 1:05d}.pt")
 
     with torch.no_grad():
         final_render = gauss_data.render(

@@ -151,3 +151,35 @@ See [`benchmarks/tanks_and_temples/README.md`](benchmarks/tanks_and_temples/READ
 ## License
 
 MIT
+
+## Inspecting quality and preserving detail
+
+The Viser viewer defaults to browser WebGL rendering, which uses only the SH DC
+(base color) term. To inspect the learned view-dependent appearance with
+TinySplat's own CUDA renderer:
+
+```bash
+python view_gaussians_viser.py outputs/run/gaussians.pt \
+  --dataset data/scene/dataset.json --device cuda --mode tinysplat \
+  --render-height 540 --gpu-memory-limit-gb 4 --torch-num-threads 4
+```
+
+With a dataset, the viewer starts at its first camera. Camera jumps preserve the
+recorded optical up direction and vertical field of view. Without a dataset, the
+viewer retains the orbit overview. The optional memory limit caps the selected
+GPU's PyTorch allocator; it is not a reservation or a limit on other processes.
+
+FastGS late pruning remains enabled by default. For scenes where pruning removes
+useful detail, compare a run with it disabled while retaining early pruning and
+densification. Intermediate checkpoints help inspect the model before pruning:
+
+```bash
+python train_3d_gaussians_json.py data/scene/dataset.json \
+  --device cuda --fastgs --no-fastgs-late-prune --checkpoint-every 5000 \
+  --iterations 30000 --no-viser --output-dir outputs/no_late_prune
+```
+
+`--checkpoint-every 0` (default) saves only the final `gaussians.pt`. Positive
+intervals also save `gaussians_step_NNNNN.pt` before the final step. Disabling
+late pruning can retain more Gaussians and increase memory and rendering cost;
+compare held-out metrics and use `--max-gaussians` to bound growth.
