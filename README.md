@@ -154,9 +154,12 @@ MIT
 
 ## Inspecting quality and preserving detail
 
-The Viser viewer defaults to browser WebGL rendering, which uses only the SH DC
-(base color) term. To inspect the learned view-dependent appearance with
-TinySplat's own CUDA renderer:
+The Viser viewer defaults to browser WebGL rendering. It retains all Gaussians
+by default and updates their SH colors for each client camera position. Geometry
+is rasterized in the browser; color updates require the server connection.
+WebGL uses a black background to match TinySplat. Viser still differs in its
+screen-space filtering, culling, covariance precision, and alpha compositing.
+To inspect TinySplat's own CUDA renderer:
 
 ```bash
 python view_gaussians_viser.py outputs/run/gaussians.pt \
@@ -164,9 +167,12 @@ python view_gaussians_viser.py outputs/run/gaussians.pt \
   --render-height 540 --gpu-memory-limit-gb 4 --torch-num-threads 4
 ```
 
-With a dataset, the viewer starts at its first camera. Camera jumps preserve the
-recorded optical up direction and vertical field of view. Without a dataset, the
-viewer retains the orbit overview. The optional memory limit caps the selected
+With a dataset, the viewer starts at its first camera. In TinySplat mode,
+`use dataset calibration` uses the exact recorded intrinsics, pose, and original
+resolution, with letterboxing and lossless PNG streaming. Camera jumps enable
+this mode. Uncheck it to orbit with the server renderer; selecting WebGL also
+releases the calibration lock. Without a dataset, the viewer uses an orbit
+overview. The optional memory limit caps the selected
 GPU's PyTorch allocator; it is not a reservation or a limit on other processes.
 
 FastGS late pruning remains enabled by default. For scenes where pruning removes

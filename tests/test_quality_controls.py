@@ -52,6 +52,43 @@ class QualityControlsTest(unittest.TestCase):
                     module.parse_args()
                 self.assertEqual(error.exception.code, 2)
 
+    def test_webgl_export_keeps_faint_gaussians_and_order(self):
+        model = SimpleNamespace(
+            means=torch.tensor([[1., 2., 3.], [4., 5., 6.]]),
+            sh_coeffs=None, colors=torch.tensor([[.1, .2, .3], [.4, .5, .6]]),
+            visible_opacities=lambda: torch.tensor([.001, .8]),
+            covariance_matrices=lambda: torch.eye(3).repeat(2, 1, 1),
+        )
+        arrays = viewer.splat_arrays(model, opacity_floor=0., max_splats=0)
+        self.assertEqual(arrays["kept"], 2)
+        np.testing.assert_array_equal(arrays["indices"], [0, 1])
+        limited = viewer.splat_arrays(model, opacity_floor=0., max_splats=1)
+        np.testing.assert_array_equal(limited["indices"], [1])
+
+    def test_calibrated_render_uses_exact_intrinsics_and_resolution(self):
+        class Model:
+            def render(self, **kwargs):
+                self.received = kwargs
+                return torch.zeros((7, 5, 3))
+        model = Model()
+        frame = SimpleNamespace(width=5, height=7,
+            intrinsics=torch.tensor([[4., 0., 1.2], [0., 6., 3.1], [0., 0., 1.]]),
+            camera_to_world=torch.eye(4))
+        rgb, _ = viewer.Renderer(model).render_frame(frame)
+        self.assertIs(model.received["intrinsics"], frame.intrinsics)
+        self.assertIs(model.received["camera_to_world"], frame.camera_to_world)
+        self.assertEqual((model.received["width"], model.received["height"]), (5, 7))
+        self.assertEqual(rgb.shape, (7, 5, 3))
+
+    def test_letterbox_preserves_all_pixels(self):
+        rgb = np.arange(7 * 5 * 3, dtype=np.uint8).reshape(7, 5, 3)
+        for aspect in (2., .4):
+            canvas = viewer.letterbox_image(rgb, aspect)
+            h, w = canvas.shape[:2]
+            y, x = (h - 7) // 2, (w - 5) // 2
+            np.testing.assert_array_equal(canvas[y:y + 7, x:x + 5], rgb)
+            self.assertLessEqual(abs(w / h - aspect), 1 / h)
+
     def test_recorded_camera_preserves_roll_and_fov(self):
         # A rolled optical camera must not be forced to world +Z up.
         pose = torch.tensor([[0., -1., 0., 2.], [1., 0., 0., 3.],

@@ -3,7 +3,7 @@
 
 Two rendering modes, switchable live from the GUI:
 
-``webgl``     — push the Gaussians to the browser once and let viser's
+``webgl``     — push the Gaussians and update SH colors per camera; let viser's
                 client-side splat rasterizer draw them. Smooth and
                 interactive, but it is *viser's* renderer, not TinySplat's.
 ``tinysplat`` — rasterize every frame on the server with TinySplat (Metal on
@@ -99,6 +99,7 @@ def splat_arrays(
         "covariances": to_np(gauss_data.covariance_matrices()[idx]).astype(np.float32),
         "rgbs": to_np(base_colors(gauss_data)[idx]).astype(np.float32),
         "opacities": to_np(opacities[idx]).astype(np.float32).reshape(-1, 1),
+        "indices": to_np(idx),
         "kept": idx.numel(),
     }
 
@@ -145,6 +146,31 @@ class Renderer:
             )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return tensor_image_to_uint8(image), elapsed_ms
+
+    @torch.no_grad()
+    def render_frame(self, frame: Any) -> Tuple[np.ndarray, float]:
+        """Render at the recorded resolution with the exact dataset K and pose."""
+        start = time.perf_counter()
+        with self.lock:
+            image = self.gauss_data.render(
+                intrinsics=frame.intrinsics,
+                camera_to_world=frame.camera_to_world,
+                height=frame.height,
+                width=frame.width,
+            )
+        return tensor_image_to_uint8(image), (time.perf_counter() - start) * 1000.0
+
+
+def letterbox_image(rgb: np.ndarray, aspect: float) -> np.ndarray:
+    """Pad to the browser aspect without stretching or cropping calibrated pixels."""
+    height, width = rgb.shape[:2]
+    aspect = max(float(aspect), 0.01)
+    canvas_width = max(width, int(round(height * aspect)))
+    canvas_height = max(height, int(round(width / aspect)))
+    canvas = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+    x, y = (canvas_width - width) // 2, (canvas_height - height) // 2
+    canvas[y:y + height, x:x + width] = rgb
+    return canvas
 
 
 def add_training_cameras(
@@ -199,14 +225,14 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         choices=["webgl", "tinysplat"],
         default="webgl",
-        help="Initial render mode: webgl uses base colors only; tinysplat includes "
+        help="Initial render mode: webgl uses view-dependent SH colors; tinysplat includes "
              "learned view-dependent SH appearance (switchable in the GUI).",
     )
     parser.add_argument(
         "--opacity-floor",
         type=float,
-        default=0.01,
-        help="Drop Gaussians below this opacity from the WebGL view.",
+        default=0.0,
+        help="Drop Gaussians below this opacity from WebGL (default: keep all).",
     )
     parser.add_argument(
         "--max-splats",
@@ -271,7 +297,8 @@ def main() -> int:
     print("Uploading splats to the browser ...")
     arrays = splat_arrays(gauss_data, args.opacity_floor, args.max_splats)
     kept = arrays.pop("kept")
-    splat_handle = server.scene.add_gaussian_splats("/splats", **arrays)
+    splat_indices = torch.as_tensor(arrays.pop("indices"), device=gauss_data.device)
+    splat_handle = server.scene.add_gaussian_splats("/splats", **arrays, visible=False)
     print(f"WebGL splats: {kept}/{gauss_data.num_gaussians}")
 
     frustums = add_training_cameras(server, frames, scale=radius * 0.04) if frames else []
@@ -291,7 +318,25 @@ def main() -> int:
         gui_height = server.gui.add_slider(
             "height", min=180, max=1440, step=60, initial_value=args.render_height
         )
+        gui_calibrated = server.gui.add_checkbox(
+            "use dataset calibration", initial_value=bool(frames) and args.mode == "tinysplat",
+            hint="Exact recorded pose, intrinsics and original resolution. Uncheck to orbit.",
+        )
         gui_stats = server.gui.add_text("frame", initial_value="—", disabled=True)
+
+    @gui_mode.on_update
+    def _(_event: Any) -> None:
+        # WebGL must always expose the interactive browser camera.
+        if gui_mode.value == "webgl":
+            gui_calibrated.value = False
+
+    @gui_calibrated.on_update
+    def _(_event: Any) -> None:
+        if gui_calibrated.value:
+            gui_mode.value = "tinysplat"
+        gui_height.disabled = bool(frames) and gui_calibrated.value
+
+    gui_height.disabled = bool(frames) and gui_calibrated.value
 
     if frustums:
         with server.gui.add_folder("Cameras"):
@@ -311,10 +356,21 @@ def main() -> int:
         @gui_jump_btn.on_click
         def _(event: Any) -> None:
             index = int(gui_jump.value.split(":", 1)[0])
+            gui_calibrated.value = True
+            gui_mode.value = "tinysplat"
             set_camera_to_frame(event.client, frames[index], radius)
+
+    client_splats: Dict[int, Any] = {}
+
+    @server.on_client_disconnect
+    def _(client: viser.ClientHandle) -> None:
+        client_splats.pop(client.client_id, None)
 
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
+        client_splats[client.client_id] = client.scene.add_gaussian_splats(
+            "/view_dependent_splats", **arrays, visible=False,
+        )
         if frames:
             set_camera_to_frame(client, frames[0])
         else:
@@ -325,21 +381,43 @@ def main() -> int:
     # ---- Server-side render loop -------------------------------------------
     def render_loop() -> None:
         last_key: Dict[int, Any] = {}
+        color_keys: Dict[int, Any] = {}
+        webgl_background: set[int] = set()
         while True:
             if gui_mode.value != "tinysplat":
-                splat_handle.visible = True
+                splat_handle.visible = False
                 for client in server.get_clients().values():
-                    if last_key.pop(client.client_id, None) is not None:
-                        client.scene.set_background_image(None)
+                    handle = client_splats.get(client.client_id)
+                    if handle is None:
+                        continue
+                    handle.visible = True
+                    position_key = tuple(np.asarray(client.camera.position).tolist())
+                    if color_keys.get(client.client_id) != position_key:
+                        pose = torch.eye(4, dtype=torch.float32, device=gauss_data.device)
+                        pose[:3, 3] = torch.as_tensor(position_key, device=gauss_data.device)
+                        with torch.no_grad(), renderer.lock:
+                            colors = gauss_data.visible_colors(pose)[splat_indices]
+                            handle.rgbs = colors.detach().cpu().numpy()
+                        color_keys[client.client_id] = position_key
+                    gui_stats.value = f"WebGL: {kept} splats, SH {gauss_data.active_sh_degree}"
+                    if last_key.pop(client.client_id, None) is not None or client.client_id not in webgl_background:
+                        # Match TinySplat's black background; white washed out translucent edges.
+                        client.scene.set_background_image(np.zeros((1, 1, 3), dtype=np.uint8), format="png")
+                        webgl_background.add(client.client_id)
                 time.sleep(0.05)
                 continue
 
             splat_handle.visible = False
             for client in server.get_clients().values():
+                webgl_background.discard(client.client_id)
+                handle = client_splats.get(client.client_id)
+                if handle is not None:
+                    handle.visible = False
                 camera = client.camera
+                calibrated_index = int(gui_jump.value.split(":", 1)[0]) if frames and gui_calibrated.value else None
                 height = int(gui_height.value)
                 width = max(64, int(round(height * float(camera.aspect))))
-                key = (
+                key = ("calibrated", calibrated_index, float(camera.aspect)) if calibrated_index is not None else (
                     tuple(np.asarray(camera.wxyz).tolist()),
                     tuple(np.asarray(camera.position).tolist()),
                     float(camera.fov),
@@ -353,15 +431,20 @@ def main() -> int:
                 c2w[:3, :3] = vtf.SO3(np.asarray(camera.wxyz)).as_matrix()
                 c2w[:3, 3] = np.asarray(camera.position)
                 try:
-                    rgb, elapsed_ms = renderer.render(c2w, float(camera.fov), width, height)
+                    if calibrated_index is not None:
+                        rgb, elapsed_ms = renderer.render_frame(frames[calibrated_index])
+                        height, width = rgb.shape[:2]
+                        rgb = letterbox_image(rgb, camera.aspect)
+                    else:
+                        rgb, elapsed_ms = renderer.render(c2w, float(camera.fov), width, height)
                 except Exception as exc:  # keep the viewer alive on a bad frame
                     gui_stats.value = f"error: {exc}"
                     time.sleep(0.5)
                     continue
 
-                client.scene.set_background_image(rgb, format="jpeg", jpeg_quality=85)
+                client.scene.set_background_image(rgb, format="png")
                 last_key[client.client_id] = key
-                gui_stats.value = f"{width}x{height}  {elapsed_ms:.1f} ms"
+                gui_stats.value = f"{width}x{height}  {elapsed_ms:.1f} ms" + ("  exact dataset camera" if calibrated_index is not None else "  free camera")
             time.sleep(0.01)
 
     threading.Thread(target=render_loop, daemon=True).start()
