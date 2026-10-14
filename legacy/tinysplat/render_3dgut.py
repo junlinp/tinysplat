@@ -1,4 +1,4 @@
-"""Optional gsplat 3DGUT renderer and a bounded PyTorch correctness reference.
+"""Native CUDA/Metal 3DGUT, optional gsplat, and a PyTorch reference.
 
 The reference evaluates 3D Gaussian responses along calibrated rays directly;
 it is not an accelerated unscented-transform rasterizer.
@@ -23,6 +23,7 @@ def render_3dgut(means, quats, scales, opacities, colors, camera, camera_to_worl
     """Return HWC RGB and HW1 alpha. Calibration is fixed, pose is optical c2w.
 
     `gsplat` requires CUDA and an API exposing both with_ut and with_eval3d.
+    `native` uses TinySplat's CUDA/Metal UT and eval3D forward/backward kernels.
     `reference` supports CPU/CUDA/Apple MPS for small scenes. No implicit
     undistortion, approximate pinhole conversion, or device fallback occurs.
     """
@@ -30,7 +31,10 @@ def render_3dgut(means, quats, scales, opacities, colors, camera, camera_to_worl
         raise ValueError("Supported devices are CPU, CUDA and Apple MPS")
     validate_camera_to_world(camera_to_world)
     if backend == "auto":
-        backend = "gsplat" if means.is_cuda else "reference"
+        backend = "native" if means.device.type in ("cuda", "mps") else "reference"
+    if backend == "native":
+        from .native_3dgut import render_native
+        return render_native(means,quats,scales,opacities,colors,camera,camera_to_world,near_plane)
     if backend == "gsplat":
         if not means.is_cuda:
             raise ValueError("gsplat 3DGUT requires CUDA; use reference for CPU/Apple")

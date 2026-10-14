@@ -97,11 +97,11 @@ def test_pinhole_loader_rejects_raw_distorted_dataset(tmp_path):
     with pytest.raises(ValueError,match='train_3dgut.py'):module.load_dataset_frames(path,'cpu')
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", "cuda", "mps"])
 def test_raw_fisheye_training_cli(tmp_path, device):
     if device == "cuda":
         if not torch.cuda.is_available(): pytest.skip("CUDA unavailable")
-        pytest.importorskip("gsplat")
+    if device == "mps" and not torch.backends.mps.is_available(): pytest.skip("Apple GPU unavailable")
     c=Camera(24,20,15.,15.,12.,10.,"OPENCV_FISHEYE",(.03,-.004,0.,0.))
     with torch.no_grad():target,_,tensors=render_scene('cpu')
     cv2.imwrite(str(tmp_path/'raw.png'),(target.numpy()[...,::-1]*255).round().astype(np.uint8))

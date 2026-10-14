@@ -2,7 +2,7 @@
 """Train/render raw calibrated fisheye images without undistorting pixels.
 
 Run with PYTHONPATH=legacy. Fixed calibration and optical camera-to-world poses;
-fixed Gaussian count for predictable memory. CUDA uses optional gsplat 3DGUT.
+fixed Gaussian count for predictable memory. GPU defaults to native CUDA/Metal.
 """
 import argparse
 import collections
@@ -47,7 +47,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cuda")
-    p.add_argument("--backend", choices=["auto", "gsplat", "reference"], default="auto")
+    p.add_argument("--backend", choices=["auto", "native", "gsplat", "reference"], default="auto")
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--max-gaussians", type=int, default=100000)
     p.add_argument("--gpu-memory-limit-gb", type=float, default=6)
