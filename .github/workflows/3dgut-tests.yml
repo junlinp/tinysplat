@@ -28,5 +28,5 @@ jobs:
         run: |
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
           python -m pip install numpy==2.4.6 opencv-python-headless==5.0.0.93 pytest==9.1.1 tqdm==4.66.5 viser==1.1.1
-      - name: Run Python tests
-        run: python -P -m pytest -q -ra tests
+      - name: Build a simple scene and run Python regressions
+        run: python -P -m pytest -v -ra tests
