@@ -703,7 +703,7 @@ def load_dataset_frames(dataset_json: Path, device: str) -> Tuple[Path, List[Fra
     frames: List[FrameSample] = []
     for frame in dataset["frames"]:
         if frame.get("camera_model", "PINHOLE") != "PINHOLE" or frame.get("distortion"):
-            raise ValueError("Raw distorted cameras require train_3dgut.py; pinhole training would use incorrect calibration")
+            raise ValueError("Raw distorted cameras require ./splat train-fisheye; pinhole training would use incorrect calibration")
         intr = frame["intrinsics"]
         intrinsics = torch.tensor(
             [

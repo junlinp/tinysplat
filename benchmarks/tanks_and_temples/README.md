@@ -7,7 +7,7 @@ Novel-view quality eval on the standard 3DGS **train** / **truck** scenes.
 | Data | Hugging Face [`alexmkwizu/gaussian_training_datasets`](https://huggingface.co/datasets/alexmkwizu/gaussian_training_datasets) (`tandt/train`, `tandt/truck`) |
 | Split | Every 8th image held out (`--eval-hold 8`, same as official 3DGS / LLFF) |
 | Metrics | PSNR ↑, SSIM ↑, LPIPS ↓ on held-out views |
-| Train | [`train_3d_gaussians_json.py`](../../train_3d_gaussians_json.py) with **`--fastgs`** (VCD/VCP) + Metal tiled raster on MPS |
+| Train | [`./splat train`](../../splat) with **`--fastgs`** (VCD/VCP) + Metal tiled raster on MPS |
 
 ## Setup
 

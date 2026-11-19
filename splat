@@ -9,9 +9,9 @@ import sys
 
 COMMANDS = {
     "convert": ("convert_colmap_to_json", "Convert a COLMAP scene to dataset JSON"),
-    "train": ("train_3d_gaussians_json", "Train a pinhole scene"),
-    "train-fisheye": ("train_3dgut", "Train a raw fisheye scene"),
-    "view": ("view_gaussians_viser", "Open the interactive Viser viewer"),
+    "train": ("tinysplat.pinhole_training", "Train a pinhole scene"),
+    "train-fisheye": ("tinysplat.fisheye_training", "Train a raw fisheye scene"),
+    "view": ("tinysplat.viewer", "Open the interactive Viser viewer"),
 }
 
 
@@ -22,7 +22,9 @@ def main():
         commands.add_parser(name, help=description)
 
     command = parser.parse_args(sys.argv[1:2]).command
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+    root = Path(__file__).resolve().parent
+    sys.path.insert(0, str(root / "scripts"))
+    sys.path.insert(0, str(root / "python"))
     sys.argv = [f"{parser.prog} {command}", *sys.argv[2:]]
     module_name, _ = COMMANDS[command]
     return import_module(module_name).main()

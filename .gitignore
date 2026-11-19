@@ -4,9 +4,7 @@
 *.ppm
 *.egg-info/
 __pycache__/
-legacy/**/__pycache__/
-legacy/**/build/
-legacy/**/.ninja_log
+/tests/test_outputs/
 python/**/build/
 python/**/.ninja_log
 python/dist/

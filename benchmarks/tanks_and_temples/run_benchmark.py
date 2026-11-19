@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         "--extra-train-args",
         nargs=argparse.REMAINDER,
         default=[],
-        help="Extra args forwarded to train_3d_gaussians_json.py (prefix with --).",
+        help="Extra args forwarded to splat train (prefix with --).",
     )
     return parser.parse_args()
 
@@ -113,7 +113,8 @@ def main() -> int:
         if not args.skip_train:
             train_cmd = [
                 py,
-                str(repo_root / "train_3d_gaussians_json.py"),
+                str(repo_root / "splat"),
+                "train",
                 str(dataset_json),
                 "--iterations",
                 str(args.iterations),

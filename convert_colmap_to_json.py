@@ -1,1 +1,0 @@
-scripts/convert_colmap_to_json.py

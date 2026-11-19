@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-# Keep both standalone converters usable from outside the repository.
+# Resolve the adjacent COLMAP reader when invoked directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from colmap_io import (
     CAMERA_MODELS,

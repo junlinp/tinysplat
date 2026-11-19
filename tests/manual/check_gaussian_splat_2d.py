@@ -11,8 +11,8 @@ from tinysplat import gaussian_splat_2d, GaussianSplat2D
 
 
 # Path to Lena image
-LENA_PATH = Path(__file__).parent / "data" / "lena.png"
-TEST_OUTPUT_DIR = Path(__file__).parent / "test_outputs"
+LENA_PATH = Path(__file__).resolve().parents[1] / "data" / "lena.png"
+TEST_OUTPUT_DIR = Path(__file__).resolve().parents[1] / "test_outputs"
 TEST_OUTPUT_DIR.mkdir(exist_ok=True)
 
 
@@ -27,7 +27,7 @@ def load_lena_image(device="cpu"):
         Tensor of shape (H, W, 3) with values in [0, 1].
     """
     if not LENA_PATH.exists():
-        pytest.skip(f"Lena image not found at {LENA_PATH}. Run tests/download_lena.py first.")
+        pytest.skip(f"Lena image not found at {LENA_PATH}. Use the image shipped with the checkout.")
     
     try:
         from PIL import Image
