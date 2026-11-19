@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import subprocess
 import sys
@@ -8,9 +9,11 @@ import numpy as np
 import pytest
 import torch
 
+from tinysplat import gaussian_model
 from tinysplat.cameras import Camera
 from tinysplat.pinhole_training import load_dataset_frames
 from tinysplat.render_3dgut import render_3dgut
+from tinysplat.sh import init_sh_from_rgb
 
 
 def test_opencv_projection_and_pixel_ray_roundtrip():
@@ -73,6 +76,44 @@ def test_reference_front_to_back_and_behind_camera():
         torch.tensor([.8,.5,1.]),torch.eye(3),c,torch.eye(4),backend='reference')
     torch.testing.assert_close(image[0,0],torch.tensor([.8,.1,0.]))
     torch.testing.assert_close(alpha[0,0],torch.tensor([.9]))
+
+
+def test_checkpoint_sh_colors_receive_gradients_without_metal(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tinysplat.metal_backend", None)
+    spec = importlib.util.spec_from_file_location(
+        "tinysplat._gaussian_model_without_metal", gaussian_model.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert not module.metal_available()
+
+    checkpoint_rgb = torch.tensor([[0.8, 0.3, 0.2]])
+    model = module.GaussianData(
+        {
+            "means": torch.tensor([[0.0, 0.0, 2.0]]),
+            "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "log_scales": torch.full((1, 3), -2.0),
+            "opacities": torch.zeros(1),
+            "colors": torch.tensor([[0.1, 0.2, 0.3]]),
+            "sh_coeffs": init_sh_from_rgb(checkpoint_rgb),
+        },
+        "cpu",
+        sh_degree=3,
+    )
+    pose = torch.eye(4)
+    colors = model.visible_colors(pose)
+    torch.testing.assert_close(colors, checkpoint_rgb)
+
+    camera = Camera(24, 20, 15.0, 15.0, 12.0, 10.0, "OPENCV_FISHEYE", (0.0,) * 4)
+    image, _ = render_3dgut(
+        model.means, model.rotations, model.log_scales.exp(),
+        model.visible_opacities(), colors, camera, pose, backend="reference",
+    )
+    image.abs().mean().backward()
+    assert model.sh_coeffs.grad is not None
+    assert torch.isfinite(model.sh_coeffs.grad).all()
+    assert model.sh_coeffs.grad.abs().sum() > 0
+    assert model.colors.grad is None
 
 
 def test_pinhole_loader_rejects_raw_distorted_dataset(tmp_path):
