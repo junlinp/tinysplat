@@ -1,0 +1,32 @@
+name: 3DGUT tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, 'ci/**']
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: 3DGUT CPU and Python regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: legacy
+      TINYSPLAT_BUILD_EXTENSIONS: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
+          python -m pip install numpy==2.4.6 opencv-python-headless==5.0.0.93 pytest==9.1.1 tqdm==4.66.5 viser==1.1.1
+      - name: Build a simple scene and run Python regressions
+        run: python -P -m pytest -v -ra tests
