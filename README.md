@@ -1,6 +1,6 @@
 # TinySplat (C++ / Bazel)
 
-A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and built with [Bazel](https://bazel.build). The Python training commands use the PyTorch package under `legacy/tinysplat/`.
+A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and built with [Bazel](https://bazel.build). The Python training commands use the PyTorch package under `python/tinysplat/`.
 
 ## Features
 
@@ -85,8 +85,8 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 |---|---|
 | `src/tinysplat/` | C++ library and public headers |
 | `cuda/`, `metal/` | Native CUDA and Metal backends |
-| `legacy/tinysplat/` | Installable PyTorch package, including the shared Gaussian model in `gaussian_model.py` and PyTorch extensions in `cpp/` |
-| `legacy/tinysplat/pinhole_training.py`, `fisheye_training.py` in the same directory | Training loops for pinhole and raw fisheye images |
+| `python/tinysplat/` | Installable PyTorch package, including the shared Gaussian model in `gaussian_model.py` and PyTorch extensions in `cpp/` |
+| `python/tinysplat/pinhole_training.py`, `fisheye_training.py` in the same directory | Training loops for pinhole and raw fisheye images |
 | `train_3d_gaussians_json.py`, `train_3dgut.py` | Command-line entry points for the pinhole and fisheye trainers |
 | `convert_colmap_to_json.py`, `legacy/convert_colmap_to_json.py` | Current and legacy dataset converters. Both use the COLMAP readers in `scripts/colmap_io.py` |
 | `examples/`, `benchmarks/` | C++ demos and dataset benchmarks |
@@ -110,7 +110,7 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 
 - No spherical harmonics, densification, or COLMAP loader in C++
 - The standalone `cuda/` Bazel library still has no tile binning in its 3D
-  compositing kernel; the PyTorch extension under `legacy/tinysplat/cpp/` (which
+  compositing kernel; the PyTorch extension under `python/tinysplat/cpp/` (which
   Python training uses) does
 - Run pinhole training with `train_3d_gaussians_json.py` for built-in densification and pruning.
 
@@ -132,14 +132,14 @@ than a capability gap.
 
 ## Python package
 
-Install the training package from the repository root with `pip install -e legacy`. See the [raw fisheye training guide](docs/raw_fisheye_3dgut.md) for dataset calibration, training commands, and evaluation.
+Install the training package from the repository root with `pip install -e ./python`. See the [raw fisheye training guide](docs/raw_fisheye_3dgut.md) for dataset calibration, training commands, and evaluation.
 
 ### Tanks & Temples quality benchmark
 
 Novel-view PSNR / SSIM / LPIPS on the standard **train** / **truck** scenes (Hugging Face download, every-8th holdout):
 
 ```bash
-pip install -e legacy
+pip install -e ./python
 pip install huggingface_hub lpips pytorch-msssim
 
 python benchmarks/tanks_and_temples/run_benchmark.py --device cuda

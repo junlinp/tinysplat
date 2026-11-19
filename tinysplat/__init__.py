@@ -1,4 +1,4 @@
-"""Root helpers (Metal / FastGS / SH). Prefer `pip install -e legacy` for training APIs."""
+"""Root helpers (Metal / FastGS / SH). Prefer `pip install -e ./python` for training APIs."""
 
 from __future__ import annotations
 

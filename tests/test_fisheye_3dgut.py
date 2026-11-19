@@ -101,7 +101,7 @@ def test_raw_fisheye_training_cli(tmp_path, device):
     means,quats,scales,opa,colors=[t.detach() for t in tensors]
     ck=tmp_path/'initial.pt';torch.save(dict(means=means,rotations=quats,log_scales=scales.log(),opacities=torch.logit(opa),colors=colors),ck)
     repo=Path(__file__).resolve().parents[1]
-    env=os.environ.copy();env['PYTHONPATH']=str(repo/'legacy')+os.pathsep+env.get('PYTHONPATH','')
+    env=os.environ.copy();env['PYTHONPATH']=str(repo/'python')+os.pathsep+env.get('PYTHONPATH','')
     subprocess.run([sys.executable,str(repo/'train_3dgut.py'),'--dataset',str(path),'--checkpoint',str(ck),
                     '--output',str(tmp_path/'result'),'--device',device,'--steps','3','--eval-views','1'],env=env,check=True,cwd=tmp_path)
     assert json.loads((tmp_path/'result/dataset.json').read_text())==d

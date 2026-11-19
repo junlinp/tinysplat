@@ -1,1 +1,1 @@
-legacy/tinysplat/metal_backend.py
+python/tinysplat/metal_backend.py

@@ -1,1 +1,1 @@
-legacy/tinysplat/fastgs.py
+python/tinysplat/fastgs.py

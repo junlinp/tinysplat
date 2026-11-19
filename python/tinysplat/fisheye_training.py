@@ -1,6 +1,6 @@
 """Train/render raw calibrated fisheye images without undistorting pixels.
 
-Run with PYTHONPATH=legacy. Fixed calibration and optical camera-to-world poses;
+Run with PYTHONPATH=python. Fixed calibration and optical camera-to-world poses;
 fixed Gaussian count for predictable memory. GPU defaults to native CUDA/Metal.
 """
 import argparse

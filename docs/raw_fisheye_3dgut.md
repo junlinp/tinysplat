@@ -38,7 +38,7 @@ feature does not run SfM or optimize calibration/poses.
 ## CUDA training
 
 ```sh
-PYTHONPATH=legacy python train_3dgut.py \
+PYTHONPATH=python python train_3dgut.py \
   --dataset data/fisheye/dataset.json --output outputs/fisheye_3dgut \
   --device cuda --backend native --steps 3000 --max-gaussians 100000 \
   --gpu-memory-limit-gb 6 --min-free-gb 4
@@ -72,7 +72,7 @@ uses validation IDs when provided, otherwise labels results as training views.
 
 ```sh
 python metal/build_native_3dgut.py
-PYTHONPATH=legacy python train_3dgut.py \
+PYTHONPATH=python python train_3dgut.py \
   --dataset data/fisheye/dataset.json --output outputs/fisheye_metal \
   --device mps --backend native --steps 3000 --max-gaussians 100000
 ```
@@ -102,7 +102,7 @@ CLI's native raw-camera renders to judge calibration and training quality.
 ## Validation
 
 ```sh
-PYTHONPATH=legacy python -P -m pytest tests/test_fisheye_3dgut.py tests/test_native_3dgut.py -q
+PYTHONPATH=python python -P -m pytest tests/test_fisheye_3dgut.py tests/test_native_3dgut.py -q
 ```
 
 Tests compare projection against OpenCV, invert pixel rays, check geometry and

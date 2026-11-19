@@ -20,7 +20,7 @@ def _find_repo_root() -> Path:
             candidate / "metal" / "BUILD.bazel"
         ).is_file():
             return candidate
-    if here.name == "tinysplat" and here.parent.name == "legacy":
+    if here.name == "tinysplat" and here.parent.name == "python":
         return here.parents[1]
     return here.parents[1] if here.name == "tinysplat" else here
 

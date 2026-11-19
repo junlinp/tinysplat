@@ -24,9 +24,9 @@ Requires `--define=metal=1` (see `.bazelrc` `build:metal`).
 ## Train with FastGS on MPS
 
 ```bash
-export PYTHONPATH=$PWD/legacy
+export PYTHONPATH=$PWD/python
 export TINYSPLAT_METAL_LIB=$PWD/metal/build/libtinysplat_metal_py.dylib
-# Run from a non-repo cwd if needed so ./tinysplat does not shadow legacy.
+# Run from a non-repo cwd if needed so ./tinysplat does not shadow the training package.
 python train_3d_gaussians_json.py data/tandt/truck/dataset.json \
   --device mps --fastgs --sh-degree 3 --no-viser --iterations 30000
 ```

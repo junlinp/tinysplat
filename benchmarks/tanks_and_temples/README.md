@@ -12,8 +12,8 @@ Novel-view quality eval on the standard 3DGS **train** / **truck** scenes.
 ## Setup
 
 ```bash
-# Complete Python package lives under legacy/
-pip install -e legacy
+# Complete Python package lives under python/
+pip install -e ./python
 pip install huggingface_hub lpips pytorch-msssim
 # Metal FastGS rasterizer (macOS)
 ./metal/build_python_dylib.sh
@@ -37,7 +37,7 @@ Outputs land in `outputs/tandt_benchmark/<scene>/` (`gaussians.pt`, `metrics.jso
 ## Steps separately
 
 ```bash
-export PYTHONPATH=$PWD/legacy
+export PYTHONPATH=$PWD/python
 export TINYSPLAT_METAL_LIB=$PWD/metal/build/libtinysplat_metal_py.dylib
 python benchmarks/tanks_and_temples/download_hf.py --data-dir data
 python benchmarks/tanks_and_temples/prepare_scenes.py --data-dir data

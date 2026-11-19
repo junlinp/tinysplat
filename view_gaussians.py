@@ -24,9 +24,9 @@ import numpy as np
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parent
-_LEGACY = _REPO_ROOT / "legacy"
-if _LEGACY.is_dir():
-    sys.path.insert(0, str(_LEGACY))
+_PYTHON_DIR = _REPO_ROOT / "python"
+if _PYTHON_DIR.is_dir():
+    sys.path.insert(0, str(_PYTHON_DIR))
 
 from tinysplat.gaussian_model import GaussianData
 from tinysplat.pinhole_training import load_dataset_frames, resolve_device, tensor_image_to_uint8

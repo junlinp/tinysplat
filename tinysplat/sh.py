@@ -1,1 +1,1 @@
-../legacy/tinysplat/sh.py
+../python/tinysplat/sh.py
