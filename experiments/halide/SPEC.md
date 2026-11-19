@@ -103,7 +103,6 @@ tinysplat/
 │   ├── schedule_cpu.h       # CPU schedule definitions
 │   ├── schedule_cuda.h      # CUDA schedule definitions
 │   ├── schedule_metal.h     # Metal/MPS schedule definitions
-│   ├── pipeline_forward.cpp # JIT pipeline construction
 │   ├── pipeline_backward.cpp
 │   ├── bindings.h           # PyBind11/JITPython Callable wrappers
 │   └── CMakeLists.txt       # Build halide pipeline to .so
