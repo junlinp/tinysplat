@@ -152,7 +152,8 @@ conda install -c conda-forge halide
 ### 6.2 CMake Build
 
 ```bash
-cmake -S experiments/halide -B experiments/halide/build -DHL_PATH="$HL_PATH" -DHalide_DIR="$HL_PATH/lib/cmake/Halide"
+cmake -S experiments/halide -B experiments/halide/build \
+  -DCMAKE_BUILD_TYPE=Release -DHL_PATH="$HL_PATH"
 cmake --build experiments/halide/build
 ```
 

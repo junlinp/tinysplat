@@ -6,7 +6,7 @@
  * ======================================
  * Forward + Backward pipelines for 2D Gaussian splatting.
  *
- * Build:  HL_PATH=$HOME/halide make
+ * Build instructions: SPEC.md
  */
 
 #include <Halide.h>

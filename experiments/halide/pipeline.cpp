@@ -5,10 +5,7 @@
  * Applies target-specific schedules (CPU/CUDA/Metal) before realize.
  * Exposes a C API callable from Python via ctypes.
  *
- * Build:
- *   HL_PATH=/path/to/halide make
- *
- *   Produces: libtinysplat_halide_pipeline.so
+ * Build instructions: SPEC.md
  */
 
 #include <Halide.h>
