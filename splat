@@ -12,7 +12,6 @@ COMMANDS = {
     "train": ("train_3d_gaussians_json", "Train a pinhole scene"),
     "train-fisheye": ("train_3dgut", "Train a raw fisheye scene"),
     "view": ("view_gaussians_viser", "Open the interactive Viser viewer"),
-    "view-http": ("view_gaussians", "Open the HTTP viewer"),
 }
 
 

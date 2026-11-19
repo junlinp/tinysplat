@@ -1,1 +1,0 @@
-scripts/view_gaussians.py
