@@ -108,3 +108,63 @@ def test_raw_fisheye_training_cli(tmp_path, device):
     report=json.loads((tmp_path/'result/evaluation.json').read_text())
     assert report['intrinsics_fixed'] and report['distortion_fixed'] and report['poses_fixed']
     assert (tmp_path/'result/comparison_0.png').exists()
+
+
+def test_build_simple_fisheye_scene_from_sparse_points(tmp_path):
+    camera = Camera(24, 20, 15., 15., 12.5, 10.5, "OPENCV_FISHEYE", (.03, -.004, 0., 0.))
+    xyz = [0., 0., .3]
+    rgb = [230, 110, 50]
+    frames = []
+    for image_id, camera_x in enumerate((-.055, .06, .025)):
+        pose = torch.eye(4)
+        pose[0, 3] = camera_x
+        target, _ = render_3dgut(
+            torch.tensor([xyz]), torch.tensor([[1., 0., 0., 0.]]),
+            torch.full((1, 3), .011), torch.tensor([.25]), torch.tensor([rgb]) / 255.,
+            camera, pose, backend="reference",
+        )
+        image_path = tmp_path / f"raw_{image_id}.png"
+        assert cv2.imwrite(str(image_path), (target.numpy()[..., ::-1] * 255).round().astype(np.uint8))
+        frames.append({
+            "image_id": image_id,
+            "file_path": image_path.name,
+            "width": camera.width,
+            "height": camera.height,
+            "camera_model": camera.model,
+            "intrinsics": dict(fx=camera.fx, fy=camera.fy, cx=camera.cx, cy=camera.cy),
+            "distortion": list(camera.distortion),
+            "transform_matrix": pose.tolist(),
+        })
+
+    dataset = dict(
+        scene_dir=str(tmp_path),
+        frames=frames,
+        points3d=[dict(xyz=xyz, rgb=rgb)],
+        train_ids=[0, 1],
+        val_ids=[2],
+    )
+    dataset_path = tmp_path / "dataset.json"
+    dataset_path.write_text(json.dumps(dataset))
+    repo = Path(__file__).resolve().parents[1]
+    command = [
+        sys.executable, str(repo / "train_3dgut.py"), "--dataset", str(dataset_path),
+        "--device", "cpu", "--backend", "reference", "--max-gaussians", "1",
+    ]
+    initial, trained = tmp_path / "initial", tmp_path / "trained"
+    for output, steps in ((initial, 0), (trained, 150)):
+        subprocess.run(
+            [*command, "--output", str(output), "--steps", str(steps)],
+            cwd=tmp_path, check=True,
+        )
+
+    before = json.loads((initial / "evaluation.json").read_text())
+    after = json.loads((trained / "evaluation.json").read_text())
+    assert after["held_out"]
+    assert [view["image_id"] for view in after["views"]] == [2]
+    assert after["mean_psnr"] > before["mean_psnr"] + 2.0, (before, after)
+    assert json.loads((trained / "dataset.json").read_text()) == dataset
+    checkpoint = torch.load(trained / "gaussians.pt", map_location="cpu", weights_only=True)
+    assert checkpoint["means"].shape == (1, 3)
+    assert all(torch.isfinite(value).all() for value in checkpoint.values())
+    comparison = cv2.imread(str(trained / "comparison_2.png"))
+    assert comparison is not None and comparison.shape == (camera.height, 2 * camera.width, 3)
