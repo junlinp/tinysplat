@@ -1787,7 +1787,7 @@ def main():
     explicitly_requested = "--fastgs" in sys.argv
     unavailable = None
     if use_fastgs and not _HAS_FASTGS:
-        unavailable = "tinysplat.fastgs is not importable (install the legacy package)"
+        unavailable = "tinysplat.fastgs is not importable (install the Python package)"
     elif use_fastgs and not stats_available():
         unavailable = "no Metal or CUDA rasterizer can supply per-render VCD/AbsGS stats"
     if unavailable is not None:

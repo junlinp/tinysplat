@@ -1,1 +1,0 @@
-legacy/tinysplat/metal_backend.py

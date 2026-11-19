@@ -26,7 +26,7 @@ SCENE="${SCENE:-truck}"
 echo "=============== 1. environment ==============="
 nvidia-smi || { echo "FATAL: no NVIDIA GPU visible"; exit 1; }
 if ! command -v nvcc >/dev/null 2>&1; then
-  echo "FATAL: nvcc not found. The legacy CUDA extension JIT-compiles at first"
+  echo "FATAL: nvcc not found. The PyTorch CUDA extension JIT-compiles at first"
   echo "       use, so a runtime-only image will not work. Pick a vast.ai"
   echo "       template with the full CUDA toolkit (pytorch/pytorch *-devel)."
   exit 1
@@ -49,13 +49,13 @@ echo "at commit: $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
 echo "=============== 3. dependencies ==============="
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet huggingface_hub lpips pytorch-msssim plyfile opencv-python-headless tqdm
-# legacy/ is the complete `tinysplat` package: gaussian_splat_3d, backends_3d,
+# python/ is the complete `tinysplat` package: gaussian_splat_3d, backends_3d,
 # cpp/ (the CUDA extension). The root package only carries fastgs/metal/sh.
-python -m pip install --quiet -e legacy
+python -m pip install --quiet -e ./python
 python -c "import lpips, plyfile; print('deps ok')"
 
 echo "=============== 4. dataset ==============="
-export PYTHONPATH="$REPO/legacy:${PYTHONPATH:-}"
+export PYTHONPATH="$REPO/python:${PYTHONPATH:-}"
 python benchmarks/tanks_and_temples/download_hf.py --data-dir data
 python benchmarks/tanks_and_temples/prepare_scenes.py --data-dir data
 DATASET="data/tandt/$SCENE/dataset.json"

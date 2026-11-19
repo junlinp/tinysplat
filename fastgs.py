@@ -1,1 +1,0 @@
-legacy/tinysplat/fastgs.py

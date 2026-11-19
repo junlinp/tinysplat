@@ -2,40 +2,15 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 
 from .common import Backend3DOps
 
 
-def _import_metal_backend():
-    # Prefer package module; also allow repo-root / tinysplat/ layouts.
-    try:
-        from tinysplat.metal_backend import metal_available, render_metal_3d
-
-        return metal_available, render_metal_3d
-    except ImportError:
-        pass
-    repo = Path(__file__).resolve().parents[3]
-    for extra in (repo, repo / "tinysplat"):
-        s = str(extra)
-        if s not in sys.path:
-            sys.path.insert(0, s)
-    try:
-        from metal_backend import metal_available, render_metal_3d  # type: ignore
-
-        return metal_available, render_metal_3d
-    except ImportError:
-        from tinysplat.metal_backend import metal_available, render_metal_3d
-
-        return metal_available, render_metal_3d
-
-
 try:
-    _metal_available, _render_metal_3d = _import_metal_backend()
-    _HAS_METAL = bool(_metal_available())
+    from ..metal_backend import metal_available, render_metal_3d as _render_metal_3d
+
+    _HAS_METAL = bool(metal_available())
 except Exception:
     _HAS_METAL = False
     _render_metal_3d = None

@@ -1,9 +1,6 @@
-# Legacy Python / PyTorch implementation
+# Legacy Python tools
 
-This directory contains the original TinySplat codebase (Python API, PyTorch autograd, JIT-compiled C++/CUDA extensions, training scripts).
-
-The active project is now the **C++ / Bazel** build at the repository root. Use `pip install -e legacy` only if you need the old Python workflow.
-
-The FastGS, Metal backend, and spherical-harmonic helper implementations live
-in `legacy/tinysplat/`. The corresponding checkout-level Python modules are
-relative symlinks so existing scripts can import the same source files.
+This directory contains the earlier training and conversion scripts, examples,
+and backend tests. The active PyTorch package lives in [python/](../python/).
+The package and project-file links here preserve existing checkouts that use
+`pip install -e legacy` or `PYTHONPATH=legacy`.

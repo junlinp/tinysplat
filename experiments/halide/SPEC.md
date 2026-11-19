@@ -1,5 +1,7 @@
 # TinySplat × Halide — SPEC
 
+The prototype lives in `experiments/halide/`. This document records the proposed integration.
+
 ## 1. Current Architecture
 
 ```
@@ -91,7 +93,7 @@ Alternatively, ahead-of-time with a build step (see Phase 3).
 
 ---
 
-## 4. File Layout
+## 4. Proposed integration layout
 
 ```
 tinysplat/
@@ -151,9 +153,8 @@ conda install -c conda-forge halide
 ### 6.2 CMake Build
 
 ```bash
-mkdir halide_build && cd halide_build
-cmake -DHalide_DIR=$HL_PATH/lib/cmake/Halide ..
-make -j$(nproc)
+cmake -S experiments/halide -B experiments/halide/build -DHL_PATH="$HL_PATH" -DHalide_DIR="$HL_PATH/lib/cmake/Halide"
+cmake --build experiments/halide/build
 ```
 
 ### 6.3 Python Binding

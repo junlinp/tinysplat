@@ -55,10 +55,10 @@ def main() -> int:
     )
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # Prefer complete legacy package. Avoid repo-root cwd shadowing `tinysplat/`.
+    # Prefer complete training package. Avoid repo-root cwd shadowing `tinysplat/`.
     env = os.environ.copy()
-    legacy = str(repo_root / "legacy")
-    env["PYTHONPATH"] = legacy + os.pathsep + env.get("PYTHONPATH", "")
+    python_dir = str(repo_root / "python")
+    env["PYTHONPATH"] = python_dir + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault(
         "TINYSPLAT_METAL_LIB",
         str(repo_root / "metal" / "build" / "libtinysplat_metal_py.dylib"),

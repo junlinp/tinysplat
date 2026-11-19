@@ -7,9 +7,7 @@ pipelines to the torch.autograd.Function interface used by GaussianSplat2DFuncti
 Usage:
     export HL_PATH=$HOME/halide
     export TINYSPLAT_HALIDE_LIB=/path/to/libtinysplat_halide_pipeline.so
-    export TINYSPLAT_BACKEND=halide   # optional, forces Halide over other backends
-
-    # Then tinyplat will auto-detect and use the Halide backend.
+    PYTHONPATH=python:. python -P -m experiments.halide.halide_backend
 """
 
 import ctypes
@@ -99,7 +97,7 @@ def forward_halide(
     Falls back to pure-PyTorch if Halide library unavailable.
     """
     if _halide_lib is None and not _try_load_halide_lib():
-        from .backends.python import forward_pytorch
+        from tinysplat.backends.python import forward_pytorch
         return forward_pytorch(means, covariances, colors, opacities, height, width)
 
     N, C = colors.shape
@@ -123,7 +121,7 @@ def forward_halide(
 
     if rc != 0:
         # Fall back on error
-        from .backends.python import forward_pytorch
+        from tinysplat.backends.python import forward_pytorch
         return forward_pytorch(means, covariances, colors, opacities, height, width)
 
     output = torch.from_numpy(output_np).to(device)
@@ -149,7 +147,7 @@ def backward_halide(
     Backward pass. Phase 1: always falls back to PyTorch.
     Phase 2: will call _halide_lib.gaussian_splat_backward.
     """
-    from .backends.python import backward_pytorch
+    from tinysplat.backends.python import backward_pytorch
     return backward_pytorch(
         grad_output, means, covariances, colors, opacities,
         height, width, intermediates, needs_input_grad,
@@ -160,7 +158,7 @@ def backward_halide(
 # BackendOps registration
 # ---------------------------------------------------------------------------
 
-from .backends.common import BackendOps
+from tinysplat.backends.common import BackendOps
 
 HALIDE_BACKEND = BackendOps(
     name="halide",
@@ -171,7 +169,7 @@ HALIDE_BACKEND = BackendOps(
 
 
 # ---------------------------------------------------------------------------
-# Smoke test (run with: python -m tinysplat.halide_backend)
+# Smoke test (run with: PYTHONPATH=python:. python -P -m experiments.halide.halide_backend)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

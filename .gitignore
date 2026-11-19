@@ -7,7 +7,12 @@ __pycache__/
 legacy/**/__pycache__/
 legacy/**/build/
 legacy/**/.ninja_log
+python/**/build/
+python/**/.ninja_log
+python/dist/
 /data/
 /outputs/
 /logs/
 /metal/build/
+
+/experiments/halide/build/
