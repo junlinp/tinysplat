@@ -38,7 +38,7 @@ feature does not run SfM or optimize calibration/poses.
 ## CUDA training
 
 ```sh
-PYTHONPATH=python python train_3dgut.py \
+./splat train-fisheye \
   --dataset data/fisheye/dataset.json --output outputs/fisheye_3dgut \
   --device cuda --backend native --steps 3000 --max-gaussians 100000 \
   --gpu-memory-limit-gb 6 --min-free-gb 4
@@ -72,7 +72,7 @@ uses validation IDs when provided, otherwise labels results as training views.
 
 ```sh
 python metal/build_native_3dgut.py
-PYTHONPATH=python python train_3dgut.py \
+./splat train-fisheye \
   --dataset data/fisheye/dataset.json --output outputs/fisheye_metal \
   --device mps --backend native --steps 3000 --max-gaussians 100000
 ```

@@ -2,6 +2,21 @@
 
 A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and built with [Bazel](https://bazel.build). The Python training commands use the PyTorch package under `python/tinysplat/`.
 
+## Python quick start
+
+Use `./splat --help` to list commands and `./splat <command> --help` for options.
+Run these commands from the repository root for a COLMAP scene with PINHOLE calibration.
+
+```sh
+pip install -e ./python
+./splat convert data/scene
+./splat train data/scene/dataset.json --output-dir outputs/scene --no-viser
+./splat view outputs/scene/gaussians.pt --dataset data/scene/dataset.json
+```
+
+For raw fisheye images, use `./splat train-fisheye` with the
+[calibrated dataset format](docs/raw_fisheye_3dgut.md).
+
 ## Features
 
 - **2D Gaussian splatting** — tiled CPU forward and backward (weight-normalized compositing)
@@ -87,7 +102,7 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 | `cuda/`, `metal/` | Native CUDA and Metal backends |
 | `python/tinysplat/` | Installable PyTorch package, including the shared Gaussian model in `gaussian_model.py` and PyTorch extensions in `cpp/` |
 | `python/tinysplat/pinhole_training.py`, `fisheye_training.py` in the same directory | Training loops for pinhole and raw fisheye images |
-| `train_3d_gaussians_json.py`, `train_3dgut.py` | Command-line entry points for the pinhole and fisheye trainers |
+| `splat`, `scripts/` | Checkout launcher and command implementations |
 | `convert_colmap_to_json.py`, `legacy/convert_colmap_to_json.py` | Current and legacy dataset converters. Both use the COLMAP readers in `scripts/colmap_io.py` |
 | `examples/`, `benchmarks/` | C++ demos and dataset benchmarks |
 | `tests/` | C++ tests and Python regression tests, including the synthetic fisheye scene |
@@ -112,7 +127,7 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 - The standalone `cuda/` Bazel library still has no tile binning in its 3D
   compositing kernel; the PyTorch extension under `python/tinysplat/cpp/` (which
   Python training uses) does
-- Run pinhole training with `train_3d_gaussians_json.py` for built-in densification and pruning.
+- Run pinhole training with `./splat train` for built-in densification and pruning.
 
 ### Python training backends
 
@@ -162,7 +177,7 @@ screen-space filtering, culling, covariance precision, and alpha compositing.
 To inspect TinySplat's own CUDA renderer:
 
 ```bash
-python view_gaussians_viser.py outputs/run/gaussians.pt \
+./splat view outputs/run/gaussians.pt \
   --dataset data/scene/dataset.json --device cuda --mode tinysplat \
   --render-height 540 --gpu-memory-limit-gb 4 --torch-num-threads 4
 ```
@@ -180,7 +195,7 @@ useful detail, compare a run with it disabled while retaining early pruning and
 densification. Intermediate checkpoints help inspect the model before pruning:
 
 ```bash
-python train_3d_gaussians_json.py data/scene/dataset.json \
+./splat train data/scene/dataset.json \
   --device cuda --fastgs --no-fastgs-late-prune --checkpoint-every 5000 \
   --iterations 30000 --no-viser --output-dir outputs/no_late_prune
 ```

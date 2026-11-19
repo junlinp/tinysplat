@@ -147,7 +147,7 @@ def test_build_simple_fisheye_scene_from_sparse_points(tmp_path):
     dataset_path.write_text(json.dumps(dataset))
     repo = Path(__file__).resolve().parents[1]
     command = [
-        sys.executable, str(repo / "train_3dgut.py"), "--dataset", str(dataset_path),
+        sys.executable, str(repo / "splat"), "train-fisheye", "--dataset", str(dataset_path),
         "--device", "cpu", "--backend", "reference", "--max-gaussians", "1",
     ]
     initial, trained = tmp_path / "initial", tmp_path / "trained"

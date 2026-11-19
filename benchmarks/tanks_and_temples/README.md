@@ -41,7 +41,7 @@ export PYTHONPATH=$PWD/python
 export TINYSPLAT_METAL_LIB=$PWD/metal/build/libtinysplat_metal_py.dylib
 python benchmarks/tanks_and_temples/download_hf.py --data-dir data
 python benchmarks/tanks_and_temples/prepare_scenes.py --data-dir data
-python train_3d_gaussians_json.py data/tandt/truck/dataset.json \
+./splat train data/tandt/truck/dataset.json \
   --eval-hold 8 --iterations 30000 --no-viser --num-downscales 0 \
   --fastgs --sh-degree 3 --device mps \
   --output-dir outputs/tandt_benchmark/truck
