@@ -1,6 +1,6 @@
 # TinySplat (C++ / Bazel)
 
-A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and built with [Bazel](https://bazel.build). This is a rewrite of the original [Python/PyTorch TinySplat](https://github.com/junlinp/tinysplat); the previous implementation lives under `legacy/`.
+A lightweight **2D and 3D Gaussian splatting** library implemented in C++ and built with [Bazel](https://bazel.build). The Python training commands use the PyTorch package under `legacy/tinysplat/`.
 
 ## Features
 
@@ -48,11 +48,10 @@ Enable GPU code paths with Bazel:
 
 ```bash
 bazel build --define=cuda=1 //src/tinysplat:tinysplat
-bazel test --define=cuda=1 //tests:...
+bazel test --define=cuda=1 //tests/...
 ```
 
 Requires `nvcc` and a visible CUDA device for GPU tests and benchmarks.
-```
 
 ## API overview
 
@@ -82,16 +81,17 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 
 ## Project layout
 
-```
-tinysplat/
-├── MODULE.bazel          # Bazel module (bzlmod)
-├── BUILD.bazel           # Root aliases
-├── src/tinysplat/        # Core C++ library
-├── cuda/                 # CUDA kernels (nvcc genrule)
-├── examples/             # `render_2d`, `render_2d_cuda`, `debug`
-├── tests/                # C++ tests
-└── legacy/               # Original Python/PyTorch code (reference)
-```
+| Location | Purpose |
+|---|---|
+| `src/tinysplat/` | C++ library and public headers |
+| `cuda/`, `metal/` | Native CUDA and Metal backends |
+| `legacy/tinysplat/` | Installable PyTorch package, including the shared Gaussian model in `gaussian_model.py` and PyTorch extensions in `cpp/` |
+| `legacy/tinysplat/pinhole_training.py`, `fisheye_training.py` in the same directory | Training loops for pinhole and raw fisheye images |
+| `train_3d_gaussians_json.py`, `train_3dgut.py` | Command-line entry points for the pinhole and fisheye trainers |
+| `convert_colmap_to_json.py`, `legacy/convert_colmap_to_json.py` | Current and legacy dataset converters. Both use the COLMAP readers in `scripts/colmap_io.py` |
+| `examples/`, `benchmarks/` | C++ demos and dataset benchmarks |
+| `tests/` | C++ tests and Python regression tests, including the synthetic fisheye scene |
+| `legacy/` | Additional Python examples and backend tests |
 
 ## Build targets
 
@@ -112,7 +112,7 @@ tinysplat/
 - The standalone `cuda/` Bazel library still has no tile binning in its 3D
   compositing kernel; the PyTorch extension under `legacy/tinysplat/cpp/` (which
   Python training uses) does
-- Python training remains in `train_3d_gaussians_json.py` (built-in densify/prune; no gsplat)
+- Run pinhole training with `train_3d_gaussians_json.py` for built-in densification and pruning.
 
 ### Python training backends
 
@@ -130,9 +130,9 @@ directly in its kernels. Both agree numerically -- the CUDA path matches the CPU
 reference on every parameter -- so this is an implementation difference rather
 than a capability gap.
 
-## Legacy Python version
+## Python package
 
-The original package (PyTorch autograd, JIT C++/CUDA extensions, training scripts) is preserved in `legacy/` for reference. It is **not** built by Bazel.
+Install the training package from the repository root with `pip install -e legacy`. See the [raw fisheye training guide](docs/raw_fisheye_3dgut.md) for dataset calibration, training commands, and evaluation.
 
 ### Tanks & Temples quality benchmark
 

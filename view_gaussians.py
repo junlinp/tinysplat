@@ -8,7 +8,6 @@ JPEG frames to an orbit-camera web UI.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import math
 import sys
@@ -29,15 +28,8 @@ _LEGACY = _REPO_ROOT / "legacy"
 if _LEGACY.is_dir():
     sys.path.insert(0, str(_LEGACY))
 
-_TRAIN_PATH = _REPO_ROOT / "train_3d_gaussians_json.py"
-_spec = importlib.util.spec_from_file_location("train_3d_gaussians_json", _TRAIN_PATH)
-_train = importlib.util.module_from_spec(_spec)
-assert _spec.loader is not None
-_spec.loader.exec_module(_train)
-GaussianData = _train.GaussianData
-load_dataset_frames = _train.load_dataset_frames
-resolve_device = _train.resolve_device
-tensor_image_to_uint8 = _train.tensor_image_to_uint8
+from tinysplat.gaussian_model import GaussianData
+from tinysplat.pinhole_training import load_dataset_frames, resolve_device, tensor_image_to_uint8
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
