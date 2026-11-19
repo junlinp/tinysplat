@@ -1,2 +1,0 @@
-# Optional CUDA acceleration; CPU/Apple reference needs only existing PyTorch.
-gsplat==1.5.3

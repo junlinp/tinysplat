@@ -47,7 +47,7 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cuda")
-    p.add_argument("--backend", choices=["auto", "native", "gsplat", "reference"], default="auto")
+    p.add_argument("--backend", choices=["auto", "native", "reference"], default="auto")
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--max-gaussians", type=int, default=100000)
     p.add_argument("--gpu-memory-limit-gb", type=float, default=6)

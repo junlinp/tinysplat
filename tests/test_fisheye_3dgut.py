@@ -36,12 +36,12 @@ def test_reject_ambiguous_calibration_and_reference_oversize():
         render_scene('cpu',limit=1)
 
 
-def render_scene(device, backend="reference", limit=2_000_000):
+def render_scene(device, limit=2_000_000):
     c = Camera(24,20,15.,15.,12.,10.,"OPENCV_FISHEYE",(.03,-.004,0.,0.))
     tensors = [torch.tensor(v,device=device,dtype=torch.float32,requires_grad=True) for v in (
         [[-.15,.1,2.],[.35,-.1,2.7]], [[1.,.1,.05,.02],[1.,.02,-.1,.04]],
         [[.18,.22,.25],[.2,.15,.3]], [.7,.6], [[.8,.2,.1],[.1,.5,.9]])]
-    image, alpha = render_3dgut(*tensors,c,torch.eye(4,device=device),backend=backend,reference_pair_limit=limit)
+    image, alpha = render_3dgut(*tensors,c,torch.eye(4,device=device),backend="reference",reference_pair_limit=limit)
     return image,alpha,tensors
 
 
@@ -64,18 +64,6 @@ def test_reference_gradients_and_occlusion(device):
             out,_=render_3dgut(means,*tensors[1:],c,torch.eye(4,device=device),backend='reference')
             values.append(float((out*weights).sum()))
     assert float(tensors[0].grad[0,0])==pytest.approx((values[1]-values[0])/.001,rel=.02,abs=.01)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
-def test_real_gsplat_3dgut_forward_backward():
-    pytest.importorskip('gsplat')
-    image,alpha,tensors=render_scene('cuda','gsplat')
-    image.sum().backward()
-    assert alpha.max()>0
-    for t in tensors:assert t.grad is not None and torch.isfinite(t.grad).all()
-    ref,_,_=render_scene('cuda','reference')
-    # UT bounds/filtering can differ; dominant calibrated structure should agree.
-    assert float((image-ref).abs().mean().detach()) < .025
 
 
 def test_reference_front_to_back_and_behind_camera():

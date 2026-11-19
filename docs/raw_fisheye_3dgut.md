@@ -58,13 +58,10 @@ intersection construction has an eight-million-pair safety limit. Projection
 bounds and depth ordering are discrete; their derivatives are not propagated.
 Images use front-to-back alpha compositing and 3-sigma response truncation.
 
-For an optional comparison backend, install `requirements-3dgut.txt` and select
-`--backend gsplat`. The pinned gsplat backend uses **both** `with_ut=True` and
-`with_eval3d=True`: nonlinear unscented projection plus Gaussian response
-evaluation in 3D. It is not a 2D image warp. It uses a single camera per step,
-a two-image CPU cache, fixed Gaussian count and an explicit allocator cap/free
-memory guard. `--checkpoint` accepts a TinySplat checkpoint in the same world
-frame; it must fit the chosen Gaussian limit. Output directories must be new.
+Training uses a single camera per step, a two-image CPU cache, fixed Gaussian
+count, and an explicit allocator cap and free-memory guard. `--checkpoint`
+accepts a TinySplat checkpoint in the same world frame that fits the chosen
+Gaussian limit. Output directories must be new.
 
 Outputs include `gaussians.pt`, unchanged `dataset.json`, `renderer.json`,
 `evaluation.json`, and original/render comparison PNGs. With `--steps 0` and
@@ -95,10 +92,8 @@ PyTorch reference that evaluates 3D Gaussian responses along calibrated rays.
 It is for small-scene correctness checks and has a two-million Gaussian/pixel
 pair limit. It does not implement UT tile acceleration and is not intended for
 full-scene training. `auto` selects native kernels on CUDA/Apple and reference
-on CPU. Native GPU rendering does not require gsplat.
-Existing TinySplat pinhole CPU/CUDA/Apple backends remain available unchanged.
-Missing native libraries, missing explicitly selected gsplat, or unsupported
-camera models fail explicitly.
+on CPU. Missing native libraries or unsupported camera models produce explicit
+errors.
 
 The current WebGL viewer is pinhole-only. Its free-orbit view can display a
 Gaussian checkpoint, but is not a calibrated raw-fisheye comparison. Use this
@@ -107,16 +102,15 @@ CLI's native raw-camera renders to judge calibration and training quality.
 ## Validation
 
 ```sh
-PYTHONPATH=legacy python -m pytest tests/test_fisheye_3dgut.py tests/test_native_3dgut.py -q
+PYTHONPATH=legacy python -P -m pytest tests/test_fisheye_3dgut.py tests/test_native_3dgut.py -q
 ```
 
 Tests compare projection against OpenCV, invert pixel rays, check geometry and
 appearance gradients (including finite differences), exercise raw-image
-training/export, and run real gsplat CUDA forward/backward when installed.
+training and export on CPU and supported GPUs.
 Apple tests skip on hosts without an Apple GPU.
 Native tests compare RGB/alpha and all Gaussian parameter gradients against the
 reference, check finite differences, behind-camera culling, large particles,
 tile-memory limits, and a synthetic fisheye fit with fixed calibration.
 
-References: [3DGUT project](https://research.nvidia.com/labs/toronto-ai/3DGUT/)
-and [gsplat rasterization API](https://docs.gsplat.studio/main/apis/rasterization.html).
+[3DGUT project](https://research.nvidia.com/labs/toronto-ai/3DGUT/)

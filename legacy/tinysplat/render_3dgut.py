@@ -1,9 +1,8 @@
-"""Native CUDA/Metal 3DGUT, optional gsplat, and a PyTorch reference.
+"""Native CUDA/Metal 3DGUT and a PyTorch reference.
 
 The reference evaluates 3D Gaussian responses along calibrated rays directly;
 it is not an accelerated unscented-transform rasterizer.
 """
-import inspect
 import torch
 import torch.nn.functional as F
 
@@ -22,7 +21,6 @@ def render_3dgut(means, quats, scales, opacities, colors, camera, camera_to_worl
                   reference_pair_limit=2_000_000):
     """Return HWC RGB and HW1 alpha. Calibration is fixed, pose is optical c2w.
 
-    `gsplat` requires CUDA and an API exposing both with_ut and with_eval3d.
     `native` uses TinySplat's CUDA/Metal UT and eval3D forward/backward kernels.
     `reference` supports CPU/CUDA/Apple MPS for small scenes. No implicit
     undistortion, approximate pinhole conversion, or device fallback occurs.
@@ -35,32 +33,12 @@ def render_3dgut(means, quats, scales, opacities, colors, camera, camera_to_worl
     if backend == "native":
         from .native_3dgut import render_native
         return render_native(means,quats,scales,opacities,colors,camera,camera_to_world,near_plane)
-    if backend == "gsplat":
-        if not means.is_cuda:
-            raise ValueError("gsplat 3DGUT requires CUDA; use reference for CPU/Apple")
-        try:
-            from gsplat import rasterization
-        except ImportError as exc:
-            raise RuntimeError("Install requirements-3dgut.txt for CUDA 3DGUT") from exc
-        if not {"with_ut", "with_eval3d", "radial_coeffs"} <= set(inspect.signature(rasterization).parameters):
-            raise RuntimeError("Installed gsplat lacks 3DGUT; install requirements-3dgut.txt")
-        kwargs = {}
-        if camera.model == "OPENCV_FISHEYE":
-            kwargs["radial_coeffs"] = means.new_tensor(camera.distortion)[None]
-        image, alpha, _ = rasterization(
-            means=means, quats=quats, scales=scales, opacities=opacities.reshape(-1),
-            colors=colors, viewmats=torch.linalg.inv(camera_to_world)[None],
-            Ks=camera.matrix(device=means.device, dtype=means.dtype)[None],
-            width=camera.width, height=camera.height, camera_model="fisheye" if kwargs else "pinhole",
-            with_ut=True, with_eval3d=True, packed=False, near_plane=near_plane, **kwargs)
-        _, valid = camera.rays(device=means.device, dtype=means.dtype)
-        return image[0]*valid[..., None], alpha[0]*valid[..., None]
     if backend != "reference":
         raise ValueError(f"Unknown 3DGUT backend: {backend}")
     if pixel_chunk <= 0:
         raise ValueError("pixel_chunk must be positive")
     if len(means)*camera.width*camera.height > reference_pair_limit:
-        raise ValueError("Reference scene exceeds pair limit; use CUDA gsplat or a smaller scene")
+        raise ValueError("Reference scene exceeds pair limit; use the native CUDA/Metal backend or a smaller scene")
     rays, valid = camera.rays(device=means.device, dtype=means.dtype)
     # Express rays in each Gaussian's local, scale-normalized space.
     rays = rays.reshape(-1,3) @ camera_to_world[:3,:3].T
