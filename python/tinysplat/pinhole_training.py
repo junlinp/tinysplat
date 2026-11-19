@@ -19,8 +19,9 @@ import torch.nn.functional as F
 import viser
 from tqdm.auto import tqdm
 
-from tinysplat.gaussian_model import GaussianData, build_sparse_points_gaussians_3d
+from tinysplat.gaussian_model import GaussianData, build_sparse_points_gaussians_3d, metal_available
 from tinysplat.gaussian_splat_3d_core import project_gaussians_3d_to_2d
+from tinysplat.sh import init_sh_from_rgb
 
 try:
     from tinysplat.backends_3d.cuda import get_last_render_info
@@ -42,7 +43,6 @@ try:
         should_step_optimizer,
         split_child_log_scales,
     )
-    from tinysplat.metal_backend import metal_available
 
     # Device-dispatched: Metal when available, otherwise CUDA. Importing these
     # from metal_backend meant they were stubs on CUDA, so VCD counts were all
@@ -55,14 +55,10 @@ try:
         stats_available,
         stats_backend_name,
     )
-    from tinysplat.sh import init_sh_from_rgb
 
     _HAS_FASTGS = True
 except ImportError:
     _HAS_FASTGS = False
-
-    def metal_available():
-        return False
 
     def last_grad_means2d():
         return None
@@ -691,8 +687,7 @@ def build_pose_bbox_gaussians_3d(
         'colors': colors,
         'opacities': opacity_logits,
     }
-    if _HAS_FASTGS:
-        out['sh_coeffs'] = init_sh_from_rgb(colors, max_degree=3)
+    out['sh_coeffs'] = init_sh_from_rgb(colors, max_degree=3)
     return out
 
 
@@ -1656,7 +1651,7 @@ def densify_and_prune(
                 "colors": colors,
                 "opacities": opacities,
             }
-            if data.sh_coeffs is not None and _HAS_FASTGS:
+            if data.sh_coeffs is not None:
                 # Keep SH in sync with RGB densify by re-initting from colors.
                 payload["sh_coeffs"] = init_sh_from_rgb(colors)
             data.replace(payload)

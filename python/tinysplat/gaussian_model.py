@@ -7,17 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from .gaussian_splat_3d import gaussian_splat_3d
+from .sh import colors_from_sh, init_sh_from_rgb, sh_degree_from_step
 
 try:
     from .metal_backend import metal_available
-    from .sh import colors_from_sh, init_sh_from_rgb, sh_degree_from_step
 except ImportError:
-    _HAS_SH = False
-
     def metal_available():
         return False
-else:
-    _HAS_SH = True
 
 
 def build_sparse_points_gaussians_3d(
@@ -77,8 +73,7 @@ def build_sparse_points_gaussians_3d(
         "colors": rgb,
         "opacities": opa,
     }
-    if _HAS_SH:
-        out["sh_coeffs"] = init_sh_from_rgb(rgb, max_degree=3)
+    out["sh_coeffs"] = init_sh_from_rgb(rgb, max_degree=3)
     return out
 
 
@@ -100,7 +95,7 @@ class GaussianData:
         self.opacities = params["opacities"].to(self._device).requires_grad_(True)
         if "sh_coeffs" in params and self.max_sh_degree > 0:
             self.sh_coeffs = params["sh_coeffs"].to(self._device).requires_grad_(True)
-        elif self.max_sh_degree > 0 and _HAS_SH:
+        elif self.max_sh_degree > 0:
             self.sh_coeffs = init_sh_from_rgb(self.colors.detach()).requires_grad_(True)
         else:
             self.sh_coeffs = None
@@ -126,7 +121,7 @@ class GaussianData:
         return params
 
     def set_sh_degree_for_step(self, step: int):
-        if self.max_sh_degree <= 0 or not _HAS_SH:
+        if self.max_sh_degree <= 0:
             return
         self.active_sh_degree = sh_degree_from_step(step, self.max_sh_degree)
 
@@ -160,7 +155,7 @@ class GaussianData:
         return covariance + epsilon
 
     def visible_colors(self, camera_to_world: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if self.sh_coeffs is not None and camera_to_world is not None and _HAS_SH:
+        if self.sh_coeffs is not None and camera_to_world is not None:
             return colors_from_sh(
                 self.means, self.sh_coeffs, camera_to_world, self.active_sh_degree
             )
@@ -177,7 +172,7 @@ class GaussianData:
         self.opacities = params["opacities"].to(self._device).requires_grad_(True)
         if "sh_coeffs" in params and params["sh_coeffs"] is not None:
             self.sh_coeffs = params["sh_coeffs"].to(self._device).requires_grad_(True)
-        elif self.sh_coeffs is not None and _HAS_SH:
+        elif self.sh_coeffs is not None:
             self.sh_coeffs = init_sh_from_rgb(self.colors.detach()).requires_grad_(True)
 
     def export_params(self) -> Dict[str, torch.Tensor]:
