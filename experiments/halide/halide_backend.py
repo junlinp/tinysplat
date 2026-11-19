@@ -5,7 +5,7 @@ Halide backend for TinySplat — bridges Halide JIT-compiled Gaussian splatting
 pipelines to the torch.autograd.Function interface used by GaussianSplat2DFunction.
 
 Usage:
-    export HL_PATH=$HOME/halide
+    # Build the library using CMake as described in SPEC.md.
     export TINYSPLAT_HALIDE_LIB=/path/to/libtinysplat_halide_pipeline.so
     PYTHONPATH=python:. python -P -m experiments.halide.halide_backend
 """
