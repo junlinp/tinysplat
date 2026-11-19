@@ -23,7 +23,7 @@ from tqdm.auto import tqdm
 from tinysplat import GaussianSplat3D
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 LENA_PATH = REPO_ROOT / "tests" / "data" / "lena.png"
 
 
@@ -88,7 +88,7 @@ def load_lena_image(image_size: int, device: str) -> torch.Tensor:
     """Load and resize the Lena image from the repo's test data directory."""
     if not LENA_PATH.exists():
         raise FileNotFoundError(
-            f"Expected Lena image at {LENA_PATH}. Run tests/download_lena.py first."
+            f"Expected Lena image at {LENA_PATH}. Use the image shipped with the checkout."
         )
 
     image_bgr = cv2.imread(str(LENA_PATH), cv2.IMREAD_COLOR)

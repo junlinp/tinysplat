@@ -1,6 +1,4 @@
 import json
-import importlib.util
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +9,7 @@ import pytest
 import torch
 
 from tinysplat.cameras import Camera
+from tinysplat.pinhole_training import load_dataset_frames
 from tinysplat.render_3dgut import render_3dgut
 
 
@@ -77,12 +76,9 @@ def test_reference_front_to_back_and_behind_camera():
 
 
 def test_pinhole_loader_rejects_raw_distorted_dataset(tmp_path):
-    repo=Path(__file__).resolve().parents[1]
-    spec=importlib.util.spec_from_file_location('_fisheye_guard_test',repo/'train_3d_gaussians_json.py')
-    module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module;spec.loader.exec_module(module)
     d=dict(scene_dir=str(tmp_path),frames=[dict(camera_model='OPENCV_FISHEYE')])
     path=tmp_path/'dataset.json';path.write_text(json.dumps(d))
-    with pytest.raises(ValueError,match='train_3dgut.py'):module.load_dataset_frames(path,'cpu')
+    with pytest.raises(ValueError,match='train-fisheye'):load_dataset_frames(path,'cpu')
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda", "mps"])
@@ -101,9 +97,8 @@ def test_raw_fisheye_training_cli(tmp_path, device):
     means,quats,scales,opa,colors=[t.detach() for t in tensors]
     ck=tmp_path/'initial.pt';torch.save(dict(means=means,rotations=quats,log_scales=scales.log(),opacities=torch.logit(opa),colors=colors),ck)
     repo=Path(__file__).resolve().parents[1]
-    env=os.environ.copy();env['PYTHONPATH']=str(repo/'python')+os.pathsep+env.get('PYTHONPATH','')
-    subprocess.run([sys.executable,str(repo/'train_3dgut.py'),'--dataset',str(path),'--checkpoint',str(ck),
-                    '--output',str(tmp_path/'result'),'--device',device,'--steps','3','--eval-views','1'],env=env,check=True,cwd=tmp_path)
+    subprocess.run([sys.executable,str(repo/'splat'),'train-fisheye','--dataset',str(path),'--checkpoint',str(ck),
+                    '--output',str(tmp_path/'result'),'--device',device,'--steps','3','--eval-views','1'],check=True,cwd=tmp_path)
     assert json.loads((tmp_path/'result/dataset.json').read_text())==d
     report=json.loads((tmp_path/'result/evaluation.json').read_text())
     assert report['intrinsics_fixed'] and report['distortion_fixed'] and report['poses_fixed']

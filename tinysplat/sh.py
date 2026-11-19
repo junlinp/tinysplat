@@ -1,1 +1,0 @@
-../python/tinysplat/sh.py

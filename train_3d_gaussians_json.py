@@ -1,1 +1,0 @@
-scripts/train_3d_gaussians_json.py

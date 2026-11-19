@@ -16,7 +16,7 @@ against a known-good reference on the same camera.
 
 Usage::
 
-    python view_gaussians_viser.py outputs/<run>/gaussians.pt \\
+    ./splat view outputs/<run>/gaussians.pt \\
         --dataset data/tandt/truck/dataset.json
 """
 
@@ -34,13 +34,8 @@ import torch
 import viser
 import viser.transforms as vtf
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_PYTHON_DIR = _REPO_ROOT / "python"
-if _PYTHON_DIR.is_dir():
-    sys.path.insert(0, str(_PYTHON_DIR))
-
-from tinysplat.gaussian_model import GaussianData
-from tinysplat.pinhole_training import load_dataset_frames, resolve_device, tensor_image_to_uint8
+from .gaussian_model import GaussianData
+from .pinhole_training import load_dataset_frames, resolve_device, tensor_image_to_uint8
 
 SH_C0 = 0.28209479177387814
 

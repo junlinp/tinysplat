@@ -1,7 +1,6 @@
 """Regression checks for the Python quality controls (run with unittest)."""
 import contextlib
 import io
-import importlib.util
 import math
 from pathlib import Path
 import sys
@@ -12,19 +11,8 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_script(name, filename):
-    spec = importlib.util.spec_from_file_location(name, ROOT / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-trainer = load_script("quality_trainer", "train_3d_gaussians_json.py")
-viewer = load_script("quality_viewer", "view_gaussians_viser.py")
+from tinysplat import pinhole_training as trainer
+from tinysplat import viewer
 
 
 class QualityControlsTest(unittest.TestCase):

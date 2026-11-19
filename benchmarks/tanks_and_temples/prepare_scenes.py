@@ -31,9 +31,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
-    convert = repo_root / "convert_colmap_to_json.py"
-    if not convert.is_file():
-        print(f"Missing converter: {convert}", file=sys.stderr)
+    launcher = repo_root / "splat"
+    if not launcher.is_file():
+        print(f"Missing TinySplat launcher: {launcher}", file=sys.stderr)
         return 1
 
     data_dir = args.data_dir.resolve()
@@ -45,7 +45,8 @@ def main() -> int:
         out = scene_dir / "dataset.json"
         cmd = [
             sys.executable,
-            str(convert),
+            str(launcher),
+            "convert",
             str(scene_dir),
             "--output",
             str(out),

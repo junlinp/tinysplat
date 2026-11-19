@@ -1,1 +1,0 @@
-scripts/train_3dgut.py

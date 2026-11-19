@@ -72,13 +72,13 @@ def save_image(image: torch.Tensor, filename: str):
 def main():
     """Main function to render Lena image with Gaussian splatting."""
     # Paths
-    lena_path = Path(__file__).parent / "tests" / "data" / "lena.png"
-    output_dir = Path(__file__).parent / "outputs"
+    lena_path = Path(__file__).resolve().parents[2] / "tests" / "data" / "lena.png"
+    output_dir = Path(__file__).resolve().parents[2] / "outputs"
     output_dir.mkdir(exist_ok=True)
     
     if not lena_path.exists():
         print(f"Error: Lena image not found at {lena_path}")
-        print("Please ensure the image exists or run tests/download_lena.py first.")
+        print("Use the image shipped with the checkout.")
         return
     
     # Auto-detect device
