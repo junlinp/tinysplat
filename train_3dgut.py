@@ -14,11 +14,10 @@ import sys
 # training package when executing this file directly from a checkout.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "legacy"))
 
-import cv2
 import numpy as np
 import torch
 
-from tinysplat.cameras import Camera
+from tinysplat.fisheye_evaluation import evaluate_fisheye_views
 from tinysplat.fisheye_dataset import FisheyeDataset, load_raw_frame
 from tinysplat.render_3dgut import render_3dgut
 
@@ -50,7 +49,6 @@ def main():
     metadata = json.loads(raw_json)
     dataset = FisheyeDataset(metadata)
     train_indices = dataset.train_indices
-    val_indices = dataset.val_indices
     # Reuse the existing checkpoint format, SH and initialization implementation.
     spec = importlib.util.spec_from_file_location("_tinysplat_training", Path(__file__).with_name("train_3d_gaussians_json.py"))
     training = importlib.util.module_from_spec(spec)
@@ -110,22 +108,7 @@ def main():
             print(json.dumps(status), flush=True)
             (args.output/"status.json").write_text(json.dumps(status))
     torch.save(model.export_params(), args.output/"gaussians.pt")
-    pool = val_indices or train_indices
-    selected = np.linspace(0, len(pool)-1, min(args.eval_views,len(pool))).astype(int)
-    metrics = []
-    with torch.no_grad():
-        for j in selected:
-            i = pool[int(j)]
-            c, target, valid, pose = dataset.frame(i, args.device)
-            pred = render(c, pose)
-            mse = (pred[valid]-target[valid]).square().mean().clamp_min(1e-12)
-            metrics.append(dict(image_id=dataset.frames[i]["image_id"], psnr=float(-10*torch.log10(mse))))
-            comparison = torch.cat([target, pred],1).clamp(0,1).cpu().numpy()
-            cv2.imwrite(str(args.output/f"comparison_{dataset.frames[i]['image_id']}.png"), (comparison[...,::-1]*255).round().astype(np.uint8))
-    assert [Camera.from_frame(f) for f in dataset.frames] == dataset.cameras
-    (args.output/"evaluation.json").write_text(json.dumps(dict(views=metrics,
-        mean_psnr=float(np.mean([v["psnr"] for v in metrics])), held_out=bool(val_indices),
-        intrinsics_fixed=True, distortion_fixed=True, poses_fixed=True), indent=2))
+    evaluate_fisheye_views(dataset, render, args.device, args.eval_views, args.output)
     (args.output/"status.json").write_text(json.dumps(dict(status="complete",steps=args.steps)))
 
 
