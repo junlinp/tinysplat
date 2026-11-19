@@ -5,7 +5,6 @@ Run with PYTHONPATH=legacy. Fixed calibration and optical camera-to-world poses;
 fixed Gaussian count for predictable memory. GPU defaults to native CUDA/Metal.
 """
 import argparse
-import collections
 import json
 import importlib.util
 from pathlib import Path
@@ -20,25 +19,8 @@ import numpy as np
 import torch
 
 from tinysplat.cameras import Camera
+from tinysplat.fisheye_dataset import FisheyeDataset, load_raw_frame
 from tinysplat.render_3dgut import render_3dgut
-
-
-def load_raw_frame(scene_dir, frame, device):
-    camera = Camera.from_frame(frame)
-    image = cv2.imread(str(scene_dir / frame["file_path"]), cv2.IMREAD_COLOR)
-    if image is None or image.shape[:2] != (camera.height, camera.width):
-        raise ValueError(f"Image missing or dimensions disagree with calibration: {frame['file_path']}")
-    rgb = torch.tensor(image[..., ::-1].copy(), device=device, dtype=torch.float32)/255
-    _, valid = camera.rays(device=device)
-    if frame.get("mask_path"):
-        mask = cv2.imread(str(scene_dir / frame["mask_path"]), cv2.IMREAD_GRAYSCALE)
-        if mask is None or mask.shape != image.shape[:2]:
-            raise ValueError("Mask missing or dimensions disagree with raw image")
-        valid &= torch.tensor(mask > 0, device=device)
-    if not valid.any():
-        raise ValueError("Frame has no valid calibrated pixels")
-    pose = torch.tensor(frame["transform_matrix"], device=device, dtype=torch.float32)
-    return camera, rgb, valid, pose
 
 
 def main():
@@ -65,21 +47,10 @@ def main():
         torch.cuda.set_per_process_memory_fraction(args.gpu_memory_limit_gb*1024**3/total)
     args.output.mkdir(parents=True, exist_ok=False)
     raw_json = args.dataset.read_text()
-    dataset = json.loads(raw_json)
-    scene = Path(dataset["scene_dir"])
-    frames = dataset["frames"]
-    if not frames:
-        raise ValueError("Dataset has no frames")
-    cameras = [Camera.from_frame(f) for f in frames]
-    by_id = {f["image_id"]: i for i, f in enumerate(frames)}
-    if len(by_id) != len(frames):
-        raise ValueError("Duplicate image_id")
-    train_ids = dataset.get("train_ids", list(by_id))
-    val_ids = dataset.get("val_ids", [])
-    if not train_ids or set(train_ids) & set(val_ids):
-        raise ValueError("Training split must be nonempty and disjoint from validation")
-    train_indices = [by_id[i] for i in train_ids]
-    val_indices = [by_id[i] for i in val_ids]
+    metadata = json.loads(raw_json)
+    dataset = FisheyeDataset(metadata)
+    train_indices = dataset.train_indices
+    val_indices = dataset.val_indices
     # Reuse the existing checkpoint format, SH and initialization implementation.
     spec = importlib.util.spec_from_file_location("_tinysplat_training", Path(__file__).with_name("train_3d_gaussians_json.py"))
     training = importlib.util.module_from_spec(spec)
@@ -93,7 +64,7 @@ def main():
         if len(params["means"]) > args.max_gaussians:
             raise ValueError("Checkpoint exceeds --max-gaussians; increase the explicit limit")
     else:
-        points = dataset.get("points3d", [])
+        points = metadata.get("points3d", [])
         if not points:
             raise ValueError("Supply points3d in the BA/SLAM world frame or --checkpoint")
         indices = np.random.default_rng(42).choice(len(points), min(len(points), args.max_gaussians), replace=False)
@@ -107,14 +78,6 @@ def main():
         {"params": [model.opacities], "lr": .003},
         {"params": [model.sh_coeffs if model.sh_coeffs is not None else model.colors], "lr": .001},
     ])
-    cache = collections.OrderedDict()
-    def frame(i):
-        if i not in cache:
-            cache[i] = load_raw_frame(scene, frames[i], "cpu")
-            while len(cache) > 2:
-                cache.popitem(last=False)
-        c, target, mask, pose = cache[i]
-        return c, target.to(args.device), mask.to(args.device), pose.to(args.device)
     def render(camera, pose):
         return render_3dgut(model.means, model.rotations, model.log_scales.exp(),
                              model.visible_opacities(), model.visible_colors(pose), camera, pose,
@@ -130,7 +93,7 @@ def main():
             raise RuntimeError("Free GPU memory below safety guard")
         if (step-1) % len(train_indices) == 0:
             order = rng.permutation(train_indices)
-        c, target, valid, pose = frame(int(order[(step-1)%len(order)]))
+        c, target, valid, pose = dataset.frame(int(order[(step-1)%len(order)]), args.device)
         optimizer.zero_grad(set_to_none=True)
         pred = render(c, pose)
         loss = (pred[valid]-target[valid]).abs().mean()
@@ -153,13 +116,13 @@ def main():
     with torch.no_grad():
         for j in selected:
             i = pool[int(j)]
-            c, target, valid, pose = frame(i)
+            c, target, valid, pose = dataset.frame(i, args.device)
             pred = render(c, pose)
             mse = (pred[valid]-target[valid]).square().mean().clamp_min(1e-12)
-            metrics.append(dict(image_id=frames[i]["image_id"], psnr=float(-10*torch.log10(mse))))
+            metrics.append(dict(image_id=dataset.frames[i]["image_id"], psnr=float(-10*torch.log10(mse))))
             comparison = torch.cat([target, pred],1).clamp(0,1).cpu().numpy()
-            cv2.imwrite(str(args.output/f"comparison_{frames[i]['image_id']}.png"), (comparison[...,::-1]*255).round().astype(np.uint8))
-    assert [Camera.from_frame(f) for f in frames] == cameras
+            cv2.imwrite(str(args.output/f"comparison_{dataset.frames[i]['image_id']}.png"), (comparison[...,::-1]*255).round().astype(np.uint8))
+    assert [Camera.from_frame(f) for f in dataset.frames] == dataset.cameras
     (args.output/"evaluation.json").write_text(json.dumps(dict(views=metrics,
         mean_psnr=float(np.mean([v["psnr"] for v in metrics])), held_out=bool(val_indices),
         intrinsics_fixed=True, distortion_fixed=True, poses_fixed=True), indent=2))
