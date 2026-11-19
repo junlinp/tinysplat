@@ -155,7 +155,10 @@ conda install -c conda-forge halide
 cmake -S experiments/halide -B experiments/halide/build \
   -DCMAKE_BUILD_TYPE=Release -DHL_PATH="$HL_PATH"
 cmake --build experiments/halide/build
+(cd experiments/halide/build && ctest --output-on-failure)
 ```
+
+Set `-DBUILD_TESTING=OFF` at configure time for a library-only build.
 
 ### 6.3 Python Binding
 

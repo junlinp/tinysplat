@@ -29,6 +29,16 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(tinysplat_halide_pipeline PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+include(CTest)
+if(BUILD_TESTING)
+    foreach(check IN ITEMS forward backward)
+        add_executable(halide_test_${check} test_${check}.cpp)
+        target_compile_features(halide_test_${check} PRIVATE cxx_std_17)
+        target_link_libraries(halide_test_${check} PRIVATE tinysplat_halide_pipeline Halide::Halide)
+        add_test(NAME halide_${check} COMMAND halide_test_${check})
+    endforeach()
+endif()
+
 install(TARGETS tinysplat_halide_pipeline
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
