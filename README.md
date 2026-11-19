@@ -104,6 +104,7 @@ tinysplat::Image img = tinysplat::gaussian_splat_2d_forward(g, 256, 256);
 | `python/tinysplat/pinhole_training.py`, `fisheye_training.py` in the same directory | Training loops for pinhole and raw fisheye images |
 | `splat`, `scripts/` | Checkout launcher and command implementations |
 | `convert_colmap_to_json.py`, `legacy/convert_colmap_to_json.py` | Current and legacy dataset converters. Both use the COLMAP readers in `scripts/colmap_io.py` |
+| [`experiments/halide/`](experiments/halide/SPEC.md) | Experimental 2D Halide kernels, standalone build, and Python bridge |
 | `examples/`, `benchmarks/` | C++ demos and dataset benchmarks |
 | `tests/` | C++ tests and Python regression tests, including the synthetic fisheye scene |
 | `legacy/` | Additional Python examples and backend tests |

@@ -14,3 +14,5 @@ python/dist/
 /outputs/
 /logs/
 /metal/build/
+
+/experiments/halide/build/
